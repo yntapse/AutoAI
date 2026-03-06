@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0B1F3A;
+  --foreground: #e2e8f0;
+  --card: #0F172A;
+  --border: #1e3a52;
+  --muted: #94a3b8;
+  --primary: #3BB273;
+  --primary-hover: #2FA565;
+  --pyrun-navy: #0B1F3A;
+  --pyrun-surface: #0F172A;
+  --pyrun-green: #3BB273;
+  --pyrun-green-light: #5EDC8A;
+  --pyrun-blue-accent: #123C66;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-pyrun-navy: #0B1F3A;
+  --color-pyrun-surface: #0F172A;
+  --color-pyrun-green: #3BB273;
+  --color-pyrun-greenLight: #5EDC8A;
+  --color-pyrun-blueAccent: #123C66;
+}
+
+body {
+  background: radial-gradient(circle at 20% -10%, rgba(59, 178, 115, 0.08), transparent 40%),
+    radial-gradient(circle at 90% 0%, rgba(18, 60, 102, 0.12), transparent 35%),
+    linear-gradient(180deg, #0B1F3A 0%, #050f1c 100%);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans, Arial, sans-serif);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  line-height: 1.5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: #3BB273;
+  color: #ffffff;
+}

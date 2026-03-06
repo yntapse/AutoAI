@@ -1,0 +1,3 @@
+HAS_KEY=True
+MODEL=llama-3.3-70b-versatile
+REPLY=GROQ_OK

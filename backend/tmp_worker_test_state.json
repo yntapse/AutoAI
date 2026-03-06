@@ -1,0 +1,18 @@
+{
+  "project_id": "f2ba1024-48d3-4d9b-b91a-7bc205d291e6",
+  "agent_id": "599a1af0-4301-472a-ab4f-6237ac89c3cb",
+  "single_job_id": "6496a333-2b6d-45c9-8ae1-5311e3c201e9",
+  "multi_job_ids": [
+    "ee680938-5faa-4812-92bb-9744b0aeb446",
+    "74237abf-f80b-424b-9f33-d3ac48dedd40",
+    "f4e1582f-5de9-4066-84fd-6780a6ff9db9"
+  ],
+  "recovery_job_id": "20e4b683-d266-44cc-a2b9-11a22dc18068",
+  "single_job_id_live": "0444d410-aa15-48d9-8e74-ca9cd8cba5c3",
+  "sequential_job_ids_live": [
+    "03e3ce9e-4617-4fa4-b01f-c4af2ad92b59",
+    "ed9df53b-b8d9-40fc-a333-195d84f86f72"
+  ],
+  "project_file_id_live": "0168630d-b99c-4cbd-b012-623fb1839a97.csv",
+  "recovery_job_id_live": "c633e342-ce72-47e8-a145-360cba31dc78"
+}
