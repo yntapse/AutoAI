@@ -6,7 +6,7 @@ export default function DashboardLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex min-h-screen bg-gradient-to-b from-slate-950 to-black text-slate-100">
+    <div className="flex min-h-screen text-slate-100 bg-[radial-gradient(circle_at_15%_8%,rgba(40,55,140,0.15),transparent_32%),radial-gradient(circle_at_80%_12%,rgba(30,130,120,0.1),transparent_28%),radial-gradient(circle_at_50%_85%,rgba(15,25,55,0.25),transparent_45%),linear-gradient(180deg,#050c1c_0%,#030812_100%)]">
       <Sidebar />
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {children}

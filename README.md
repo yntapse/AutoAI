@@ -2,6 +2,21 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+
+ projects/create response: {'project_id': '978c2923-0f89-4a38-bb76-733ccd0c7f39', 'project_name': 'Test 2', 'file_id': 'bd543ced-0004-4a5c-9885-1f9cf84d4d79.csv', 'target_column': 'Sales', 'r 200, 'columns': 4, 'datows':aset_profile_summary': 'rows=200, features=3, numeric=3, categorical=0, missing_ratio=0.0000, feature_variance_mean=2688.561987, target_std=5.283892, target_skew=-0.073739. Small dataset detected: favor simpler and regularized 
+models.'}
+
+
+
+
+
+
+
+
+
+
+
+
 First, run the development server:
 
 ```bash
@@ -13,6 +28,12 @@ pnpm dev
 # or
 bun dev
 ```
+
+New-NetFirewallRule -DisplayName "FastAPI Backend" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "Next.js Dev Server" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
+
+
+
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 

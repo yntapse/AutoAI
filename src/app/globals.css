@@ -46,3 +46,262 @@ body {
   background: #3BB273;
   color: #ffffff;
 }
+
+.onboarding-page .aurora-pan {
+  background-size: 120% 120%;
+  animation: aurora-pan 18s ease-in-out infinite alternate;
+}
+
+.onboarding-page .wireframe-drift {
+  animation: wireframe-drift 20s ease-in-out infinite;
+  transform-origin: center;
+}
+
+.onboarding-page .pulse-blob {
+  animation: pulse-blob 4.6s ease-in-out infinite;
+}
+
+.onboarding-page .twinkle-dot {
+  animation: twinkle 1.8s ease-in-out infinite;
+}
+
+.onboarding-page .twinkle-dot.delay-1 {
+  animation-delay: 0.45s;
+}
+
+.onboarding-page .twinkle-dot.delay-2 {
+  animation-delay: 0.95s;
+}
+
+.onboarding-page .panel-pop {
+  animation: panel-pop 0.9s cubic-bezier(0.18, 0.88, 0.24, 1) both,
+    panel-float 6.5s ease-in-out 1s infinite;
+}
+
+.onboarding-page .hero-glow {
+  animation: hero-glow 2.6s ease-in-out infinite;
+  text-shadow: 0 0 28px rgba(92, 241, 232, 0.22);
+}
+
+.onboarding-page .subtitle-rise {
+  animation: subtitle-rise 1s ease-out both;
+}
+
+.onboarding-page .step-card {
+  transform: translateY(18px) scale(0.97);
+  opacity: 0;
+  animation: step-in 0.7s cubic-bezier(0.18, 0.88, 0.24, 1) forwards,
+    step-float 5.6s ease-in-out 1.2s infinite;
+  will-change: transform;
+}
+
+.onboarding-page .step-1 {
+  animation-delay: 0.16s, 1.2s;
+}
+
+.onboarding-page .step-2 {
+  animation-delay: 0.3s, 1.45s;
+}
+
+.onboarding-page .step-3 {
+  animation-delay: 0.44s, 1.7s;
+}
+
+.onboarding-page .icon-stage {
+  animation: icon-pulse 2.8s ease-in-out infinite;
+}
+
+.onboarding-page .cta-primary {
+  animation: cta-breathe 2.2s ease-in-out infinite;
+}
+
+.onboarding-page .cta-secondary {
+  animation: cta-bob 2.9s ease-in-out infinite;
+}
+
+.onboarding-page .shine-sweep {
+  position: relative;
+  overflow: hidden;
+}
+
+.onboarding-page .shine-sweep::after {
+  content: "";
+  position: absolute;
+  top: -120%;
+  left: -30%;
+  width: 30%;
+  height: 340%;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0),
+    rgba(255, 255, 255, 0.42),
+    rgba(255, 255, 255, 0)
+  );
+  transform: rotate(18deg) translateX(-220%);
+  animation: shine-sweep 3.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes panel-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(26px) scale(0.97);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes panel-float {
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-7px);
+  }
+}
+
+@keyframes step-in {
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes step-float {
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+@keyframes icon-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 0 rgba(101, 240, 219, 0));
+  }
+  50% {
+    filter: drop-shadow(0 0 10px rgba(101, 240, 219, 0.55));
+  }
+}
+
+@keyframes hero-glow {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.16);
+  }
+}
+
+@keyframes subtitle-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes cta-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 24px rgba(56, 211, 190, 0.44);
+    transform: translateY(0px);
+  }
+  50% {
+    box-shadow: 0 0 38px rgba(56, 211, 190, 0.78);
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes cta-bob {
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes shine-sweep {
+  0%,
+  20% {
+    transform: rotate(18deg) translateX(-220%);
+  }
+  55%,
+  100% {
+    transform: rotate(18deg) translateX(420%);
+  }
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.8);
+  }
+}
+
+@keyframes pulse-blob {
+  0%,
+  100% {
+    opacity: 0.22;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.48;
+    transform: scale(1.18);
+  }
+}
+
+@keyframes aurora-pan {
+  0% {
+    transform: translate3d(-2%, -1.5%, 0) scale(1.04);
+    filter: hue-rotate(0deg);
+  }
+  100% {
+    transform: translate3d(1.5%, 1.5%, 0) scale(1.08);
+    filter: hue-rotate(10deg);
+  }
+}
+
+@keyframes wireframe-drift {
+  0%,
+  100% {
+    transform: translateY(0px) scale(1.01);
+  }
+  50% {
+    transform: translateY(-12px) scale(1.03);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-page .aurora-pan,
+  .onboarding-page .wireframe-drift,
+  .onboarding-page .pulse-blob,
+  .onboarding-page .twinkle-dot,
+  .onboarding-page .panel-pop,
+  .onboarding-page .hero-glow,
+  .onboarding-page .subtitle-rise,
+  .onboarding-page .step-card,
+  .onboarding-page .icon-stage,
+  .onboarding-page .cta-primary,
+  .onboarding-page .cta-secondary,
+  .onboarding-page .shine-sweep::after {
+    animation: none !important;
+  }
+}

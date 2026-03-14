@@ -24,7 +24,7 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Body, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import func, and_, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -256,6 +256,8 @@ def _set_agent_model_status(
     model_name: str,
     status: str,
     rmse: Optional[float] = None,
+    r2: Optional[float] = None,
+    mae: Optional[float] = None,
     job_id: Optional[uuid.UUID] = None,
     error: Optional[str] = None,
 ) -> None:
@@ -267,6 +269,10 @@ def _set_agent_model_status(
 
         model["status"] = status
         model["rmse"] = rmse
+        if r2 is not None:
+            model["r2"] = r2
+        if mae is not None:
+            model["mae"] = mae
         if job_id is not None:
             model["job_id"] = str(job_id)
         if error is not None:
@@ -656,6 +662,8 @@ class TrainingRequest(BaseModel):
 
 # Fine-tune request model
 class FineTuneRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     file_id: str
     target_column: str
     llm_provider: str
@@ -736,6 +744,7 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                         TrainingRun.project_id,
                         TrainingRun.status,
                         TrainingRun.r2,
+                        TrainingRun.agent_run_id,
                         TrainingRun.version_number,
                         TrainingRun.created_at,
                     )
@@ -755,6 +764,7 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                     latest_run_by_project[key] = {
                         "status": run.status,
                         "r2": run.r2,
+                        "agent_run_id": str(run.agent_run_id) if run.agent_run_id else None,
                     }
             except Exception:
                 latest_run_by_project = {}
@@ -825,6 +835,7 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                         "num_rows": num_rows,
                         "created_at": _serialize_created_at(project.get("created_at")),
                         "target_column": str(project.get("target_column") or ""),
+                        "agent_run_id": latest_run.get("agent_run_id") if latest_run else None,
                     }
                 )
             except Exception:
@@ -1375,6 +1386,37 @@ def run_agent_loop(
             return ""
         return " ".join(code_text.split())
 
+    def _remove_natural_language_from_code(code: Optional[str]) -> Optional[str]:
+        """Remove natural language instruction lines from LLM-generated code."""
+        if not code:
+            return None
+        
+        # Pattern to detect natural language instructions
+        natural_language_pattern = re.compile(
+            r"^\s*(Use|Try|Apply|Implement|Consider|Ensure|Remember|Note|Make sure|You should|You can|This will|This should|To improve|For better)\s+",
+            re.IGNORECASE,
+        )
+        
+        cleaned_lines: List[str] = []
+        for line in code.splitlines():
+            stripped_line = line.strip()
+            # Keep empty lines
+            if not stripped_line:
+                cleaned_lines.append(line)
+                continue
+            # Keep comment lines
+            if stripped_line.startswith("#"):
+                cleaned_lines.append(line)
+                continue
+            # Skip natural language instructions
+            if natural_language_pattern.match(stripped_line):
+                continue
+            # Keep valid Python code
+            cleaned_lines.append(line)
+        
+        result = "\n".join(cleaned_lines).strip()
+        return result if result else None
+
     def _sanitize_training_section(
         training_code: Optional[str],
         disallow_model_redefinition: bool,
@@ -1404,14 +1446,28 @@ def run_agent_loop(
             r"^\s*(import\s+|from\s+\S+\s+import\s+)",
             re.IGNORECASE,
         )
+        # Pattern to detect natural language instructions (not valid Python code)
+        natural_language_pattern = re.compile(
+            r"^\s*(Use|Try|Apply|Implement|Consider|Ensure|Remember|Note|Make sure|You should|You can|This will|This should)\s+",
+            re.IGNORECASE,
+        )
         filtered_lines: List[str] = []
         for line in cleaned.splitlines():
+            # Skip protected system assignments
             if protected_assignment_pattern.match(line):
                 continue
+            # Skip print statements
             if protected_print_pattern.match(line):
                 continue
+            # Skip import statements (system handles these)
             if protected_import_pattern.match(line):
                 continue
+            # Skip natural language instructions that LLM might output
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith("#"):
+                # If line looks like natural language instruction, skip it
+                if natural_language_pattern.match(stripped_line):
+                    continue
             filtered_lines.append(line)
         cleaned = "\n".join(filtered_lines).strip()
 
@@ -1520,16 +1576,9 @@ def run_agent_loop(
         return directive
 
     def _get_model_instantiation_line(model_family: str) -> str:
-        """Return the deterministic model instantiation line for a given family."""
-        model_lines = {
-            "LinearRegression": "model = LinearRegression()",
-            "Ridge": "model = Ridge(alpha=1.0)",
-            "Lasso": "model = Lasso(alpha=0.01, max_iter=5000)",
-            "ElasticNet": "model = ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000)",
-            "RandomForestRegressor": "model = RandomForestRegressor(n_estimators=120, max_depth=8, random_state=42)",
-            "XGBRegressor": "model = XGBRegressor(random_state=42, verbosity=0, n_estimators=150, max_depth=6, learning_rate=0.05)",
-        }
-        return model_lines.get(model_family, model_lines["Ridge"])
+        """Return a placeholder comment indicating which model family to use.
+        The LLM will generate the actual instantiation with hyperparameters."""
+        return f"# MODEL_FAMILY: {model_family}\n# LLM: Generate the model instantiation with optimized hyperparameters"
 
     # ──────────────────────────────────────────────────────────────────────────
     # CONTRACT VALIDATOR - LLM → Sandbox validation layer
@@ -1738,6 +1787,10 @@ def run_agent_loop(
 
         regenerated_sections = _generate_autonomous_section_via_llm(stricter_prompt)
         regen_preprocessing, regen_training = _parse_sectioned_autonomous_output(regenerated_sections)
+        
+        # Remove any natural language instructions
+        regen_preprocessing = _remove_natural_language_from_code(regen_preprocessing)
+        regen_training = _remove_natural_language_from_code(regen_training)
 
         # Use original preprocessing if regeneration didn't produce valid one
         if not regen_preprocessing or "train_test_split" not in regen_preprocessing:
@@ -2658,6 +2711,8 @@ def run_agent_loop(
                         model_name,
                         "completed",
                         rmse=metrics.get("rmse"),
+                        r2=metrics.get("r2"),
+                        mae=metrics.get("mae"),
                         job_id=job_id,
                     )
                     if metrics.get("rmse") is not None:
@@ -3054,7 +3109,7 @@ def run_agent_loop(
                     # Track models being trained for UI
                     AGENT_SANDBOX_EVENT_LOGS[str(agent_run_id)] = []
                     AGENT_MODELS_IN_PROGRESS[str(agent_run_id)] = [
-                        {"name": model, "status": "pending", "rmse": None, "job_id": None, "error": None}
+                        {"name": model, "status": "pending", "rmse": None, "r2": None, "mae": None, "job_id": None, "error": None}
                         for model in model_families
                     ]
                     _append_agent_sandbox_event(
@@ -3070,32 +3125,66 @@ def run_agent_loop(
                         model_specific_best = per_model_best_rmse.get(model_family)
                         model_line = _get_model_instantiation_line(model_family)
 
+                        # Build previous iteration context for this specific model
+                        previous_iteration_context = ""
+                        if previous_model_preprocessing or previous_model_training:
+                            previous_iteration_context = f"""
+=== PREVIOUS ITERATION FOR {model_family} ===
+Previous RMSE: {model_specific_best if model_specific_best else 'N/A'}
+
+Previous Preprocessing Code:
+{previous_model_preprocessing or '# No previous preprocessing'}
+
+Previous Training Code:
+{previous_model_training or '# No previous training'}
+
+What worked: {json.dumps(performance_context.get('successful_patterns', []), default=str)}
+What failed: {json.dumps(performance_context.get('failed_patterns', []), default=str)}
+==========================================
+"""
+                        
                         model_prompt = (
-                            "You are an autonomous ML researcher.\n"
-                            "Generate TWO sections only, using exact markers:\n"
+                            f"You are an autonomous ML optimization expert for {model_family}.\n\n"
+                            "YOUR TASK: Generate unique, model-specific code to maximize performance.\n\n"
+                            "Generate TWO sections using these exact markers:\n"
                             "AUTONOMOUS_PREPROCESSING_SECTION\n"
                             "AUTONOMOUS_TRAINING_SECTION\n\n"
-                            "Constraints:\n"
-                            "- Model class is fixed by system. Do NOT redefine model class.\n"
-                            "- Preprocessing section must define X_train, X_test, y_train, y_test.\n"
-                            "- Training section must call model.fit(...) and predictions = model.predict(...).\n"
-                            "- You may tune regularization, CV/search setup, feature selection knobs, and ensembling with this fixed model.\n"
-                            "- Optional feature selection knobs: feature_selection_method and feature_selection_params.\n"
-                            "- Allowed feature_selection_method values: select_k_best, variance_filter, tree_importance.\n"
-                            "- No imports, no prints, no markdown, no explanation.\n"
+                            f"=== CURRENT SITUATION ===\n"
+                            f"Model Family: {model_family}\n"
                             f"Iteration: {current_iteration}\n"
-                            f"Model family: {model_family}\n"
-                            f"Model best RMSE so far: {model_specific_best}\n"
-                            f"Global best RMSE so far: {best_rmse}\n"
-                            f"Last RMSE: {last_rmse}\n"
-                            f"Stagnation count: {no_improvement_counter}\n"
-                            f"Strategy: {strategy_reasoning}\n"
-                            f"Dataset metadata: {json.dumps(performance_context.get('dataset', {}), default=str)}\n"
-                            f"Dataset profile summary: {performance_context.get('dataset_profile_summary')}\n\n"
-                            "Previous preprocessing code for this model:\n"
-                            f"{previous_model_preprocessing or '# none'}\n\n"
-                            "Previous training code for this model:\n"
-                            f"{previous_model_training or '# none'}\n"
+                            f"Your Best RMSE So Far: {model_specific_best if model_specific_best else 'Not trained yet'}\n"
+                            f"Global Best RMSE (all models): {best_rmse}\n"
+                            f"Last Iteration RMSE: {last_rmse}\n"
+                            f"Stagnation Count: {no_improvement_counter}\n"
+                            f"Strategy Needed: {strategy_reasoning}\n\n"
+                            f"=== DATASET INFORMATION ===\n"
+                            f"Dataset Metadata: {json.dumps(performance_context.get('dataset', {}), default=str)}\n"
+                            f"Dataset Profile: {performance_context.get('dataset_profile_summary')}\n\n"
+                            f"{previous_iteration_context}\n"
+                            f"=== YOUR CREATIVE FREEDOM ===\n"
+                            f"For {model_family}, you have FULL CONTROL to:\n"
+                            f"1. Define model instantiation with ANY hyperparameters you think will work best\n"
+                            f"2. Choose unique preprocessing strategies tailored to {model_family}'s strengths\n"
+                            f"3. Implement model-specific feature engineering\n"
+                            f"4. Use hyperparameter tuning (GridSearch/RandomSearch) if beneficial\n"
+                            f"5. Apply cross-validation strategies\n"
+                            f"6. Experiment with feature selection techniques\n"
+                            f"7. Try ensemble methods, stacking, or blending\n"
+                            f"8. Use domain knowledge about what works well for {model_family}\n\n"
+                            f"REQUIREMENTS:\n"
+                            f"- PREPROCESSING must define: X_train, X_test, y_train, y_test\n"
+                            f"- TRAINING must include: model instantiation, model.fit(), predictions = model.predict()\n"
+                            f"- Use {model_family} as the base model class (import from sklearn/xgboost)\n"
+                            f"- Be CREATIVE and DIFFERENT from other models - each model should have unique optimizations\n\n"
+                            f"CRITICAL OUTPUT RULES:\n"
+                            f"- Output ONLY executable Python code - NO natural language explanations\n"
+                            f"- NO markdown formatting (no ```, no language tags)\n"
+                            f"- NO instructional text like 'Use this' or 'Try that'\n"
+                            f"- NO bullet points or suggestions - only valid Python statements\n"
+                            f"- Every line must be valid Python syntax (code or comments starting with #)\n"
+                            f"- Comments MUST start with # symbol\n"
+                            f"- Write code AS IF you're writing a .py file that will be executed directly\n\n"
+                            f"MAKE YOUR CODE UNIQUE FOR {model_family} - Don't generate generic code!\n"
                         )
                         model_prompt += _build_training_pressure_directive(
                             no_improvement_counter,
@@ -3105,13 +3194,17 @@ def run_agent_loop(
 
                         raw_sections = _generate_autonomous_section_via_llm(model_prompt)
                         preprocessing_code, training_code = _parse_sectioned_autonomous_output(raw_sections)
+                        
+                        # Remove any natural language instructions from LLM output
+                        preprocessing_code = _remove_natural_language_from_code(preprocessing_code)
+                        training_code = _remove_natural_language_from_code(training_code)
 
                         if not preprocessing_code or "train_test_split" not in preprocessing_code:
                             preprocessing_code = _fallback_preprocessing_section([])
 
                         training_code = _sanitize_training_section(
                             training_code,
-                            disallow_model_redefinition=True,
+                            disallow_model_redefinition=False,  # Allow LLM to define model with hyperparameters
                         )
 
                         needs_regen, regen_reason = _should_regenerate_training_section(
@@ -3124,9 +3217,11 @@ def run_agent_loop(
                             stronger_prompt = model_prompt + "\nSTRICT REGENERATION DIRECTIVE: " + regen_reason + "\n"
                             stronger_sections = _generate_autonomous_section_via_llm(stronger_prompt)
                             _, stronger_training = _parse_sectioned_autonomous_output(stronger_sections)
+                            # Remove natural language from regenerated code
+                            stronger_training = _remove_natural_language_from_code(stronger_training)
                             training_code = _sanitize_training_section(
                                 stronger_training,
-                                disallow_model_redefinition=True,
+                                disallow_model_redefinition=False,  # Allow LLM to define model
                             )
 
                         if not training_code or "model.fit" not in training_code or "predict" not in training_code:
@@ -3135,33 +3230,35 @@ def run_agent_loop(
                         script_content = _build_exploration_script_template(
                             preprocessing_code,
                             project_target_column,
-                            model_line,
+                            "",  # No model injection - LLM generates it
                             training_code,
                         )
 
                         validation_result = _validate_script_contract(
                             script_content=script_content,
                             training_section=training_code,
-                            is_model_injected=True,
+                            is_model_injected=False,  # LLM generates model in training section
                             exploration_mode=False,
                             exploitation_lock=False,
                         )
                         if not validation_result.is_valid:
                             recovery_prompt = (
-                                "Generate TWO sections only:\n"
-                                "AUTONOMOUS_PREPROCESSING_SECTION\n"
-                                "AUTONOMOUS_TRAINING_SECTION\n"
-                                "Model is injected by system. Do NOT redefine model.\n"
-                                "Must include model.fit(X_train, y_train) and predictions assignment from model.predict(X_test).\n"
-                                "No imports/prints/markdown.\n"
+                                f"Generate TWO sections only:\n"
+                                f"AUTONOMOUS_PREPROCESSING_SECTION\n"
+                                f"AUTONOMOUS_TRAINING_SECTION\n\n"
+                                f"For {model_family}, you must:\n"
+                                f"- Define model instantiation: model = {model_family}(...)\n"
+                                f"- Include model.fit(X_train, y_train)\n"
+                                f"- Include predictions = model.predict(X_test)\n"
+                                f"- No imports/prints/markdown\n"
                             )
                             script_content, training_code, _ = _validate_and_regenerate_script(
                                 script_content=script_content,
                                 training_section=training_code or "",
                                 preprocessing_section=preprocessing_code,
                                 target_column=project_target_column,
-                                system_model_section=model_line,
-                                is_model_injected=True,
+                                system_model_section="",  # No model injection
+                                is_model_injected=False,  # LLM generates model
                                 exploration_mode=False,
                                 exploitation_lock=False,
                                 original_prompt=recovery_prompt,
@@ -3231,6 +3328,8 @@ def run_agent_loop(
                                 model_family,
                                 "completed",
                                 rmse=model_rmse,
+                                r2=metrics_payload.get("r2"),
+                                mae=metrics_payload.get("mae"),
                                 job_id=job_ids[idx],
                             )
                             _append_agent_sandbox_event(

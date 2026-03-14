@@ -9,6 +9,7 @@ export interface DashboardProject {
   num_rows: number;
   created_at: string | null;
   target_column: string;
+  agent_run_id?: string | null;
 }
 
 export interface DashboardOverviewResponse {
