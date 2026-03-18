@@ -28,6 +28,7 @@ export default function NewProjectPage() {
   const [targetColumns, setTargetColumns] = useState<string[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -308,20 +309,61 @@ export default function NewProjectPage() {
                               </div>
                             </div>
                           )}
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setFile(null);
-                              setDatasetInfo(null);
-                              setTargetColumns([]);
-                              setTargetColumn("");
-                              setCurrentStep(2);
-                            }}
-                            className="mt-2 text-[13px] font-medium text-rose-400 transition-colors hover:text-rose-300"
-                          >
-                            Remove file
-                          </button>
+                          <div className="mt-3 flex items-center gap-3">
+                            <button
+                              type="button"
+                              disabled={isUploading}
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!file) return;
+                                setIsUploading(true);
+                                setSubmitError(null);
+                                try {
+                                  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+                                  const fd = new FormData();
+                                  fd.append("file", file);
+                                  const res = await fetch(`${API_BASE}/upload-temp`, { method: "POST", body: fd });
+                                  if (!res.ok) {
+                                    const err = await res.json().catch(() => ({ detail: "Upload failed" }));
+                                    throw new Error(err.detail || "Upload failed");
+                                  }
+                                  const data = await res.json();
+                                  router.push(`/training/${encodeURIComponent(data.file_id)}/transform`);
+                                } catch (err) {
+                                  setSubmitError(err instanceof Error ? err.message : "Upload failed");
+                                } finally {
+                                  setIsUploading(false);
+                                }
+                              }}
+                              className="group relative flex items-center gap-2 rounded-xl border border-violet-500/30 bg-gradient-to-r from-violet-600/20 to-fuchsia-600/20 px-4 py-2 text-[13px] font-semibold text-violet-300 shadow-[0_0_16px_rgba(139,92,246,0.2)] transition-all hover:border-violet-400/50 hover:shadow-[0_0_24px_rgba(139,92,246,0.35)] disabled:opacity-60"
+                            >
+                              {isUploading ? (
+                                <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                </svg>
+                              ) : (
+                                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                              )}
+                              {isUploading ? "Uploading…" : "Transform Dataset"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setFile(null);
+                                setDatasetInfo(null);
+                                setTargetColumns([]);
+                                setTargetColumn("");
+                                setCurrentStep(2);
+                              }}
+                              className="text-[13px] font-medium text-rose-400 transition-colors hover:text-rose-300"
+                            >
+                              Remove file
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <div className="flex flex-col items-center gap-3">

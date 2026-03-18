@@ -627,6 +627,15 @@ export default function ResultsPage({ params }: { params: Promise<{ id: string }
                   <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-pulse" />
                   <span className="text-[13px] font-bold text-emerald-300">Recommended Model</span>
                 </span>
+                <Link
+                  href={`/results/${encodeURIComponent(id)}/experiment-report`}
+                  className="inline-flex items-center gap-2 rounded-xl border border-cyan-400/40 bg-cyan-500/10 px-4 py-2 text-[12px] font-semibold text-cyan-300 transition-all hover:bg-cyan-500/15 hover:text-cyan-200"
+                >
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-6m4 6V7m4 10V4M5 20h14" />
+                  </svg>
+                  View Experiment Report
+                </Link>
                 <div className="text-right">
                   <p className="text-[11px] text-slate-400 uppercase tracking-wide">Model Confidence</p>
                   <p className="text-[20px] font-bold text-cyan-400">{modelConfidence.toFixed(0)}%</p>

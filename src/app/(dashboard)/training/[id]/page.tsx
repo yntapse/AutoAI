@@ -347,6 +347,15 @@ export default function TrainingPage({ params }: { params: Promise<{ id: string 
     if (lower.includes("completed") || lower.includes("success") || lower.includes("finished")) {
       return { textClass: "text-[#5EDC8A]", icon: "✓", bgClass: "bg-[#3BB273]/10" };
     }
+    if (lower.includes("telemetry")) {
+      return { textClass: "text-cyan-300", icon: "◆", bgClass: "bg-cyan-500/10" };
+    }
+    if (lower.includes("architect") || lower.includes("blueprint")) {
+      return { textClass: "text-violet-300", icon: "✦", bgClass: "bg-violet-500/10" };
+    }
+    if (lower.includes("single-model gate") || lower.includes("gate rejected")) {
+      return { textClass: "text-orange-300", icon: "⚠", bgClass: "bg-orange-500/10" };
+    }
     if (lower.includes("queued") || lower.includes("starting") || lower.includes("started")) {
       return { textClass: "text-[#7ec8ff]", icon: "→", bgClass: "bg-[#3b82f6]/10" };
     }
@@ -649,6 +658,19 @@ export default function TrainingPage({ params }: { params: Promise<{ id: string 
                       )}
                     </span>
                   </button>
+                </div>
+
+                {/* Transform Dataset button */}
+                <div className="pt-1">
+                  <Link
+                    href={`/training/${encodeURIComponent(id)}/transform`}
+                    className="group relative flex w-full items-center justify-center gap-2 overflow-hidden rounded-xl border border-violet-400/30 bg-violet-500/10 px-4 py-2.5 text-[13px] font-semibold text-violet-200 transition-all duration-300 hover:bg-violet-500/20 hover:shadow-[0_0_20px_rgba(139,92,246,0.25)]"
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    Transform Dataset
+                  </Link>
                 </div>
 
                 {jobId && (

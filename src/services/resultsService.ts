@@ -22,6 +22,71 @@ export interface FineTuneResponse {
   };
 }
 
+export interface ExperimentReportIteration {
+  iteration: number;
+  training_run_id: string;
+  status: string;
+  model_name: string | null;
+  rmse: number | null;
+  mae: number | null;
+  r2: number | null;
+  duration_seconds: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+  delta_from_previous_rmse: number | null;
+  delta_from_best_rmse: number | null;
+  is_new_best: boolean;
+  strategy_summary: string | null;
+  candidate_models: Array<{
+    model_name: string;
+    rank_position: number | null;
+    rmse: number | null;
+    mae: number | null;
+    r2: number | null;
+    hyperparameters: Record<string, unknown> | null;
+  }>;
+  preprocessing_tokens: string[];
+  training_tokens: string[];
+  agent_signals: {
+    architect_blueprints: number;
+    architect_fallbacks: number;
+    single_model_gate_rejections: number;
+    compile_fallbacks: number;
+    telemetry_events: number;
+  };
+  log_excerpt: string[];
+}
+
+export interface ExperimentReportResponse {
+  file_id: string;
+  project_id: string;
+  project_name: string;
+  target_column: string;
+  agent_run_id: string;
+  agent_status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  summary: {
+    iterations_completed: number;
+    max_iterations: number;
+    baseline_iteration: ExperimentReportIteration | null;
+    best_iteration: ExperimentReportIteration | null;
+    rmse_reduction: number | null;
+    rmse_reduction_percent: number | null;
+    r2_gain: number | null;
+    best_model_name: string | null;
+  };
+  iterations: ExperimentReportIteration[];
+  strategy_themes: Array<{
+    name: string;
+    count: number;
+  }>;
+  log_retention: {
+    available: boolean;
+    captured_lines: number;
+  };
+}
+
 export async function getTrainingHistory(fileId: string): Promise<unknown> {
   const response = await fetch(`${API_BASE}/training/history/${encodeURIComponent(fileId)}`);
 
@@ -41,6 +106,29 @@ export async function getTrainingHistory(fileId: string): Promise<unknown> {
   }
 
   return payload;
+}
+
+export async function getExperimentReport(fileId: string): Promise<ExperimentReportResponse> {
+  const response = await fetch(`${API_BASE}/training/report/${encodeURIComponent(fileId)}`, {
+    cache: "no-store",
+  });
+
+  const contentType = response.headers.get("content-type") ?? "";
+  const isJson = contentType.includes("application/json");
+  const payload = isJson ? await response.json() : await response.text();
+
+  if (!response.ok) {
+    const message =
+      isJson && payload && typeof payload === "object" && "detail" in payload
+        ? String((payload as { detail?: unknown }).detail)
+        : typeof payload === "string"
+        ? payload
+        : "Failed to fetch experiment report.";
+
+    throw new Error(message);
+  }
+
+  return payload as ExperimentReportResponse;
 }
 
 function downloadFromEndpoint(url: string): void {

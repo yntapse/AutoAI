@@ -46,7 +46,19 @@ import numpy as np
 
 from database import Base, SessionLocal, engine
 from services.llm_service import get_hyperparameter_suggestions, validate_hyperparameters, SAFE_HYPERPARAMETERS
-from services.llm_service import get_hyperparameter_suggestions, validate_hyperparameters, SAFE_HYPERPARAMETERS
+from services.prompt_architect import (
+    ENABLE_PROMPT_ARCHITECT,
+    Blueprint,
+    ErrorContext,
+    ArchitectTelemetry,
+    build_error_context,
+    validate_blueprint,
+    deterministic_blueprint,
+    build_architect_prompt,
+    parse_architect_response,
+    blueprint_to_generator_prompt,
+    enforce_single_model,
+)
 
 app = FastAPI(title="PyrunAI Backend", version="1.0.0")
 
@@ -115,6 +127,9 @@ AGENT_MODELS_IN_PROGRESS: Dict[str, List[Dict[str, Any]]] = {}
 AGENT_SANDBOX_EVENT_LOGS: Dict[str, List[str]] = {}
 MAX_AGENT_SANDBOX_EVENT_LOGS = 250
 
+# In-memory transform sessions: session_id -> session dict
+TRANSFORM_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
 
 def get_db():
     db = SessionLocal()
@@ -122,6 +137,103 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ── Standalone LLM helpers (used by transform endpoints) ───────────────────
+def _resolve_llm_client_standalone(
+    force_provider: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """Resolve an LLM client/model at module level (no run-agent closure).
+
+    Priority: Groq -> OpenAI -> Gemini (or forced via *force_provider*).
+    """
+    requested = (force_provider or os.getenv("LLM_PROVIDER") or "").strip().lower()
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+
+    if not groq_key and not openai_key and not gemini_key:
+        return None, None, None
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        if gemini_key:
+            return None, os.getenv("GEMINI_MODEL") or "gemini-2.0-flash", "gemini"
+        return None, None, None
+
+    use_groq = bool(groq_key) and requested in {"", "groq", "auto"}
+    use_openai = bool(openai_key) and requested == "openai"
+    use_gemini = bool(gemini_key) and requested == "gemini"
+
+    if requested in {"", "auto"}:
+        if groq_key:
+            use_groq = True
+        elif openai_key:
+            use_openai = True
+        elif gemini_key:
+            use_gemini = True
+
+    if use_groq:
+        model = os.getenv("GROQ_MODEL") or os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
+        client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=45.0)
+        return client, model, "groq"
+
+    if use_openai:
+        model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+        client = OpenAI(api_key=openai_key, timeout=45.0)
+        return client, model, "openai"
+
+    if use_gemini or gemini_key:
+        model = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
+        return None, model, "gemini"
+
+    return None, None, None
+
+
+def _call_gemini_text_standalone(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+    model_override: Optional[str] = None,
+) -> Optional[str]:
+    """Call Gemini REST API at module level (no closure dependency)."""
+    gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not gemini_key:
+        return None
+
+    gemini_model = model_override or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash"
+
+    payload = {
+        "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
+        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+    }
+
+    import urllib.error
+    import urllib.request
+
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+        f"?key={gemini_key}"
+    )
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=45) as response:
+        raw_body = response.read().decode("utf-8")
+    parsed = json.loads(raw_body)
+
+    candidates = parsed.get("candidates") or []
+    if not candidates:
+        return None
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text_parts = [p["text"] for p in parts if isinstance(p.get("text"), str) and p["text"].strip()]
+    return "\n".join(text_parts).strip() if text_parts else None
 
 
 def _update_job_status(
@@ -188,6 +300,115 @@ def _append_agent_sandbox_event(agent_id: Optional[Any], message: str) -> None:
     timestamp = datetime.utcnow().strftime("%H:%M:%S")
     logs.append(f"[{timestamp}] {message}")
     AGENT_SANDBOX_EVENT_LOGS[agent_key] = logs[-MAX_AGENT_SANDBOX_EVENT_LOGS:]
+
+
+def _parse_token_list(raw_value: Optional[Any]) -> List[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    if not isinstance(raw_value, str):
+        raw_value = str(raw_value)
+    return [part.strip() for part in raw_value.split(",") if part.strip()]
+
+
+def _safe_float(value: Optional[Any]) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_accuracy_score(r2_value: Optional[Any]) -> Optional[float]:
+    parsed = _safe_float(r2_value)
+    if parsed is None:
+        return None
+    return max(0.0, min(1.0, parsed))
+
+
+def _build_iteration_log_index(logs: List[str]) -> Dict[int, Dict[str, Any]]:
+    indexed: Dict[int, Dict[str, Any]] = {}
+    active_iteration: Optional[int] = None
+
+    def ensure_iteration(iteration_number: int) -> Dict[str, Any]:
+        if iteration_number not in indexed:
+            indexed[iteration_number] = {
+                "strategy_summary": None,
+                "architect_blueprints": 0,
+                "architect_fallbacks": 0,
+                "single_model_gate_rejections": 0,
+                "compile_fallbacks": 0,
+                "telemetry_events": 0,
+                "log_excerpt": [],
+            }
+        return indexed[iteration_number]
+
+    for raw_line in logs:
+        if not isinstance(raw_line, str):
+            continue
+
+        cleaned = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", raw_line).strip()
+        if not cleaned:
+            continue
+
+        start_match = re.search(r"Starting iteration (\d+)/(\d+)", cleaned)
+        if start_match:
+            active_iteration = int(start_match.group(1))
+            ensure_iteration(active_iteration)
+
+        rmse_match = re.search(r"Iteration (\d+) RMSE:", cleaned)
+        if rmse_match:
+            active_iteration = int(rmse_match.group(1))
+            ensure_iteration(active_iteration)
+
+        failure_match = re.search(r"Iteration (\d+) failed:", cleaned)
+        if failure_match:
+            active_iteration = int(failure_match.group(1))
+            ensure_iteration(active_iteration)
+
+        if active_iteration is None:
+            continue
+
+        bucket = ensure_iteration(active_iteration)
+
+        if cleaned.startswith("Strategy: "):
+            bucket["strategy_summary"] = cleaned.split("Strategy: ", 1)[1].strip()
+        if "Architect: Blueprint generated" in cleaned:
+            bucket["architect_blueprints"] += 1
+        if "Architect: Fallback blueprint" in cleaned:
+            bucket["architect_fallbacks"] += 1
+        if "Single-model gate rejected" in cleaned:
+            bucket["single_model_gate_rejections"] += 1
+        if "Compile gate:" in cleaned:
+            bucket["compile_fallbacks"] += 1
+        if cleaned.startswith("Telemetry ["):
+            bucket["telemetry_events"] += 1
+
+        is_interesting = (
+            cleaned.startswith("Stage:")
+            or cleaned.startswith("Strategy:")
+            or cleaned.startswith("Architect:")
+            or cleaned.startswith("Telemetry [")
+            or "Single-model gate rejected" in cleaned
+            or cleaned.startswith("Iteration ")
+            or cleaned.startswith("New best RMSE")
+        )
+        if is_interesting and len(bucket["log_excerpt"]) < 8:
+            bucket["log_excerpt"].append(cleaned)
+
+    return indexed
+
+
+def _build_strategy_theme_summary(iterations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    theme_counts: Dict[str, int] = {}
+    for iteration in iterations:
+        for token in iteration.get("preprocessing_tokens", []):
+            theme_counts[token] = theme_counts.get(token, 0) + 1
+        for token in iteration.get("training_tokens", []):
+            theme_counts[token] = theme_counts.get(token, 0) + 1
+
+    ranked = sorted(theme_counts.items(), key=lambda item: (-item[1], item[0]))
+    return [{"name": name, "count": count} for name, count in ranked[:8]]
 
 
 def _is_sandbox_worker_running() -> bool:
@@ -1386,35 +1607,56 @@ def run_agent_loop(
             return ""
         return " ".join(code_text.split())
 
+    # Broad natural language keyword pattern for LLM prose lines
+    _NL_PATTERN = re.compile(
+        r"^\s*(Use|Try|Apply|Implement|Consider|Ensure|Remember|Note|Make sure|"
+        r"You should|You can|This will|This should|To improve|For better|"
+        r"Example|Replace|Step|First|Then|Finally|Next|After|Before|Here|The|"
+        r"Load|Add|Create|Define|Generate|Calculate|Compute|Build|Fit|Predict|"
+        r"Evaluate|Scale|Encode|Normalize|Select|Remove|Drop|Handle|Convert|"
+        r"Transform|Split|Train|Tune|Optimize|Adjust|Set|Initialize|Prepare|"
+        r"Start|Continue|Complete|Check|Verify|Validate)\s+[a-zA-Z]",
+        re.IGNORECASE,
+    )
+
     def _remove_natural_language_from_code(code: Optional[str]) -> Optional[str]:
-        """Remove natural language instruction lines from LLM-generated code."""
+        """Remove natural language instruction lines from LLM-generated code,
+        then strip any remaining lines that cause a SyntaxError when compiled."""
         if not code:
             return None
-        
-        # Pattern to detect natural language instructions
-        natural_language_pattern = re.compile(
-            r"^\s*(Use|Try|Apply|Implement|Consider|Ensure|Remember|Note|Make sure|You should|You can|This will|This should|To improve|For better)\s+",
-            re.IGNORECASE,
-        )
-        
+
         cleaned_lines: List[str] = []
         for line in code.splitlines():
             stripped_line = line.strip()
-            # Keep empty lines
             if not stripped_line:
                 cleaned_lines.append(line)
                 continue
-            # Keep comment lines
             if stripped_line.startswith("#"):
                 cleaned_lines.append(line)
                 continue
-            # Skip natural language instructions
-            if natural_language_pattern.match(stripped_line):
+            if _NL_PATTERN.match(stripped_line):
                 continue
-            # Keep valid Python code
             cleaned_lines.append(line)
-        
-        result = "\n".join(cleaned_lines).strip()
+
+        # Second pass: strip individual lines that introduce SyntaxErrors.
+        # We do this iteratively until the accumulated code compiles cleanly
+        # or we run out of lines to remove (max 15 passes).
+        result_lines = cleaned_lines
+        for _ in range(15):
+            candidate = "\n".join(result_lines)
+            try:
+                compile(candidate, "<string>", "exec")
+                break  # compiles fine
+            except SyntaxError as se:
+                bad_lineno = (se.lineno or 1) - 1  # 0-indexed
+                if 0 <= bad_lineno < len(result_lines):
+                    result_lines = [
+                        l for i, l in enumerate(result_lines) if i != bad_lineno
+                    ]
+                else:
+                    break  # can't pinpoint line — leave as-is
+
+        result = "\n".join(result_lines).strip()
         return result if result else None
 
     def _sanitize_training_section(
@@ -2705,6 +2947,8 @@ def run_agent_loop(
                         polled_job.error_log,
                     )
                     model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
+                    metrics["_sandbox_status"] = current_status
+                    metrics["_error_message"] = None
                     results[idx] = metrics
                     _set_agent_model_status(
                         agent_run_id,
@@ -2735,7 +2979,12 @@ def run_agent_loop(
                         agent_run_id,
                         f"Model metrics unavailable: {model_name} ({job_id}) | {exc}",
                     )
-                    results[idx] = _empty_sandbox_metrics()
+                    failed_metrics = _empty_sandbox_metrics()
+                    failed_metrics["_sandbox_status"] = current_status
+                    # Prefer the raw error_log from DB (has full text incl exit codes);
+                    # fall back to exception message if not available.
+                    failed_metrics["_error_message"] = polled_job.error_log or str(exc)
+                    results[idx] = failed_metrics
 
                 pending_job_id_set.discard(job_id)
                 last_progress_at = now
@@ -2885,6 +3134,10 @@ def run_agent_loop(
         per_model_previous_preprocessing: Dict[str, Optional[str]] = {m: None for m in model_families}
         per_model_previous_training: Dict[str, Optional[str]] = {m: None for m in model_families}
         per_model_best_rmse: Dict[str, Optional[float]] = {m: None for m in model_families}
+        # Prompt Architect state
+        per_model_previous_blueprint: Dict[str, Optional[Blueprint]] = {m: None for m in model_families}
+        per_model_last_error: Dict[str, ErrorContext] = {m: ErrorContext(error_type="none") for m in model_families}
+        per_model_telemetry: Dict[str, List[ArchitectTelemetry]] = {m: [] for m in model_families}
 
         while True:
             iteration_db = SessionLocal()
@@ -3107,7 +3360,7 @@ def run_agent_loop(
                     print(f"PARALLEL EXECUTION: Generating scripts for all {len(model_families)} models...")
                     
                     # Track models being trained for UI
-                    AGENT_SANDBOX_EVENT_LOGS[str(agent_run_id)] = []
+                    AGENT_SANDBOX_EVENT_LOGS.setdefault(str(agent_run_id), [])
                     AGENT_MODELS_IN_PROGRESS[str(agent_run_id)] = [
                         {"name": model, "status": "pending", "rmse": None, "r2": None, "mae": None, "job_id": None, "error": None}
                         for model in model_families
@@ -3125,76 +3378,153 @@ def run_agent_loop(
                         model_specific_best = per_model_best_rmse.get(model_family)
                         model_line = _get_model_instantiation_line(model_family)
 
-                        # Build previous iteration context for this specific model
-                        previous_iteration_context = ""
-                        if previous_model_preprocessing or previous_model_training:
-                            previous_iteration_context = f"""
-=== PREVIOUS ITERATION FOR {model_family} ===
-Previous RMSE: {model_specific_best if model_specific_best else 'N/A'}
-
-Previous Preprocessing Code:
-{previous_model_preprocessing or '# No previous preprocessing'}
-
-Previous Training Code:
-{previous_model_training or '# No previous training'}
-
-What worked: {json.dumps(performance_context.get('successful_patterns', []), default=str)}
-What failed: {json.dumps(performance_context.get('failed_patterns', []), default=str)}
-==========================================
-"""
-                        
-                        model_prompt = (
-                            f"You are an autonomous ML optimization expert for {model_family}.\n\n"
-                            "YOUR TASK: Generate unique, model-specific code to maximize performance.\n\n"
-                            "Generate TWO sections using these exact markers:\n"
-                            "AUTONOMOUS_PREPROCESSING_SECTION\n"
-                            "AUTONOMOUS_TRAINING_SECTION\n\n"
-                            f"=== CURRENT SITUATION ===\n"
-                            f"Model Family: {model_family}\n"
-                            f"Iteration: {current_iteration}\n"
-                            f"Your Best RMSE So Far: {model_specific_best if model_specific_best else 'Not trained yet'}\n"
-                            f"Global Best RMSE (all models): {best_rmse}\n"
-                            f"Last Iteration RMSE: {last_rmse}\n"
-                            f"Stagnation Count: {no_improvement_counter}\n"
-                            f"Strategy Needed: {strategy_reasoning}\n\n"
-                            f"=== DATASET INFORMATION ===\n"
-                            f"Dataset Metadata: {json.dumps(performance_context.get('dataset', {}), default=str)}\n"
-                            f"Dataset Profile: {performance_context.get('dataset_profile_summary')}\n\n"
-                            f"{previous_iteration_context}\n"
-                            f"=== YOUR CREATIVE FREEDOM ===\n"
-                            f"For {model_family}, you have FULL CONTROL to:\n"
-                            f"1. Define model instantiation with ANY hyperparameters you think will work best\n"
-                            f"2. Choose unique preprocessing strategies tailored to {model_family}'s strengths\n"
-                            f"3. Implement model-specific feature engineering\n"
-                            f"4. Use hyperparameter tuning (GridSearch/RandomSearch) if beneficial\n"
-                            f"5. Apply cross-validation strategies\n"
-                            f"6. Experiment with feature selection techniques\n"
-                            f"7. Try ensemble methods, stacking, or blending\n"
-                            f"8. Use domain knowledge about what works well for {model_family}\n\n"
-                            f"REQUIREMENTS:\n"
-                            f"- PREPROCESSING must define: X_train, X_test, y_train, y_test\n"
-                            f"- TRAINING must include: model instantiation, model.fit(), predictions = model.predict()\n"
-                            f"- Use {model_family} as the base model class (import from sklearn/xgboost)\n"
-                            f"- Be CREATIVE and DIFFERENT from other models - each model should have unique optimizations\n\n"
-                            f"CRITICAL OUTPUT RULES:\n"
-                            f"- Output ONLY executable Python code - NO natural language explanations\n"
-                            f"- NO markdown formatting (no ```, no language tags)\n"
-                            f"- NO instructional text like 'Use this' or 'Try that'\n"
-                            f"- NO bullet points or suggestions - only valid Python statements\n"
-                            f"- Every line must be valid Python syntax (code or comments starting with #)\n"
-                            f"- Comments MUST start with # symbol\n"
-                            f"- Write code AS IF you're writing a .py file that will be executed directly\n\n"
-                            f"MAKE YOUR CODE UNIQUE FOR {model_family} - Don't generate generic code!\n"
-                        )
-                        model_prompt += _build_training_pressure_directive(
-                            no_improvement_counter,
-                            improvement_delta,
-                            previous_model_training,
+                        # --- Telemetry record for this model+iteration ---
+                        telemetry = ArchitectTelemetry(
+                            model_family=model_family,
+                            iteration=current_iteration,
                         )
 
-                        raw_sections = _generate_autonomous_section_via_llm(model_prompt)
+                        # ============================================================
+                        #  TWO-STAGE PIPELINE: Prompt Architect → Script Generator
+                        # ============================================================
+                        if ENABLE_PROMPT_ARCHITECT:
+                            # ── Stage 1: Architect Agent produces blueprint ──
+                            error_ctx = per_model_last_error.get(
+                                model_family, ErrorContext(error_type="none")
+                            )
+                            prev_bp = per_model_previous_blueprint.get(model_family)
+
+                            arch_sys, arch_user = build_architect_prompt(
+                                model_family=model_family,
+                                iteration=current_iteration,
+                                strategy_reasoning=strategy_reasoning,
+                                dataset_metadata=performance_context.get("dataset", {}),
+                                dataset_profile_summary=performance_context.get("dataset_profile_summary"),
+                                previous_rmse=model_specific_best,
+                                best_rmse=best_rmse,
+                                stagnation_count=no_improvement_counter,
+                                error_context=error_ctx,
+                                previous_blueprint=prev_bp,
+                            )
+
+                            architect_raw = _call_autonomous_llm_text(
+                                system_prompt=arch_sys,
+                                user_prompt=arch_user,
+                                temperature=0.25,
+                                max_tokens=800,
+                                failure_log_prefix=f"ARCHITECT FALLBACK ({model_family})",
+                            )
+
+                            bp_ok, blueprint, bp_errors = parse_architect_response(
+                                architect_raw, model_family
+                            )
+
+                            if bp_ok and blueprint is not None:
+                                blueprint.architect_raw = architect_raw
+                                telemetry.architect_success = True
+                                print(f"ARCHITECT: Blueprint OK for {model_family}")
+                                _append_agent_sandbox_event(
+                                    agent_run_id,
+                                    f"Architect: Blueprint generated for {model_family}",
+                                )
+                            else:
+                                print(
+                                    f"ARCHITECT: Blueprint FAILED for {model_family}: {bp_errors}. "
+                                    "Using deterministic fallback."
+                                )
+                                blueprint = deterministic_blueprint(model_family)
+                                telemetry.architect_success = False
+                                telemetry.reason_code = "architect_parse_fail"
+                                _append_agent_sandbox_event(
+                                    agent_run_id,
+                                    f"Architect: Fallback blueprint for {model_family}",
+                                )
+
+                            per_model_previous_blueprint[model_family] = blueprint
+
+                            # ── Stage 2: Generator Agent writes code from blueprint ──
+                            generator_prompt = blueprint_to_generator_prompt(
+                                blueprint, project_target_column
+                            )
+                            generator_prompt += _build_training_pressure_directive(
+                                no_improvement_counter,
+                                improvement_delta,
+                                previous_model_training,
+                            )
+
+                            raw_sections = _generate_autonomous_section_via_llm(generator_prompt)
+
+                        else:
+                            # ── Legacy single-stage path (feature flag off) ──
+                            # Build previous iteration context for this specific model
+                            previous_iteration_context = ""
+                            if previous_model_preprocessing or previous_model_training:
+                                previous_iteration_context = (
+                                    f"\n=== PREVIOUS ITERATION FOR {model_family} ===\n"
+                                    f"Previous RMSE: {model_specific_best if model_specific_best else 'N/A'}\n"
+                                    f"\nPrevious Preprocessing Code:\n"
+                                    f"{previous_model_preprocessing or '# No previous preprocessing'}\n"
+                                    f"\nPrevious Training Code:\n"
+                                    f"{previous_model_training or '# No previous training'}\n"
+                                    f"\nWhat worked: {json.dumps(performance_context.get('successful_patterns', []), default=str)}\n"
+                                    f"What failed: {json.dumps(performance_context.get('failed_patterns', []), default=str)}\n"
+                                    f"==========================================\n"
+                                )
+
+                            model_prompt = (
+                                f"You are an autonomous ML optimization expert for {model_family}.\n\n"
+                                "YOUR TASK: Generate unique, model-specific code to maximize performance.\n\n"
+                                "Generate TWO sections using these exact markers:\n"
+                                "AUTONOMOUS_PREPROCESSING_SECTION\n"
+                                "AUTONOMOUS_TRAINING_SECTION\n\n"
+                                f"=== CURRENT SITUATION ===\n"
+                                f"Model Family: {model_family}\n"
+                                f"Iteration: {current_iteration}\n"
+                                f"Your Best RMSE So Far: {model_specific_best if model_specific_best else 'Not trained yet'}\n"
+                                f"Global Best RMSE (all models): {best_rmse}\n"
+                                f"Last Iteration RMSE: {last_rmse}\n"
+                                f"Stagnation Count: {no_improvement_counter}\n"
+                                f"Strategy Needed: {strategy_reasoning}\n\n"
+                                f"=== DATASET INFORMATION ===\n"
+                                f"Dataset Metadata: {json.dumps(performance_context.get('dataset', {}), default=str)}\n"
+                                f"Dataset Profile: {performance_context.get('dataset_profile_summary')}\n\n"
+                                f"{previous_iteration_context}\n"
+                                f"=== YOUR CREATIVE FREEDOM ===\n"
+                                f"For {model_family}, you have FULL CONTROL to:\n"
+                                f"1. Define model instantiation with ANY hyperparameters you think will work best\n"
+                                f"2. Choose unique preprocessing strategies tailored to {model_family}'s strengths\n"
+                                f"3. Implement model-specific feature engineering\n"
+                                f"4. Use hyperparameter tuning (GridSearch/RandomSearch) if beneficial\n"
+                                f"5. Apply cross-validation strategies\n"
+                                f"6. Experiment with feature selection techniques\n"
+                                f"7. Try ensemble methods, stacking, or blending\n"
+                                f"8. Use domain knowledge about what works well for {model_family}\n\n"
+                                f"REQUIREMENTS:\n"
+                                f"- PREPROCESSING must define: X_train, X_test, y_train, y_test\n"
+                                f"- TRAINING must include: model instantiation, model.fit(), predictions = model.predict()\n"
+                                f"- Use {model_family} as the base model class (import from sklearn/xgboost)\n"
+                                f"- Be CREATIVE and DIFFERENT from other models - each model should have unique optimizations\n\n"
+                                f"CRITICAL OUTPUT RULES:\n"
+                                f"- Output ONLY executable Python code - NO natural language explanations\n"
+                                f"- NO markdown formatting (no ```, no language tags)\n"
+                                f"- NO instructional text like 'Use this' or 'Try that'\n"
+                                f"- NO bullet points or suggestions - only valid Python statements\n"
+                                f"- Every line must be valid Python syntax (code or comments starting with #)\n"
+                                f"- Comments MUST start with # symbol\n"
+                                f"- Write code AS IF you're writing a .py file that will be executed directly\n\n"
+                                f"MAKE YOUR CODE UNIQUE FOR {model_family} - Don't generate generic code!\n"
+                            )
+                            model_prompt += _build_training_pressure_directive(
+                                no_improvement_counter,
+                                improvement_delta,
+                                previous_model_training,
+                            )
+
+                            raw_sections = _generate_autonomous_section_via_llm(model_prompt)
+
+                        # ── Common post-processing (both paths) ──
                         preprocessing_code, training_code = _parse_sectioned_autonomous_output(raw_sections)
-                        
+
                         # Remove any natural language instructions from LLM output
                         preprocessing_code = _remove_natural_language_from_code(preprocessing_code)
                         training_code = _remove_natural_language_from_code(training_code)
@@ -3214,7 +3544,10 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
                             improvement_delta,
                         )
                         if needs_regen:
-                            stronger_prompt = model_prompt + "\nSTRICT REGENERATION DIRECTIVE: " + regen_reason + "\n"
+                            if ENABLE_PROMPT_ARCHITECT:
+                                stronger_prompt = generator_prompt + "\nSTRICT REGENERATION DIRECTIVE: " + regen_reason + "\n"
+                            else:
+                                stronger_prompt = model_prompt + "\nSTRICT REGENERATION DIRECTIVE: " + regen_reason + "\n"
                             stronger_sections = _generate_autonomous_section_via_llm(stronger_prompt)
                             _, stronger_training = _parse_sectioned_autonomous_output(stronger_sections)
                             # Remove natural language from regenerated code
@@ -3226,6 +3559,8 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
 
                         if not training_code or "model.fit" not in training_code or "predict" not in training_code:
                             training_code = _fallback_training_section_without_model()
+                            telemetry.fallback_used = True
+                            telemetry.reason_code = telemetry.reason_code or "generator_output_invalid"
 
                         script_content = _build_exploration_script_template(
                             preprocessing_code,
@@ -3233,6 +3568,54 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
                             "",  # No model injection - LLM generates it
                             training_code,
                         )
+
+                        # ── Single-model AST enforcement gate ──
+                        if ENABLE_PROMPT_ARCHITECT:
+                            sm_passed, sm_violations = enforce_single_model(
+                                script_content, model_family
+                            )
+                            if not sm_passed:
+                                print(
+                                    f"SINGLE-MODEL GATE: Rejected {model_family} script: "
+                                    f"{sm_violations}"
+                                )
+                                _append_agent_sandbox_event(
+                                    agent_run_id,
+                                    f"Single-model gate rejected {model_family}: {sm_violations[0][:80]}",
+                                )
+                                telemetry.reason_code = "multi_model_detected"
+                                # Re-generate with ultra-strict prompt
+                                strict_regen_prompt = (
+                                    f"Generate code for EXACTLY ONE model: {model_family}.\n"
+                                    f"Do NOT use any other model class.\n\n"
+                                    f"AUTONOMOUS_PREPROCESSING_SECTION\n"
+                                    f"AUTONOMOUS_TRAINING_SECTION\n\n"
+                                    f"model = {model_family}(...)\n"
+                                    f"model.fit(X_train, y_train)\n"
+                                    f"predictions = model.predict(X_test)\n"
+                                )
+                                regen_raw = _generate_autonomous_section_via_llm(strict_regen_prompt)
+                                regen_pre, regen_train = _parse_sectioned_autonomous_output(regen_raw)
+                                regen_pre = _remove_natural_language_from_code(regen_pre)
+                                regen_train = _remove_natural_language_from_code(regen_train)
+
+                                if regen_pre and "train_test_split" in regen_pre:
+                                    preprocessing_code = regen_pre
+                                regen_train = _sanitize_training_section(
+                                    regen_train, disallow_model_redefinition=False
+                                )
+                                if regen_train and "model.fit" in regen_train and "predict" in regen_train:
+                                    training_code = regen_train
+                                else:
+                                    training_code = _fallback_training_section_without_model()
+                                    telemetry.fallback_used = True
+
+                                script_content = _build_exploration_script_template(
+                                    preprocessing_code,
+                                    project_target_column,
+                                    "",
+                                    training_code,
+                                )
 
                         validation_result = _validate_script_contract(
                             script_content=script_content,
@@ -3252,7 +3635,7 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
                                 f"- Include predictions = model.predict(X_test)\n"
                                 f"- No imports/prints/markdown\n"
                             )
-                            script_content, training_code, _ = _validate_and_regenerate_script(
+                            script_content, training_code, used_fallback = _validate_and_regenerate_script(
                                 script_content=script_content,
                                 training_section=training_code or "",
                                 preprocessing_section=preprocessing_code,
@@ -3263,6 +3646,45 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
                                 exploitation_lock=False,
                                 original_prompt=recovery_prompt,
                             )
+                            if used_fallback:
+                                telemetry.fallback_used = True
+                                telemetry.reason_code = telemetry.reason_code or "validator_fail"
+                        else:
+                            telemetry.generator_success = True
+                            telemetry.validator_pass = True
+
+                        # Record telemetry
+                        per_model_telemetry[model_family].append(telemetry)
+
+                        # ── Final compile gate: catch any residual SyntaxErrors ──
+                        try:
+                            compile(script_content, "<string>", "exec")
+                        except SyntaxError as _syntax_err:
+                            print(
+                                f"COMPILE GATE: SyntaxError in {model_family} script "
+                                f"(line {_syntax_err.lineno}): {_syntax_err.msg} — using safe fallback"
+                            )
+                            _append_agent_sandbox_event(
+                                agent_run_id,
+                                f"Compile gate: SyntaxError in {model_family} script — using safe fallback",
+                            )
+                            # Rebuild from deterministic fallback blueprint
+                            _safe_bp = deterministic_blueprint(model_family)
+                            _safe_gen_prompt = blueprint_to_generator_prompt(_safe_bp, project_target_column)
+                            _safe_raw = _generate_autonomous_section_via_llm(_safe_gen_prompt)
+                            _safe_pre, _safe_train = _parse_sectioned_autonomous_output(_safe_raw)
+                            _safe_pre = _remove_natural_language_from_code(_safe_pre) or _fallback_preprocessing_section([])
+                            _safe_train = _remove_natural_language_from_code(_safe_train)
+                            _safe_train = _sanitize_training_section(_safe_train, disallow_model_redefinition=False)
+                            if not _safe_train or "model.fit" not in _safe_train:
+                                _safe_train = _fallback_training_section_without_model()
+                            script_content = _build_exploration_script_template(
+                                _safe_pre, project_target_column, "", _safe_train
+                            )
+                            preprocessing_code = _safe_pre
+                            training_code = _safe_train
+                            telemetry.fallback_used = True
+                            telemetry.reason_code = telemetry.reason_code or "syntax_error_fallback"
 
                         model_scripts_data.append({
                             "model_family": model_family,
@@ -3271,6 +3693,17 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
                             "training_code": training_code,
                         })
                         print(f"PARALLEL EXECUTION: Script validated for {model_family}")
+                        if ENABLE_PROMPT_ARCHITECT:
+                            telem_msg = (
+                                f"Telemetry [{model_family}]: "
+                                f"architect={'OK' if telemetry.architect_success else 'FAIL'} | "
+                                f"generator={'OK' if telemetry.generator_success else 'FAIL'} | "
+                                f"validator={'PASS' if telemetry.validator_pass else 'FAIL'}"
+                            )
+                            if telemetry.fallback_used:
+                                telem_msg += f" | fallback=YES ({telemetry.reason_code})"
+                            print(telem_msg)
+                            _append_agent_sandbox_event(agent_run_id, telem_msg)
 
                     # Phase 2: Create all sandbox jobs at once
                     _update_training_run_stage(training_run_id, "training_models", 40)
@@ -3344,6 +3777,22 @@ What failed: {json.dumps(performance_context.get('failed_patterns', []), default
 
                         per_model_previous_preprocessing[model_family] = preprocessing_code
                         per_model_previous_training[model_family] = training_code
+
+                        # Capture error context for Prompt Architect next iteration
+                        if ENABLE_PROMPT_ARCHITECT:
+                            _err_ctx = build_error_context({
+                                "status": metrics_payload.get("_sandbox_status", "completed"),
+                                "error_log": metrics_payload.get("_error_message"),
+                            })
+                            per_model_last_error[model_family] = _err_ctx
+                            if _err_ctx.error_type != "none":
+                                _err_log_msg = (
+                                    f"Error context captured for {model_family}: "
+                                    f"type={_err_ctx.error_type} stage={_err_ctx.stage} "
+                                    f"— Architect will adapt next iteration"
+                                )
+                                print(f"ARCHITECT ERROR CONTEXT: {_err_log_msg}")
+                                _append_agent_sandbox_event(agent_run_id, _err_log_msg)
 
                         if model_rmse is not None:
                             prior_best_for_model = per_model_best_rmse.get(model_family)
@@ -4061,6 +4510,56 @@ def _execute_start_training_with_progress(
         "models": results,
         "best_model": best_model
     }
+
+
+@app.post("/upload-temp")
+async def upload_temp_file(
+    file: UploadFile = File(..., description="CSV file to upload for transformation"),
+    db: Session = Depends(get_db),
+):
+    """Upload a CSV file temporarily and create a minimal project record so
+    the transform workflow can reference it.  Returns the generated file_id."""
+    if not file.filename or not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File too large. Max 20 MB allowed.")
+
+    unique_filename = f"{uuid.uuid4()}.csv"
+    file_path = UPLOAD_DIR / unique_filename
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    try:
+        df = pd.read_csv(file_path)
+        validate_dataset_limits(df)
+    except HTTPException:
+        file_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {exc}")
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    categorical_cols = [c for c in df.columns if c not in numeric_cols]
+    target_col = df.columns[-1]
+
+    project = Project(
+        project_name=Path(file.filename).stem,
+        file_id=unique_filename,
+        target_column=str(target_col),
+        num_rows=len(df),
+        num_features=len(df.columns),
+        num_numeric_features=len(numeric_cols),
+        num_categorical_features=len(categorical_cols),
+        missing_value_count=int(df.isnull().sum().sum()),
+        target_variance=float(df[target_col].var()) if target_col in numeric_cols else 0.0,
+    )
+    db.add(project)
+    db.commit()
+
+    return {"file_id": unique_filename}
 
 
 @app.post("/projects/create")
@@ -4969,6 +5468,214 @@ async def get_training_history(file_id: str):
             status_code=500,
             detail="Internal Server Error"
         )
+
+
+@app.get("/training/report/{file_id}")
+async def get_training_report(file_id: str):
+    """
+    Build an experiment report for the latest autonomous agent run on a dataset.
+    """
+    try:
+        db = SessionLocal()
+        try:
+            project = db.query(Project).filter(Project.file_id == file_id).first()
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+            latest_agent_run = (
+                db.query(AgentRun)
+                .filter(AgentRun.project_id == project.id)
+                .order_by(AgentRun.started_at.desc(), AgentRun.created_at.desc())
+                .first()
+            )
+            if latest_agent_run is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No autonomous experiment report found for file '{file_id}'.",
+                )
+
+            training_runs = (
+                db.query(TrainingRun)
+                .filter(TrainingRun.agent_run_id == latest_agent_run.id)
+                .order_by(TrainingRun.version_number.asc(), TrainingRun.created_at.asc())
+                .all()
+            )
+            if not training_runs:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No autonomous training iterations found for file '{file_id}'.",
+                )
+
+            experiment_memory_rows = (
+                db.query(ExperimentMemory)
+                .filter(ExperimentMemory.project_id == project.id)
+                .filter(ExperimentMemory.agent_run_id == latest_agent_run.id)
+                .order_by(ExperimentMemory.iteration_number.asc(), ExperimentMemory.created_at.asc())
+                .all()
+            )
+
+            training_run_ids = [run.id for run in training_runs]
+            model_versions = (
+                db.query(ModelVersion)
+                .filter(ModelVersion.training_run_id.in_(training_run_ids))
+                .order_by(
+                    ModelVersion.training_run_id.asc(),
+                    ModelVersion.rank_position.asc(),
+                    ModelVersion.created_at.asc(),
+                )
+                .all()
+                if training_run_ids
+                else []
+            )
+        finally:
+            db.close()
+
+        memory_by_iteration: Dict[int, ExperimentMemory] = {}
+        for row in experiment_memory_rows:
+            iteration_number = int(row.iteration_number or 0)
+            if iteration_number > 0:
+                memory_by_iteration[iteration_number] = row
+
+        model_versions_by_run_id: Dict[str, List[ModelVersion]] = {}
+        for model_version in model_versions:
+            model_versions_by_run_id.setdefault(str(model_version.training_run_id), []).append(model_version)
+
+        retained_logs = AGENT_SANDBOX_EVENT_LOGS.get(str(latest_agent_run.id), [])
+        log_index = _build_iteration_log_index(retained_logs)
+
+        iterations: List[Dict[str, Any]] = []
+        previous_rmse: Optional[float] = None
+        best_rmse_so_far: Optional[float] = None
+        first_completed_iteration: Optional[Dict[str, Any]] = None
+        best_iteration: Optional[Dict[str, Any]] = None
+
+        for run in training_runs:
+            iteration_number = int(run.version_number or 0)
+            memory_row = memory_by_iteration.get(iteration_number)
+            log_details = log_index.get(iteration_number, {})
+
+            rmse_value = _safe_float(run.rmse)
+            mae_value = _safe_float(run.mae)
+            r2_value = _safe_float(run.r2)
+            duration_seconds = None
+            if run.started_at is not None and run.completed_at is not None:
+                duration_seconds = max(0.0, float((run.completed_at - run.started_at).total_seconds()))
+
+            delta_from_previous = None
+            if previous_rmse is not None and rmse_value is not None:
+                delta_from_previous = previous_rmse - rmse_value
+
+            delta_from_best = None
+            if best_rmse_so_far is not None and rmse_value is not None:
+                delta_from_best = best_rmse_so_far - rmse_value
+
+            strategy_summary = None
+            if memory_row is not None and memory_row.strategy_summary:
+                strategy_summary = memory_row.strategy_summary.strip()
+            elif isinstance(log_details.get("strategy_summary"), str):
+                strategy_summary = str(log_details.get("strategy_summary")).strip()
+
+            candidate_models: List[Dict[str, Any]] = []
+            for model_version in model_versions_by_run_id.get(str(run.id), []):
+                candidate_models.append({
+                    "model_name": model_version.model_name,
+                    "rank_position": model_version.rank_position,
+                    "rmse": _safe_float(model_version.rmse),
+                    "mae": _safe_float(model_version.mae),
+                    "r2": _safe_float(model_version.r2),
+                    "hyperparameters": model_version.hyperparameters if isinstance(model_version.hyperparameters, dict) else None,
+                })
+
+            is_new_best = bool(
+                rmse_value is not None and (best_rmse_so_far is None or rmse_value < best_rmse_so_far)
+            )
+
+            iteration_payload: Dict[str, Any] = {
+                "iteration": iteration_number,
+                "training_run_id": str(run.id),
+                "status": run.status,
+                "model_name": run.best_model_name,
+                "rmse": rmse_value,
+                "mae": mae_value,
+                "r2": r2_value,
+                "duration_seconds": duration_seconds,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+                "delta_from_previous_rmse": delta_from_previous,
+                "delta_from_best_rmse": delta_from_best,
+                "is_new_best": is_new_best,
+                "strategy_summary": strategy_summary,
+                "candidate_models": candidate_models,
+                "preprocessing_tokens": _parse_token_list(memory_row.preprocessing_tokens if memory_row else None),
+                "training_tokens": _parse_token_list(memory_row.training_tokens if memory_row else None),
+                "agent_signals": {
+                    "architect_blueprints": int(log_details.get("architect_blueprints", 0) or 0),
+                    "architect_fallbacks": int(log_details.get("architect_fallbacks", 0) or 0),
+                    "single_model_gate_rejections": int(log_details.get("single_model_gate_rejections", 0) or 0),
+                    "compile_fallbacks": int(log_details.get("compile_fallbacks", 0) or 0),
+                    "telemetry_events": int(log_details.get("telemetry_events", 0) or 0),
+                },
+                "log_excerpt": list(log_details.get("log_excerpt", [])),
+            }
+            iterations.append(iteration_payload)
+
+            if run.status == "completed" and rmse_value is not None:
+                previous_rmse = rmse_value
+                if first_completed_iteration is None:
+                    first_completed_iteration = iteration_payload
+                if best_rmse_so_far is None or rmse_value < best_rmse_so_far:
+                    best_rmse_so_far = rmse_value
+                    best_iteration = iteration_payload
+
+        baseline_rmse = first_completed_iteration.get("rmse") if first_completed_iteration else None
+        best_rmse = best_iteration.get("rmse") if best_iteration else None
+        baseline_r2 = first_completed_iteration.get("r2") if first_completed_iteration else None
+        best_r2 = best_iteration.get("r2") if best_iteration else None
+
+        rmse_reduction = None
+        rmse_reduction_percent = None
+        if baseline_rmse is not None and best_rmse is not None:
+            rmse_reduction = baseline_rmse - best_rmse
+            if abs(baseline_rmse) > 1e-12:
+                rmse_reduction_percent = (rmse_reduction / baseline_rmse) * 100.0
+
+        r2_gain = None
+        if baseline_r2 is not None and best_r2 is not None:
+            r2_gain = best_r2 - baseline_r2
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "file_id": file_id,
+                "project_id": str(project.id),
+                "project_name": project.project_name,
+                "target_column": project.target_column,
+                "agent_run_id": str(latest_agent_run.id),
+                "agent_status": latest_agent_run.status,
+                "started_at": latest_agent_run.started_at.isoformat() if latest_agent_run.started_at else None,
+                "completed_at": latest_agent_run.completed_at.isoformat() if latest_agent_run.completed_at else None,
+                "summary": {
+                    "iterations_completed": len(iterations),
+                    "max_iterations": latest_agent_run.max_iterations,
+                    "baseline_iteration": first_completed_iteration,
+                    "best_iteration": best_iteration,
+                    "rmse_reduction": rmse_reduction,
+                    "rmse_reduction_percent": rmse_reduction_percent,
+                    "r2_gain": r2_gain,
+                    "best_model_name": best_iteration.get("model_name") if best_iteration else None,
+                },
+                "iterations": iterations,
+                "strategy_themes": _build_strategy_theme_summary(iterations),
+                "log_retention": {
+                    "available": str(latest_agent_run.id) in AGENT_SANDBOX_EVENT_LOGS,
+                    "captured_lines": len(retained_logs),
+                },
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to build experiment report: {exc}")
 
 
 def _build_training_code(training_run: TrainingRun, model_versions: List[ModelVersion]) -> str:
@@ -6177,3 +6884,532 @@ async def fine_tune_model(request: FineTuneRequest):
             status_code=500,
             detail=f"Fine-tune request failed: {e}"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATA TRANSFORM — Copilot-style prompt-driven dataset transformation
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TransformPromptRequest(BaseModel):
+    session_id: str
+    prompt: str
+
+class TransformAcceptRequest(BaseModel):
+    session_id: str
+    step_index: int
+
+class TransformUndoRequest(BaseModel):
+    session_id: str
+    step_index: int
+
+class TransformRevertRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/transform/start/{file_id}")
+async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
+    """Start a new transform session for a dataset. Returns the session_id and
+    initial dataframe preview (first 200 rows)."""
+    project = db.query(Project).filter(Project.file_id == file_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    csv_path = UPLOAD_DIR / file_id
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset file not found on disk")
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {exc}")
+
+    session_id = str(uuid.uuid4())
+    TRANSFORM_SESSIONS[session_id] = {
+        "file_id": file_id,
+        "project_id": str(project.id),
+        "original_df": df.copy(),
+        "current_df": df.copy(),
+        "steps": [],          # list of {prompt, code, summary, diff, accepted}
+        "created_at": time.time(),
+    }
+
+    preview = _df_to_preview(df)
+    return {
+        "session_id": session_id,
+        "rows": len(df),
+        "columns": len(df.columns),
+        "column_names": list(df.columns),
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
+        "preview": preview,
+        "null_counts": {col: int(df[col].isnull().sum()) for col in df.columns},
+    }
+
+
+@app.post("/transform/prompt")
+async def transform_prompt(req: TransformPromptRequest):
+    """User sends a natural-language prompt. The LLM generates pandas code,
+    we execute it in-process on a copy of the df, compute a diff, and return
+    the result as a *pending* step (not yet accepted)."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    current_df: pd.DataFrame = session["current_df"].copy()
+    before_shape = current_df.shape
+    before_nulls = int(current_df.isnull().sum().sum())
+
+    # Skip LLM calls for non-actionable chat-style prompts.
+    if _is_non_actionable_transform_prompt(req.prompt):
+        preview = _df_to_preview(current_df)
+        return {
+            "step_index": -1,
+            "code": "",
+            "summary": "No transform detected. Please describe a concrete data change (e.g., drop duplicates, fill nulls, rename a column).",
+            "diff": {
+                "rows_before": before_shape[0],
+                "rows_after": before_shape[0],
+                "cols_before": before_shape[1],
+                "cols_after": before_shape[1],
+                "nulls_before": before_nulls,
+                "nulls_after": before_nulls,
+                "rows_changed": 0,
+                "cols_changed": 0,
+                "nulls_removed": 0,
+            },
+            "preview": preview,
+            "rows": before_shape[0],
+            "columns": before_shape[1],
+            "column_names": list(current_df.columns),
+            "dtypes": {col: str(current_df[col].dtype) for col in current_df.columns},
+            "null_counts": {col: int(current_df[col].isnull().sum()) for col in current_df.columns},
+        }
+
+    constraints = _extract_transform_constraints(req.prompt)
+
+    # Build the LLM prompt
+    col_info = ", ".join(
+        f"{col} ({current_df[col].dtype})" for col in current_df.columns
+    )
+    sample_json = current_df.head(3).to_json(orient="records", default_handler=str)
+
+    system_prompt = (
+        "You are a data-transformation assistant. The user has a pandas DataFrame "
+        "called `df`. Write ONLY valid Python code using pandas to transform `df` "
+        "in-place (or reassign to `df`). Do NOT import anything — pandas is already "
+        "imported as `pd` and numpy as `np`. Do NOT print or return anything. "
+        "The code must be safe: no file I/O, no subprocess, no exec/eval, no network "
+        "calls. Output ONLY the Python code, no markdown fences, no explanation."
+    )
+    user_prompt = (
+        f"DataFrame info:\n"
+        f"- Shape: {before_shape[0]} rows × {before_shape[1]} columns\n"
+        f"- Columns: {col_info}\n"
+        f"- Sample (first 3 rows): {sample_json}\n"
+        f"- Total null values: {before_nulls}\n\n"
+        f"User request: {req.prompt}\n\n"
+        f"Write the pandas code to accomplish this."
+    )
+
+    # Call LLM
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
+
+    if not provider:
+        raise HTTPException(status_code=500, detail="No LLM provider configured. Set GROQ_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.")
+
+    # Generate code, execute, and auto-retry up to 2 times on failure
+    MAX_RETRIES = 2
+    last_error = None
+    retry_prompt = user_prompt
+    result_df: Optional[pd.DataFrame] = None
+    diff: Optional[Dict[str, int]] = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            if provider == "gemini":
+                generated_code = _call_gemini_text_standalone(system_prompt, retry_prompt, temperature=0.2, max_tokens=1024, model_override=model)
+            else:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": retry_prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=1024,
+                )
+                generated_code = resp.choices[0].message.content.strip()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"LLM call failed: {exc}")
+
+        # Strip markdown fences if present
+        generated_code = _strip_code_fences(generated_code)
+
+        # LLMs may still include imports; strip them because pd/np are injected.
+        generated_code = _strip_transform_import_lines(generated_code)
+
+        if not generated_code:
+            last_error = "Generated code was empty after removing unsupported imports"
+            if attempt < MAX_RETRIES:
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous output was invalid:\n"
+                    f"  {last_error}\n\n"
+                    "Return only pandas DataFrame transformation statements against `df`. "
+                    "Do not include any import lines."
+                )
+                continue
+            raise HTTPException(status_code=422, detail=last_error)
+
+        # Security validation — block dangerous patterns
+        try:
+            _validate_transform_code(generated_code)
+        except HTTPException as exc:
+            last_error = str(exc.detail)
+            if attempt < MAX_RETRIES:
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous code violated a safety rule:\n"
+                    f"  {last_error}\n\n"
+                    "Rewrite the code without forbidden patterns. "
+                    "Do not include imports, file/network access, or dynamic execution."
+                )
+                continue
+            raise
+
+        # Execute on a copy
+        sandbox_df = current_df.copy()
+        exec_globals = {"pd": pd, "np": __import__("numpy"), "df": sandbox_df}
+        try:
+            exec(generated_code, exec_globals)  # noqa: S102
+            candidate_df: pd.DataFrame = exec_globals.get("df", sandbox_df)
+            if not isinstance(candidate_df, pd.DataFrame):
+                raise ValueError("Code did not produce a valid DataFrame")
+
+            candidate_shape = candidate_df.shape
+            candidate_nulls = int(candidate_df.isnull().sum().sum())
+            candidate_diff = {
+                "rows_before": before_shape[0],
+                "rows_after": candidate_shape[0],
+                "cols_before": before_shape[1],
+                "cols_after": candidate_shape[1],
+                "nulls_before": before_nulls,
+                "nulls_after": candidate_nulls,
+                "rows_changed": abs(before_shape[0] - candidate_shape[0]),
+                "cols_changed": abs(before_shape[1] - candidate_shape[1]),
+                "nulls_removed": max(0, before_nulls - candidate_nulls),
+            }
+
+            constraint_violations = _validate_transform_constraints(constraints, candidate_diff)
+            if constraint_violations:
+                last_error = "; ".join(constraint_violations)
+                if attempt < MAX_RETRIES:
+                    retry_prompt = (
+                        f"{user_prompt}\n\n"
+                        "IMPORTANT: Your previous code violated user constraints:\n"
+                        f"  {last_error}\n\n"
+                        "Regenerate code that satisfies ALL explicit constraints from the user prompt."
+                    )
+                    continue
+                raise HTTPException(status_code=422, detail=f"Generated code violated prompt constraints: {last_error}")
+
+            result_df = candidate_df
+            diff = candidate_diff
+            last_error = None
+            break  # success
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                # Feed the error back so the LLM can fix its code
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous code failed with this error:\n"
+                    f"  {last_error}\n\n"
+                    f"Fix the code to handle this. Be defensive with type conversions — "
+                    f"use errors='coerce' for pd.to_numeric, strip non-numeric "
+                    f"characters before converting, etc."
+                )
+
+    if last_error:
+        raise HTTPException(status_code=422, detail=f"Generated code failed: {last_error}")
+
+    if result_df is None or diff is None:
+        raise HTTPException(status_code=422, detail="No valid transform result produced")
+
+    summary = _build_transform_summary(req.prompt, diff)
+
+    step = {
+        "prompt": req.prompt,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "accepted": False,
+        "result_df": result_df,
+    }
+    session["steps"].append(step)
+    step_index = len(session["steps"]) - 1
+
+    preview = _df_to_preview(result_df)
+
+    return {
+        "step_index": step_index,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "preview": preview,
+        "rows": diff["rows_after"],
+        "columns": diff["cols_after"],
+        "column_names": list(result_df.columns),
+        "dtypes": {col: str(result_df[col].dtype) for col in result_df.columns},
+        "null_counts": {col: int(result_df[col].isnull().sum()) for col in result_df.columns},
+    }
+
+
+@app.post("/transform/accept")
+async def transform_accept(req: TransformAcceptRequest):
+    """Accept a pending step — applies it to the session's current dataframe."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+    if req.step_index < 0 or req.step_index >= len(session["steps"]):
+        raise HTTPException(status_code=400, detail="Invalid step index")
+
+    step = session["steps"][req.step_index]
+    if step["accepted"]:
+        return {"status": "already_accepted"}
+
+    step["accepted"] = True
+    session["current_df"] = step["result_df"].copy()
+
+    return {"status": "accepted", "step_index": req.step_index}
+
+
+@app.post("/transform/undo")
+async def transform_undo(req: TransformUndoRequest):
+    """Undo a specific step — revert to the state before it. Also removes all
+    later steps."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+    if req.step_index < 0 or req.step_index >= len(session["steps"]):
+        raise HTTPException(status_code=400, detail="Invalid step index")
+
+    # Remove this step and all after it
+    session["steps"] = session["steps"][:req.step_index]
+
+    # Replay accepted steps to rebuild current_df
+    df = session["original_df"].copy()
+    for s in session["steps"]:
+        if s["accepted"]:
+            df = s["result_df"].copy()
+    session["current_df"] = df
+
+    preview = _df_to_preview(df)
+    return {
+        "status": "undone",
+        "rows": len(df),
+        "columns": len(df.columns),
+        "preview": preview,
+        "steps_remaining": len(session["steps"]),
+    }
+
+
+@app.post("/transform/revert")
+async def transform_revert(req: TransformRevertRequest):
+    """Revert the entire session back to the original dataset."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    session["steps"] = []
+    session["current_df"] = session["original_df"].copy()
+
+    df = session["current_df"]
+    preview = _df_to_preview(df)
+    return {
+        "status": "reverted",
+        "rows": len(df),
+        "columns": len(df.columns),
+        "preview": preview,
+    }
+
+
+@app.post("/transform/save/{file_id}")
+async def transform_save(file_id: str, session_id: str = Form(...), db: Session = Depends(get_db)):
+    """Save the transformed dataset — overwrites the original CSV so training
+    uses the cleaned version."""
+    session = TRANSFORM_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+    if session["file_id"] != file_id:
+        raise HTTPException(status_code=400, detail="Session file_id mismatch")
+
+    project = db.query(Project).filter(Project.file_id == file_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    df = session["current_df"]
+    csv_path = UPLOAD_DIR / file_id
+    df.to_csv(csv_path, index=False)
+
+    # Update dataset profile
+    project.rows = len(df)
+    project.columns = len(df.columns)
+    db.commit()
+
+    # Cleanup session
+    del TRANSFORM_SESSIONS[session_id]
+
+    return {
+        "status": "saved",
+        "rows": len(df),
+        "columns": len(df.columns),
+    }
+
+
+def _df_to_preview(df: pd.DataFrame, max_rows: int = 200) -> list:
+    """Return first N rows as list-of-dicts for JSON serialization."""
+    subset = df.head(max_rows)
+    return json.loads(subset.to_json(orient="records", default_handler=str))
+
+
+def _strip_code_fences(code: str) -> str:
+    """Remove markdown code fences from LLM output."""
+    code = code.strip()
+    if code.startswith("```"):
+        lines = code.split("\n")
+        # Remove first line (```python or ```)
+        lines = lines[1:]
+        # Remove last line if it's ```
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        code = "\n".join(lines)
+    return code.strip()
+
+
+def _strip_transform_import_lines(code: str) -> str:
+    """Remove import lines from generated transform snippets.
+
+    The transform runtime already injects pandas as pd and numpy as np.
+    """
+    cleaned_lines = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _is_non_actionable_transform_prompt(prompt: str) -> bool:
+    """Detect chat-like prompts that don't request a concrete data change."""
+    text = (prompt or "").strip().lower()
+    if not text:
+        return True
+
+    transform_verbs = [
+        "remove", "drop", "delete", "filter", "keep", "retain", "fill", "impute",
+        "replace", "rename", "convert", "cast", "normalize", "standardize", "scale",
+        "encode", "clean", "strip", "trim", "split", "merge", "aggregate", "group",
+        "sort", "deduplicate", "duplicate", "round", "clip", "bin", "outlier",
+    ]
+    if any(verb in text for verb in transform_verbs):
+        return False
+
+    small_talk = [
+        "hi", "hello", "hey", "thanks", "thank you", "test", "testing", "ok", "okay",
+        "cool", "nice", "yo", "sup", "hola", "bonjour",
+    ]
+    if text in small_talk:
+        return True
+
+    if len(text.split()) <= 3:
+        return True
+
+    return False
+
+
+def _extract_transform_constraints(prompt: str) -> Dict[str, bool]:
+    """Extract strict user constraints from transform prompt text."""
+    text = (prompt or "").lower()
+
+    no_row_removal = bool(
+        re.search(r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(row|rows)", text)
+        or re.search(r"(keep|retain).{0,30}(all\s+)?rows", text)
+        or "without data loss" in text
+    )
+    no_row_change = bool(
+        "same number of rows" in text
+        or "do not change rows" in text
+        or "don't change rows" in text
+    )
+    no_col_removal = bool(
+        re.search(r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(column|columns|col|cols)", text)
+        or re.search(r"(keep|retain).{0,30}(all\s+)?(columns|cols)", text)
+        or "without data loss" in text
+    )
+    no_col_change = bool(
+        "same number of columns" in text
+        or "do not change columns" in text
+        or "don't change columns" in text
+    )
+
+    return {
+        "no_row_removal": no_row_removal,
+        "no_row_change": no_row_change,
+        "no_col_removal": no_col_removal,
+        "no_col_change": no_col_change,
+    }
+
+
+def _validate_transform_constraints(constraints: Dict[str, bool], diff: Dict[str, int]) -> List[str]:
+    """Return violations when generated transform breaks explicit prompt constraints."""
+    violations: List[str] = []
+
+    if constraints.get("no_row_change") and diff["rows_after"] != diff["rows_before"]:
+        violations.append("Prompt requires the same number of rows")
+    elif constraints.get("no_row_removal") and diff["rows_after"] < diff["rows_before"]:
+        violations.append("Prompt says not to remove rows")
+
+    if constraints.get("no_col_change") and diff["cols_after"] != diff["cols_before"]:
+        violations.append("Prompt requires the same number of columns")
+    elif constraints.get("no_col_removal") and diff["cols_after"] < diff["cols_before"]:
+        violations.append("Prompt says not to remove columns")
+
+    return violations
+
+
+def _validate_transform_code(code: str) -> None:
+    """Block dangerous patterns in generated transform code."""
+    forbidden = [
+        "import ", "from ", "__import__", "subprocess", "os.system", "os.popen",
+        "eval(", "exec(", "compile(", "open(", "shutil", "pathlib",
+        "requests.", "urllib", "socket", "http.client",
+        "globals(", "locals(", "getattr(", "setattr(", "delattr(",
+        "__builtins__", "__class__", "__subclasses__",
+    ]
+    code_lower = code.lower()
+    for pattern in forbidden:
+        if pattern.lower() in code_lower:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Generated code contains forbidden pattern: {pattern.strip()}"
+            )
+
+
+def _build_transform_summary(prompt: str, diff: dict) -> str:
+    """Build a human-readable summary of a transform step."""
+    parts = []
+    if diff["rows_changed"] > 0:
+        direction = "removed" if diff["rows_after"] < diff["rows_before"] else "added"
+        parts.append(f"{diff['rows_changed']} rows {direction}")
+    if diff["cols_changed"] > 0:
+        direction = "removed" if diff["cols_after"] < diff["cols_before"] else "added"
+        parts.append(f"{diff['cols_changed']} columns {direction}")
+    if diff["nulls_removed"] > 0:
+        parts.append(f"{diff['nulls_removed']} null values removed")
+    if not parts:
+        parts.append("Data modified (same shape)")
+    return ", ".join(parts)
