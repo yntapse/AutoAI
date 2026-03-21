@@ -81,8 +81,9 @@ export default function DashboardPage() {
     setFormattedDates(newFormatted);
   }, [projects]);
 
-  const formatCreatedAt = (projectId: string): string => {
-    return formattedDates[projectId] || "â€”";
+  const formatCreatedAt = (projectId: string | null): string => {
+    if (!projectId) return "—";
+    return formattedDates[projectId] || "—";
   };
 
   const handleDeleteProject = async (projectId: string, projectName: string) => {
