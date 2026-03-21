@@ -1,6 +1,6 @@
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from models.sandbox_job import SandboxJob
@@ -8,42 +8,23 @@ from models.sandbox_job import SandboxJob
 
 def claim_next_sandbox_job(db: Session) -> Optional[SandboxJob]:
     try:
-        claim_result = db.execute(
-            text(
-                """
-                WITH next_job AS (
-                    SELECT id
-                    FROM sandbox_jobs
-                    WHERE status = 'queued'
-                    ORDER BY created_at ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
-                )
-                UPDATE sandbox_jobs AS sj
-                SET
-                    status = 'running',
-                    started_at = timezone('utc', now())
-                FROM next_job
-                WHERE sj.id = next_job.id
-                RETURNING sj.id
-                """
-            )
-        ).first()
-
-        if claim_result is None:
-            db.commit()
-            return None
-
-        claimed_job = (
+        job = (
             db.query(SandboxJob)
-            .filter(SandboxJob.id == claim_result.id)
+            .filter(SandboxJob.status == "queued")
+            .order_by(SandboxJob.created_at.asc())
+            .with_for_update(skip_locked=True)
             .first()
         )
-        if claimed_job is not None:
-            db.expunge(claimed_job)
 
+        if job is None:
+            return None
+
+        job.status = "running"
+        job.started_at = datetime.now(timezone.utc)
+        db.flush()
+        db.expunge(job)
         db.commit()
-        return claimed_job
+        return job
     except Exception:
         db.rollback()
         raise
