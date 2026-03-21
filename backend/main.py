@@ -958,6 +958,7 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                 continue
 
         latest_run_by_project: Dict[str, Dict[str, Any]] = {}
+        best_r2_by_project: Dict[str, Optional[float]] = {}
         if project_ids:
             try:
                 runs = (
@@ -989,6 +990,35 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                     }
             except Exception:
                 latest_run_by_project = {}
+
+            # Query the actual best model r2 across ALL runs for each project
+            try:
+                all_run_ids_by_project: Dict[str, List] = {}
+                all_runs = (
+                    db.query(TrainingRun.id, TrainingRun.project_id)
+                    .filter(TrainingRun.project_id.in_(project_ids))
+                    .all()
+                )
+                for run in all_runs:
+                    key = str(run.project_id)
+                    all_run_ids_by_project.setdefault(key, []).append(run.id)
+
+                all_run_ids = [r.id for r in all_runs]
+                if all_run_ids:
+                    best_models = (
+                        db.query(
+                            TrainingRun.project_id,
+                            func.max(ModelVersion.r2).label("best_r2"),
+                        )
+                        .join(TrainingRun, ModelVersion.training_run_id == TrainingRun.id)
+                        .filter(TrainingRun.project_id.in_(project_ids))
+                        .group_by(TrainingRun.project_id)
+                        .all()
+                    )
+                    for row in best_models:
+                        best_r2_by_project[str(row.project_id)] = row.best_r2
+            except Exception:
+                best_r2_by_project = {}
 
         def _to_dashboard_status(run_status: Optional[str]) -> str:
             if not run_status:
@@ -1035,9 +1065,12 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                     running_projects += 1
 
                 accuracy_percent: Optional[float] = None
-                run_r2 = latest_run.get("r2") if latest_run else None
-                if run_r2 is not None:
-                    candidate_accuracy = float(run_r2) * 100.0
+                # Use best ModelVersion r2 across all runs; fall back to latest TrainingRun.r2
+                best_r2 = best_r2_by_project.get(project_id)
+                if best_r2 is None:
+                    best_r2 = latest_run.get("r2") if latest_run else None
+                if best_r2 is not None:
+                    candidate_accuracy = float(best_r2) * 100.0
                     if np.isfinite(candidate_accuracy):
                         accuracy_percent = candidate_accuracy
 
