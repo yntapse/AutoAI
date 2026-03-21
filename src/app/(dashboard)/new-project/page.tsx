@@ -319,7 +319,7 @@ export default function NewProjectPage() {
                                 setIsUploading(true);
                                 setSubmitError(null);
                                 try {
-                                  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+                                  const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
                                   const fd = new FormData();
                                   fd.append("file", file);
                                   const res = await fetch(`${API_BASE}/upload-temp`, { method: "POST", body: fd });
