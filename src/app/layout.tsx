@@ -28,6 +28,9 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         {children}
+        <p className="fixed bottom-2 left-0 right-0 text-center text-[11px] text-slate-500 pointer-events-none z-50">
+          Developed by Yash Tapase
+        </p>
       </body>
     </html>
   );
