@@ -201,6 +201,11 @@ export default function Sidebar() {
         ))}
       </nav>
 
+      {/* Developer credit */}
+      <div className="relative px-3 pt-3">
+        <p className="text-center text-[10px] text-slate-600">Developed by <span className="text-slate-400 font-medium">Yash Tapase</span></p>
+      </div>
+
       {/* Status + User */}
       <div className="relative border-t border-white/[0.05] px-3 pb-4 pt-3">
         <div className="mb-2 flex items-center gap-2 rounded-lg border border-emerald-500/15 bg-emerald-500/[0.06] px-3 py-2">
