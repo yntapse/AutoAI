@@ -51,6 +51,31 @@ export interface TransformStep {
   columns: number;
 }
 
+export interface RecommendedTransform {
+  action: string;
+  reason: string;
+  priority: "high" | "medium" | "low";
+  prompt: string;
+}
+
+export interface DataAnalysis {
+  quality_score: number;
+  issues: string[];
+  column_insights: string[];
+  recommended_transforms: RecommendedTransform[];
+  summary: string;
+}
+
+export interface ThinkingResponse {
+  thinking: string;
+  is_valid: boolean;
+  validation_issues: string[];
+  plan: string[];
+  estimated_impact: Record<string, number>;
+  confidence: "high" | "medium" | "low";
+  warnings: string[];
+}
+
 /* ── API Calls ─────────────────────────────────────────────────── */
 
 export async function startTransformSession(
@@ -66,10 +91,60 @@ export async function startTransformSession(
   return res.json();
 }
 
+export async function analyzeDataset(
+  sessionId: string
+): Promise<DataAnalysis> {
+  const res = await fetch(`${API_BASE}/transform/analyze/${sessionId}`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Analysis failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function thinkBeforeActing(
+  sessionId: string,
+  prompt: string
+): Promise<ThinkingResponse> {
+  const res = await fetch(`${API_BASE}/transform/think`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, prompt }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Thinking failed (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function sendTransformPrompt(
   sessionId: string,
   prompt: string
 ): Promise<TransformPromptResponse> {
+  // Detect chat/analysis prompts — skip tool calling for these
+  const isChatPrompt = /^(hi|hello|hey|analy[sz]e|tell me|what|how|why|show|describe|examine)/i.test(prompt.trim())
+    && !/(remove|drop|fill|clean|normalize|encode|fix|impute|replace|convert|scale|do it all|do all|apply all|execute|transform)/i.test(prompt);
+
+  if (!isChatPrompt) {
+    // Try MCP tool-calling first, fall back to code generation
+    try {
+      const toolRes = await fetch(`${API_BASE}/transform/execute-tools`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, prompt }),
+      });
+      if (toolRes.ok) {
+        return toolRes.json();
+      }
+    } catch {
+      // Fall through to code gen
+    }
+  }
+
+  // Fallback: standard code generation (also handles chat responses)
   const res = await fetch(`${API_BASE}/transform/prompt`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

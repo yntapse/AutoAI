@@ -59,6 +59,12 @@ from services.prompt_architect import (
     blueprint_to_generator_prompt,
     enforce_single_model,
 )
+from services.transform_mcp_server import (
+    get_tools_schema as get_mcp_tools_schema,
+    execute_tool as execute_mcp_tool,
+    get_tool_names as get_mcp_tool_names,
+    TRANSFORM_TOOLS,
+)
 
 app = FastAPI(title="PyrunAI Backend", version="1.0.0")
 
@@ -6942,7 +6948,7 @@ class TransformRevertRequest(BaseModel):
 @app.post("/transform/start/{file_id}")
 async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
     """Start a new transform session for a dataset. Returns the session_id and
-    initial dataframe preview (first 200 rows)."""
+    initial dataframe preview (first 200 rows), plus an AI-generated data analysis."""
     project = db.query(Project).filter(Project.file_id == file_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -6957,6 +6963,7 @@ async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Could not read CSV: {exc}")
 
     session_id = str(uuid.uuid4())
+    initial_quality = _compute_quality_score(df)
     TRANSFORM_SESSIONS[session_id] = {
         "file_id": file_id,
         "project_id": str(project.id),
@@ -6964,6 +6971,7 @@ async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
         "current_df": df.copy(),
         "steps": [],          # list of {prompt, code, summary, diff, accepted}
         "created_at": time.time(),
+        "quality_history": [{"label": "Session start", "score": initial_quality}],
     }
 
     preview = _df_to_preview(df)
@@ -6976,6 +6984,362 @@ async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
         "preview": preview,
         "null_counts": {col: int(df[col].isnull().sum()) for col in df.columns},
     }
+
+
+@app.post("/transform/analyze/{session_id}")
+async def transform_analyze_dataset(session_id: str):
+    """AI-powered dataset analysis — acts like a pro data engineer to inspect
+    the data quality, patterns, and suggest concrete transformation steps."""
+    session = TRANSFORM_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    df: pd.DataFrame = session["current_df"]
+
+    # Build a rich dataset profile for the LLM
+    profile = _build_dataset_profile_for_analysis(df)
+
+    # Build the analysis prompt
+    system_prompt = (
+        "You are a senior data engineer analyzing a dataset for ML readiness. "
+        "You think step by step and provide actionable insights.\n\n"
+        "Your analysis MUST include these sections:\n"
+        "1. DATA QUALITY ASSESSMENT — issues found (nulls, duplicates, outliers, type mismatches)\n"
+        "2. COLUMN ANALYSIS — what each column represents, its quality score\n"
+        "3. RECOMMENDED TRANSFORMATIONS — ordered list of specific actions to take\n"
+        "4. PRIORITY — which transformations are critical vs nice-to-have\n\n"
+        "Be concise but specific. Use actual column names and numbers from the data.\n"
+        "Return your analysis as a JSON object with this structure:\n"
+        '{"quality_score": 0-100, "issues": [...], "column_insights": [...], '
+        '"recommended_transforms": [{"action": "...", "reason": "...", "priority": "high|medium|low", "prompt": "exact prompt to execute this"}], '
+        '"summary": "one paragraph overall assessment"}'
+    )
+
+    user_prompt = (
+        f"Analyze this dataset:\n\n{profile}\n\n"
+        "Provide your analysis as the specified JSON structure."
+    )
+
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
+
+    if not provider:
+        raise HTTPException(status_code=500, detail="No LLM provider configured.")
+
+    try:
+        if provider == "gemini":
+            raw_response = _call_gemini_text_standalone(system_prompt, user_prompt, temperature=0.3, max_tokens=2048, model_override=model)
+        else:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=2048,
+            )
+            raw_response = resp.choices[0].message.content.strip()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM analysis failed: {exc}")
+
+    # Parse the response
+    analysis = _parse_analysis_response(raw_response)
+    return analysis
+
+
+@app.post("/transform/think")
+async def transform_think_before_acting(req: TransformPromptRequest):
+    """AI thinks about the prompt before generating code — shows reasoning,
+    validates against actual data state, and plans the execution."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    current_df: pd.DataFrame = session["current_df"]
+    before_shape = current_df.shape
+    before_nulls = int(current_df.isnull().sum().sum())
+
+    # Detect "do everything" style prompts — skip overly cautious thinking
+    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything"]
+    is_batch_request = any(kw in req.prompt.lower() for kw in batch_keywords)
+
+    if is_batch_request:
+        # For batch requests, build a concrete plan from data state
+        null_cols = {col: int(current_df[col].isnull().sum()) for col in current_df.columns if current_df[col].isnull().sum() > 0}
+        cat_cols = [col for col in current_df.columns if current_df[col].dtype == "object"]
+        num_cols = [col for col in current_df.columns if current_df[col].dtype in ["float64", "int64", "float32", "int32"]]
+        dup_count = int(current_df.duplicated().sum())
+
+        plan_steps = []
+        if null_cols:
+            plan_steps.append(f"Fill {sum(null_cols.values())} null values across {len(null_cols)} column(s) with median/mode")
+        if dup_count > 0:
+            plan_steps.append(f"Remove {dup_count} duplicate rows")
+        if cat_cols:
+            plan_steps.append(f"Encode {len(cat_cols)} categorical column(s): {', '.join(cat_cols[:5])}")
+        if num_cols:
+            plan_steps.append(f"Normalize {len(num_cols)} numeric column(s)")
+        if not plan_steps:
+            plan_steps.append("Data looks clean — no major transforms needed")
+
+        return {
+            "thinking": f"Batch transform requested. Will apply {len(plan_steps)} operations: fill nulls, remove duplicates, encode categoricals, and normalize numerics.",
+            "is_valid": True,
+            "validation_issues": [],
+            "plan": plan_steps,
+            "estimated_impact": {"rows_affected": before_shape[0], "cols_affected": before_shape[1]},
+            "confidence": "high",
+            "warnings": ["This will modify the entire dataset. You can undo each step individually."],
+        }
+
+    # Build context
+    col_info = ", ".join(f"{col} ({current_df[col].dtype})" for col in current_df.columns)
+    null_cols = {col: int(current_df[col].isnull().sum()) for col in current_df.columns if current_df[col].isnull().sum() > 0}
+
+    system_prompt = (
+        "You are a senior data engineer planning a data transformation. "
+        "Think step by step about what the user wants to do.\n\n"
+        "IMPORTANT RULES:\n"
+        "- If the request is clear enough to execute, set is_valid=true and confidence=high\n"
+        "- Only set is_valid=false if the request literally makes no sense or references columns that don't exist\n"
+        "- Be action-oriented. Users want results, not interrogation.\n"
+        "- Common requests like 'remove nulls', 'normalize', 'drop duplicates' are always valid\n\n"
+        "You MUST:\n"
+        "1. Validate column names exist in the data\n"
+        "2. Plan the exact operations needed\n"
+        "3. Estimate the impact (rows/cols affected)\n\n"
+        "Return a JSON object:\n"
+        '{"thinking": "your concise reasoning (1-2 sentences)", '
+        '"is_valid": true, '
+        '"validation_issues": [], '
+        '"plan": ["step 1", "step 2", ...], '
+        '"estimated_impact": {"rows_affected": N, "cols_affected": N}, '
+        '"confidence": "high|medium|low", '
+        '"warnings": ["only if truly important"]}'
+    )
+
+    user_prompt = (
+        f"DataFrame state:\n"
+        f"- Shape: {before_shape[0]} rows × {before_shape[1]} columns\n"
+        f"- Columns: {col_info}\n"
+        f"- Null values: {json.dumps(null_cols) if null_cols else 'None'}\n"
+        f"- Total nulls: {before_nulls}\n"
+        f"- Sample values per column: {json.dumps({col: current_df[col].dropna().head(3).tolist() for col in current_df.columns[:10]}, default=str)}\n\n"
+        f"User request: \"{req.prompt}\"\n\n"
+        f"Think about this request and plan the execution. Be action-oriented — if the request makes sense, approve it."
+    )
+
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception:
+        return {"thinking": "Ready to execute", "is_valid": True, "plan": ["Execute directly"], "confidence": "high", "validation_issues": [], "estimated_impact": {}, "warnings": []}
+
+    if not provider:
+        return {"thinking": "No LLM configured", "is_valid": True, "plan": ["Execute directly"], "confidence": "high", "validation_issues": [], "estimated_impact": {}, "warnings": []}
+
+    try:
+        if provider == "gemini":
+            raw = _call_gemini_text_standalone(system_prompt, user_prompt, temperature=0.2, max_tokens=1024, model_override=model)
+        else:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            raw = resp.choices[0].message.content.strip()
+    except Exception:
+        return {"thinking": "Could not reach LLM for planning", "is_valid": True, "plan": ["Execute directly"], "confidence": "medium", "validation_issues": [], "estimated_impact": {}, "warnings": []}
+
+    result = _parse_thinking_response(raw)
+
+    # Safety net: never block execution for common transform operations
+    common_ops = ["remove", "drop", "fill", "impute", "normalize", "scale", "encode", "clean", "convert", "rename", "replace"]
+    if not result["is_valid"] and any(op in req.prompt.lower() for op in common_ops):
+        result["is_valid"] = True
+        result["validation_issues"] = []
+        result["confidence"] = "medium"
+
+    return result
+
+
+@app.post("/transform/execute-tools")
+async def transform_execute_with_tools(req: TransformPromptRequest):
+    """Execute a transform using MCP tool-calling.
+    The LLM selects which tools to call with what parameters.
+    Falls back to code generation if tool-calling fails."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    current_df: pd.DataFrame = session["current_df"].copy()
+    before_shape = current_df.shape
+    before_nulls = int(current_df.isnull().sum().sum())
+
+    # Handle batch requests
+    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything"]
+    expanded_prompt = req.prompt
+    if any(kw in req.prompt.lower() for kw in batch_keywords):
+        actions = []
+        null_cols = [col for col in current_df.columns if current_df[col].isnull().sum() > 0]
+        if null_cols:
+            for col in null_cols:
+                if current_df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                    actions.append(f"fill null values in column '{col}' with the median")
+                else:
+                    actions.append(f"fill null values in column '{col}' with the mode")
+        if int(current_df.duplicated().sum()) > 0:
+            actions.append("drop duplicate rows")
+        if not actions:
+            actions.append("data is already clean")
+        expanded_prompt = ". ".join(actions)
+
+    # Build context for tool selection
+    col_info = ", ".join(f"{col} ({current_df[col].dtype})" for col in current_df.columns)
+    null_info = {col: int(current_df[col].isnull().sum()) for col in current_df.columns if current_df[col].isnull().sum() > 0}
+
+    system_prompt = (
+        "You are a data transformation agent. You have access to tools to transform a pandas DataFrame.\n"
+        f"DataFrame info: {before_shape[0]} rows × {before_shape[1]} columns.\n"
+        f"Columns: {col_info}\n"
+        f"Null values: {json.dumps(null_info) if null_info else 'None'}\n\n"
+        "Call the appropriate tool(s) to fulfill the user's request.\n\n"
+        "IMPORTANT RULES:\n"
+        "- NEVER use drop_rows_with_nulls unless the user EXPLICITLY asks to drop/remove rows\n"
+        "- For null values, ALWAYS prefer fill_nulls with strategy 'median' for numeric columns and 'mode' for text columns\n"
+        "- Preserve as many rows as possible — data loss is bad\n"
+        "- If multiple operations are needed, call them in sequence\n"
+        "- For 'do it all' type requests: FIRST convert_dtype columns that should be numeric, THEN fill_nulls, then encode categoricals, then normalize numerics\n"
+        "- IMPORTANT ORDER: convert_dtype MUST come BEFORE fill_nulls so that invalid values become NaN first, then get filled"
+    )
+
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
+
+    if not provider or provider == "gemini":
+        # Gemini doesn't support tool calling well — fall back to standard prompt
+        raise HTTPException(status_code=501, detail="Tool calling requires Groq or OpenAI provider")
+
+    tools_schema = get_mcp_tools_schema()
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": expanded_prompt},
+            ],
+            tools=tools_schema,
+            tool_choice="auto",
+            temperature=0.1,
+            max_tokens=1024,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM tool call failed: {exc}")
+
+    # Process tool calls
+    message = resp.choices[0].message
+    tool_calls = getattr(message, "tool_calls", None) or []
+    tools_executed = []
+    result_df = current_df.copy()
+
+    if not tool_calls:
+        # No tool calls — LLM gave a text response, fall back to code gen
+        raise HTTPException(status_code=422, detail="LLM did not select any tools. Try being more specific.")
+
+    for tc in tool_calls:
+        tool_name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments)
+        except json.JSONDecodeError:
+            continue
+
+        try:
+            result_df = execute_mcp_tool(tool_name, result_df, args)
+            tools_executed.append({"tool": tool_name, "args": args, "status": "success"})
+        except Exception as exc:
+            tools_executed.append({"tool": tool_name, "args": args, "status": "error", "error": str(exc)})
+
+    # Compute diff
+    after_shape = result_df.shape
+    after_nulls = int(result_df.isnull().sum().sum())
+    diff = {
+        "rows_before": before_shape[0],
+        "rows_after": after_shape[0],
+        "cols_before": before_shape[1],
+        "cols_after": after_shape[1],
+        "nulls_before": before_nulls,
+        "nulls_after": after_nulls,
+        "rows_changed": abs(before_shape[0] - after_shape[0]),
+        "cols_changed": abs(before_shape[1] - after_shape[1]),
+        "nulls_removed": max(0, before_nulls - after_nulls),
+    }
+
+    # Build code representation from tool calls
+    code_lines = ["# 📝 MCP Tools Executed:"]
+    for t in tools_executed:
+        if t["status"] == "success":
+            code_lines.append(f"# ✅ {t['tool']}({json.dumps(t['args'], indent=2)})")
+        else:
+            code_lines.append(f"# ❌ {t['tool']} — Error: {t.get('error', 'unknown')}")
+    generated_code = "\n".join(code_lines)
+
+    summary = _build_transform_summary(req.prompt, diff, result_df, current_df, session)
+    # Prepend tool info
+    successful_tools = [t["tool"] for t in tools_executed if t["status"] == "success"]
+    if successful_tools:
+        tool_line = f"🛠️ Tools: {', '.join(successful_tools)}\n"
+        summary = tool_line + summary
+
+    # Store step
+    step = {
+        "prompt": req.prompt,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "accepted": False,
+        "result_df": result_df,
+        "tools_executed": tools_executed,
+    }
+    session["steps"].append(step)
+    step_index = len(session["steps"]) - 1
+
+    preview = _df_to_preview(result_df)
+
+    return {
+        "step_index": step_index,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "preview": preview,
+        "rows": diff["rows_after"],
+        "columns": diff["cols_after"],
+        "column_names": list(result_df.columns),
+        "dtypes": {col: str(result_df[col].dtype) for col in result_df.columns},
+        "null_counts": {col: int(result_df[col].isnull().sum()) for col in result_df.columns},
+        "tools_executed": tools_executed,
+    }
+
+
+@app.get("/transform/tools")
+async def list_transform_tools():
+    """List all available MCP transform tools and their schemas."""
+    tools = []
+    for name, tool_def in TRANSFORM_TOOLS.items():
+        tools.append({
+            "name": tool_def["name"],
+            "description": tool_def["description"],
+            "parameters": tool_def["parameters"],
+        })
+    return {"tools": tools, "count": len(tools)}
 
 
 @app.post("/transform/prompt")
@@ -6993,11 +7357,13 @@ async def transform_prompt(req: TransformPromptRequest):
 
     # Skip LLM calls for non-actionable chat-style prompts.
     if _is_non_actionable_transform_prompt(req.prompt):
+        # Instead of rejecting, generate a helpful chat response
+        chat_response = _generate_chat_response(req.prompt, current_df)
         preview = _df_to_preview(current_df)
         return {
             "step_index": -1,
             "code": "",
-            "summary": "No transform detected. Please describe a concrete data change (e.g., drop duplicates, fill nulls, rename a column).",
+            "summary": chat_response,
             "diff": {
                 "rows_before": before_shape[0],
                 "rows_after": before_shape[0],
@@ -7017,7 +7383,25 @@ async def transform_prompt(req: TransformPromptRequest):
             "null_counts": {col: int(current_df[col].isnull().sum()) for col in current_df.columns},
         }
 
-    constraints = _extract_transform_constraints(req.prompt)
+    # Handle "do it all" batch requests by expanding to a concrete prompt
+    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything"]
+    expanded_prompt = req.prompt
+    if any(kw in req.prompt.lower() for kw in batch_keywords):
+        actions = []
+        null_cols = [col for col in current_df.columns if current_df[col].isnull().sum() > 0]
+        if null_cols:
+            for col in null_cols:
+                if current_df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                    actions.append(f"fill null values in column '{col}' with the median")
+                else:
+                    actions.append(f"fill null values in column '{col}' with the mode (most frequent value)")
+        if int(current_df.duplicated().sum()) > 0:
+            actions.append("drop duplicate rows")
+        if not actions:
+            actions.append("no cleanup needed — data is already clean")
+        expanded_prompt = ". ".join(actions)
+
+    constraints = _extract_transform_constraints(expanded_prompt)
 
     # Build the LLM prompt
     col_info = ", ".join(
@@ -7039,7 +7423,7 @@ async def transform_prompt(req: TransformPromptRequest):
         f"- Columns: {col_info}\n"
         f"- Sample (first 3 rows): {sample_json}\n"
         f"- Total null values: {before_nulls}\n\n"
-        f"User request: {req.prompt}\n\n"
+        f"User request: {expanded_prompt}\n\n"
         f"Write the pandas code to accomplish this."
     )
 
@@ -7171,7 +7555,7 @@ async def transform_prompt(req: TransformPromptRequest):
     if result_df is None or diff is None:
         raise HTTPException(status_code=422, detail="No valid transform result produced")
 
-    summary = _build_transform_summary(req.prompt, diff)
+    summary = _build_transform_summary(req.prompt, diff, result_df, current_df, session)
 
     step = {
         "prompt": req.prompt,
@@ -7342,26 +7726,153 @@ def _is_non_actionable_transform_prompt(prompt: str) -> bool:
     if not text:
         return True
 
+    # Batch/execute-all commands are always actionable
+    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything", "fix all", "clean all"]
+    if any(kw in text for kw in batch_keywords):
+        return False
+
     transform_verbs = [
         "remove", "drop", "delete", "filter", "keep", "retain", "fill", "impute",
         "replace", "rename", "convert", "cast", "normalize", "standardize", "scale",
         "encode", "clean", "strip", "trim", "split", "merge", "aggregate", "group",
         "sort", "deduplicate", "duplicate", "round", "clip", "bin", "outlier",
+        "all", "everything", "fix",
     ]
     if any(verb in text for verb in transform_verbs):
         return False
 
-    small_talk = [
-        "hi", "hello", "hey", "thanks", "thank you", "test", "testing", "ok", "okay",
-        "cool", "nice", "yo", "sup", "hola", "bonjour",
-    ]
-    if text in small_talk:
+    # Analysis requests — let them through as chat, not transforms
+    analysis_keywords = ["analyze", "analyse", "examine", "inspect", "show", "describe", "statistics", "summary", "profile", "overview", "again", "correct", "quality", "tell me", "how much", "find null", "show null", "check null", "missing values", "find missing", "show missing", "scan null", "null values"]
+    if any(kw in text for kw in analysis_keywords):
         return True
 
-    if len(text.split()) <= 3:
+    small_talk = [
+        "hi", "hello", "hey", "thanks", "thank you", "test", "testing", "ok", "okay",
+        "cool", "nice", "yo", "sup", "hola", "bonjour", "what", "how", "why", "who",
+    ]
+    if text.rstrip("!?.") in small_talk or (len(text.split()) >= 1 and text.split()[0] in small_talk):
+        return True
+
+    # Questions are chat, not transforms
+    if text.startswith(("what", "how", "why", "which", "can", "is", "are", "do", "does", "tell")):
+        return True
+
+    if len(text.split()) <= 2 and not any(verb in text for verb in transform_verbs):
         return True
 
     return False
+
+
+def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
+    """Generate a copilot-style response — short, sharp, actionable."""
+    text = (prompt or "").strip().lower()
+
+    # Null value scan
+    null_keywords = ["find null", "null values", "show null", "check null", "missing values", "find missing", "show missing", "scan null"]
+    if any(kw in text for kw in null_keywords):
+        return _build_null_scan_response(df)
+
+    # Analysis/quality check
+    analysis_keywords = ["analyze", "analyse", "examine", "inspect", "describe", "statistics", "summary", "profile", "overview", "again", "correct", "quality", "good", "tell me"]
+    if any(kw in text for kw in analysis_keywords):
+        nulls = int(df.isnull().sum().sum())
+        dups = int(df.duplicated().sum())
+        num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        total_cells = df.shape[0] * df.shape[1]
+        completeness = round((1 - nulls / max(total_cells, 1)) * 100, 1)
+        quality_score = min(100, max(0, int(completeness - (dups / max(df.shape[0], 1)) * 10)))
+
+        response = f"🔍 DATASET ANALYSIS\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        response += f"📊 Overview\n"
+        response += f"• Rows: {df.shape[0]} | Columns: {df.shape[1]} | Nulls: {nulls} ({round(100 - completeness, 1)}%)\n"
+        response += f"• Quality Score: {quality_score}/100\n"
+
+        # Categorize issues by severity
+        critical_issues = []
+        medium_issues = []
+        low_issues = []
+
+        # Check nulls per column
+        for col in df.columns:
+            col_nulls = int(df[col].isnull().sum())
+            if col_nulls == 0:
+                continue
+            pct = round(col_nulls / df.shape[0] * 100, 0)
+            if pct >= 30:
+                if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                    critical_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill with median")
+                else:
+                    critical_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill with mode")
+            elif pct >= 10:
+                medium_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill missing values")
+            else:
+                low_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill or ignore")
+
+        # Check type mismatches
+        for col in df.columns:
+            if df[col].dtype == "object":
+                numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+                if numeric_count > len(df) * 0.5:
+                    critical_issues.append(f"{col}: stored as text but looks numeric → convert to number")
+
+        # Duplicates
+        if dups > 0:
+            if dups > df.shape[0] * 0.1:
+                critical_issues.append(f"Dataset: {dups} duplicate rows ({round(dups/df.shape[0]*100,0)}%) → drop duplicates")
+            else:
+                medium_issues.append(f"Dataset: {dups} duplicate rows → drop duplicates")
+
+        if critical_issues:
+            response += f"\n🚨 Critical Issues (fix first)\n"
+            for i, issue in enumerate(critical_issues[:4], 1):
+                response += f"{i}. {issue}\n"
+
+        if medium_issues:
+            response += f"\n⚠️ Medium Issues\n"
+            for i, issue in enumerate(medium_issues[:4], len(critical_issues) + 1):
+                response += f"{i}. {issue}\n"
+
+        if low_issues:
+            response += f"\nℹ️ Low Priority\n"
+            for i, issue in enumerate(low_issues[:3], len(critical_issues) + len(medium_issues) + 1):
+                response += f"{i}. {issue}\n"
+
+        if not critical_issues and not medium_issues and not low_issues:
+            response += "\n✅ No issues found. Data is clean!\n"
+
+        if critical_issues or medium_issues:
+            response += f"\n🎯 Auto-fix all issues? Type 'do it all' or click a suggested transform above."
+        else:
+            response += f"\n🎯 Ready for ML training! Go Back to Training to start."
+
+        return response
+
+    # Greetings
+    greetings = ["hi", "hello", "hey", "hola", "bonjour", "yo", "sup"]
+    if text.rstrip("!?.") in greetings:
+        nulls = int(df.isnull().sum().sum())
+        response = f"👋 PyrunAI Data Engineer ready.\n\n"
+        response += f"📊 {df.shape[0]} rows × {df.shape[1]} cols"
+        if nulls > 0:
+            response += f" | ⚠️ {nulls} nulls"
+        response += "\n\nI execute immediately:\n"
+        response += "• 'do it all' — auto-fix everything\n"
+        response += "• 'fill nulls' — fill missing values\n"
+        response += "• 'analyse' — show data health\n"
+        response += "• 'normalize' — scale features"
+        return response
+
+    # Questions
+    if text.startswith(("what", "how", "why", "which", "can", "is", "are", "does", "tell")):
+        return (
+            f"I execute, not explain. 📊 {df.shape[0]}×{df.shape[1]}\n\n"
+            f"Actions: fill nulls | drop cols | normalize | encode | remove outliers | filter | rename\n\n"
+            f"Say it → I do it. Try 'do it all'."
+        )
+
+    # Default
+    return f"📊 {df.shape[0]}×{df.shape[1]} | Say what to do → I execute.\nTry: 'do it all', 'fill nulls', 'analyse'"
 
 
 def _extract_transform_constraints(prompt: str) -> Dict[str, bool]:
@@ -7432,17 +7943,506 @@ def _validate_transform_code(code: str) -> None:
             )
 
 
-def _build_transform_summary(prompt: str, diff: dict) -> str:
-    """Build a human-readable summary of a transform step."""
-    parts = []
+def _build_transform_summary(prompt: str, diff: dict, result_df: "pd.DataFrame | None" = None, before_df: "pd.DataFrame | None" = None, session: "dict | None" = None) -> str:
+    """Build execution result in the copilot format with proactive next-action suggestions."""
+    lines = []
+    lines.append(f"⚡ Executed: {prompt[:60]}")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("")
+
+    # AI Decision block (only for meaningful transforms)
+    if before_df is not None and result_df is not None and (diff["nulls_removed"] > 0 or diff["rows_changed"] > 0 or diff["cols_changed"] > 0):
+        decision_block = _build_decision_block(prompt, diff, before_df, result_df)
+        if decision_block:
+            lines.append(decision_block)
+            lines.append("")
+
+    lines.append("📊 Result:")
+    lines.append(f"  Before: {diff['rows_before']} rows, {diff['cols_before']} cols, {diff['nulls_before']} nulls")
+    lines.append(f"  After:  {diff['rows_after']} rows, {diff['cols_after']} cols, {diff['nulls_after']} nulls")
+    lines.append("")
+
+    changes = []
     if diff["rows_changed"] > 0:
         direction = "removed" if diff["rows_after"] < diff["rows_before"] else "added"
-        parts.append(f"{diff['rows_changed']} rows {direction}")
+        changes.append(f"✅ {diff['rows_changed']} rows {direction}")
     if diff["cols_changed"] > 0:
         direction = "removed" if diff["cols_after"] < diff["cols_before"] else "added"
-        parts.append(f"{diff['cols_changed']} columns {direction}")
+        changes.append(f"✅ {diff['cols_changed']} columns {direction}")
     if diff["nulls_removed"] > 0:
-        parts.append(f"{diff['nulls_removed']} null values removed")
-    if not parts:
-        parts.append("Data modified (same shape)")
-    return ", ".join(parts)
+        changes.append(f"✅ {diff['nulls_removed']} null values fixed")
+    if not changes:
+        changes.append("✅ Data modified (same shape)")
+
+    lines.extend(changes)
+
+    # Quality progress bar
+    if result_df is not None and session is not None:
+        current_score = _compute_quality_score(result_df)
+        quality_history = session.get("quality_history", [])
+        # Record this step
+        short_label = prompt[:18] + "..." if len(prompt) > 18 else prompt
+        quality_history.append({"label": f"After: {short_label}", "score": current_score})
+        session["quality_history"] = quality_history
+        lines.append("")
+        lines.append(_build_quality_progress_bar(quality_history[:-1], current_score))
+
+    # Proactive next-action suggestion based on data state
+    lines.append("")
+    suggestion = _get_proactive_suggestion(prompt, diff, result_df)
+    lines.append(suggestion)
+
+    return "\n".join(lines)
+
+
+def _build_decision_block(prompt: str, diff: dict, before_df: "pd.DataFrame", result_df: "pd.DataFrame") -> str:
+    """Build the AI Decision confidence block showing WHY a particular approach was chosen."""
+    prompt_lower = (prompt or "").lower()
+    lines = []
+
+    # Null filling decisions
+    if "fill" in prompt_lower or "null" in prompt_lower or "impute" in prompt_lower or diff["nulls_removed"] > 0:
+        # Find which columns had nulls filled
+        filled_cols = []
+        for col in before_df.columns:
+            if col not in result_df.columns:
+                continue
+            before_nulls = int(before_df[col].isnull().sum())
+            after_nulls = int(result_df[col].isnull().sum()) if col in result_df.columns else 0
+            if before_nulls > 0 and after_nulls < before_nulls:
+                filled_cols.append((col, before_nulls - after_nulls, before_df[col].dtype))
+
+        if filled_cols:
+            lines.append("🧠 AI Decision")
+            lines.append("━━━━━━━━━━━━")
+            # Show decision for the top column
+            top_col, top_fixed, top_dtype = filled_cols[0]
+            if top_dtype in ["float64", "int64", "float32", "int32"]:
+                col_data = before_df[top_col].dropna()
+                if len(col_data) > 0:
+                    median_val = col_data.median()
+                    mean_val = col_data.mean()
+                    skew = col_data.skew()
+                    # Determine confidence based on skewness
+                    if abs(skew) > 1:
+                        confidence = 94
+                        strategy = "median"
+                        reason = f"Distribution is skewed ({skew:.1f}). Median is more robust than mean."
+                        alternative = f"Mean ({mean_val:.1f}) — rejected: skew would bias imputation"
+                    elif abs(skew) > 0.5:
+                        confidence = 85
+                        strategy = "median"
+                        reason = f"Moderate skew ({skew:.1f}). Median preferred for robustness."
+                        alternative = f"Mean ({mean_val:.1f}) — acceptable but less robust"
+                    else:
+                        confidence = 88
+                        strategy = "median"
+                        reason = f"Symmetric distribution. Median ≈ Mean, using median for safety."
+                        alternative = f"Mean ({mean_val:.1f}) — equally valid here"
+
+                    lines.append(f"Decision: Fill '{top_col}' nulls with {strategy} ({median_val:.1f})")
+                    lines.append(f"Confidence: {confidence}%")
+                    lines.append(f"Reason: {reason}")
+                    lines.append(f"Alternative: {alternative}")
+            else:
+                col_data = before_df[top_col].dropna()
+                if len(col_data) > 0:
+                    mode_val = col_data.mode().iloc[0] if not col_data.mode().empty else "Unknown"
+                    mode_freq = int((col_data == mode_val).sum())
+                    mode_pct = round(mode_freq / len(col_data) * 100, 0)
+                    confidence = min(95, max(60, int(mode_pct)))
+                    lines.append(f"Decision: Fill '{top_col}' nulls with mode ('{mode_val}')")
+                    lines.append(f"Confidence: {confidence}%")
+                    lines.append(f"Reason: Mode appears in {mode_pct}% of non-null values — strong majority.")
+                    lines.append(f"Alternative: 'Unknown' — use if mode dominance < 50%")
+
+            if len(filled_cols) > 1:
+                others = ", ".join(f"'{c}'" for c, _, _ in filled_cols[1:4])
+                lines.append(f"Also fixed: {others} ({len(filled_cols)-1} more columns)")
+
+    # Outlier removal decisions
+    elif "outlier" in prompt_lower:
+        if diff["rows_changed"] > 0:
+            lines.append("🧠 AI Decision")
+            lines.append("━━━━━━━━━━━━")
+            lines.append(f"Decision: Remove {diff['rows_changed']} outlier rows using IQR method (1.5×)")
+            lines.append("Confidence: 87%")
+            lines.append("Reason: IQR is standard for unknown distributions. Removes extreme values only.")
+            lines.append("Alternative: Z-score (3σ) — more lenient, keeps borderline cases")
+
+    # Encoding decisions
+    elif "encode" in prompt_lower:
+        if diff["cols_changed"] > 0:
+            lines.append("🧠 AI Decision")
+            lines.append("━━━━━━━━━━━━")
+            lines.append(f"Decision: Label encoding (categories → integers)")
+            lines.append("Confidence: 82%")
+            lines.append("Reason: Preserves column count. Tree models handle label encoding well.")
+            lines.append("Alternative: One-hot encoding — better for linear models, adds columns")
+
+    # Normalization decisions
+    elif "normalize" in prompt_lower or "scale" in prompt_lower:
+        lines.append("🧠 AI Decision")
+        lines.append("━━━━━━━━━━━━")
+        lines.append(f"Decision: Min-Max normalization (scale to 0-1)")
+        lines.append("Confidence: 80%")
+        lines.append("Reason: Preserves distribution shape. Works for most ML models.")
+        lines.append("Alternative: Z-score standardization — better if data has outliers")
+
+    return "\n".join(lines) if lines else ""
+
+
+def _get_proactive_suggestion(prompt: str, diff: dict, result_df: "pd.DataFrame | None" = None) -> str:
+    """Generate a smart proactive suggestion based on what was just done."""
+    prompt_lower = (prompt or "").lower()
+
+    if result_df is None:
+        if diff["nulls_after"] > 0:
+            return f"💡 I noticed {diff['nulls_after']} nulls still remain. Want me to fill them all?\n🔜 Type: 'fill all null values'"
+        return "🔜 Next: Try 'normalize numeric columns' or go Back to Training."
+
+    nulls_remaining = int(result_df.isnull().sum().sum())
+    dups = int(result_df.duplicated().sum())
+    num_cols = result_df.select_dtypes(include=["number"]).columns.tolist()
+    cat_cols = result_df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+    # After fixing nulls
+    if "null" in prompt_lower or "fill" in prompt_lower or "impute" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 {nulls_remaining} nulls still remain in other columns. Want me to fix those too?\n🔜 Type: 'fill all null values'"
+        elif cat_cols:
+            return f"💡 Nulls are gone! I see {len(cat_cols)} categorical column(s) ({', '.join(cat_cols[:3])}). Want me to encode them for ML?\n🔜 Type: 'encode categorical columns'"
+        elif num_cols:
+            # Check for outliers
+            outlier_count = 0
+            for col in num_cols[:5]:
+                q1, q3 = result_df[col].quantile(0.25), result_df[col].quantile(0.75)
+                iqr = q3 - q1
+                outliers = ((result_df[col] < q1 - 1.5 * iqr) | (result_df[col] > q3 + 1.5 * iqr)).sum()
+                outlier_count += int(outliers)
+            if outlier_count > 0:
+                return f"💡 Numeric columns are clean. I found {outlier_count} potential outliers. Want me to remove them?\n🔜 Type: 'remove outliers'"
+            return f"💡 Data looks great! Want me to normalize the {len(num_cols)} numeric columns for ML?\n🔜 Type: 'normalize numeric columns'"
+        else:
+            return "✅ Data is ML-ready! Go Back to Training to start model training."
+
+    # After encoding
+    if "encode" in prompt_lower or "categorical" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Encoding done. Still {nulls_remaining} nulls to fix first.\n🔜 Type: 'fill all null values'"
+        total_cells = result_df.shape[0] * result_df.shape[1]
+        quality = min(100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100)))
+        return f"💡 Categorical columns encoded. Quality: {quality}/100. Want me to normalize numeric features?\n🔜 Type: 'normalize numeric columns'"
+
+    # After normalizing
+    if "normalize" in prompt_lower or "scale" in prompt_lower or "standardize" in prompt_lower:
+        total_cells = result_df.shape[0] * result_df.shape[1]
+        quality = min(100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100)))
+        if cat_cols:
+            return f"💡 Normalized! Quality: {quality}/100. {len(cat_cols)} text column(s) remain. Want me to encode them?\n🔜 Type: 'encode categorical columns'"
+        return f"✅ Dataset quality: {quality}/100. Data is ML-ready! Go Back to Training to start."
+
+    # After removing outliers
+    if "outlier" in prompt_lower:
+        if cat_cols:
+            return f"💡 Outliers removed. Want me to encode {len(cat_cols)} categorical column(s) for ML?\n🔜 Type: 'encode categorical columns'"
+        return f"💡 Outliers removed. Data is clean. Want me to normalize numeric columns?\n🔜 Type: 'normalize numeric columns'"
+
+    # After dropping columns
+    if "drop" in prompt_lower and "col" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Column(s) dropped. {nulls_remaining} nulls remain. Want me to fix them?\n🔜 Type: 'fill all null values'"
+        return "💡 Columns cleaned up. Data looks good!\n🔜 Type: 'analyse' to check quality score."
+
+    # After dropping duplicates
+    if "duplicate" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Duplicates gone! But {nulls_remaining} nulls remain. Want me to fix them?\n🔜 Type: 'fill all null values'"
+        return "💡 No duplicates. Data is cleaner now!\n🔜 Type: 'analyse' to see quality score."
+
+    # After converting types
+    if "convert" in prompt_lower or "dtype" in prompt_lower or "numeric" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Types converted. Conversion may have created {nulls_remaining} new nulls (invalid values → NaN). Want me to fill them?\n🔜 Type: 'fill all null values'"
+        return "💡 Types fixed! Data is in better shape now.\n🔜 Type: 'analyse' to check progress."
+
+    # Generic: base on data state
+    if nulls_remaining > 0:
+        return f"💡 {nulls_remaining} nulls remaining. Want me to fix them?\n🔜 Type: 'fill all null values'"
+    elif dups > 0:
+        return f"💡 {dups} duplicate rows found. Want me to remove them?\n🔜 Type: 'drop duplicates'"
+    elif cat_cols:
+        return f"💡 Data is clean! {len(cat_cols)} categorical column(s) could be encoded for ML.\n🔜 Type: 'encode categorical columns'"
+    else:
+        total_cells = result_df.shape[0] * result_df.shape[1]
+        quality = min(100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100)))
+        return f"✅ Dataset quality: {quality}/100. ML-ready! Go Back to Training."
+
+
+def _compute_quality_score(df: pd.DataFrame) -> int:
+    """Compute a 0-100 quality score for a DataFrame."""
+    if df.shape[0] == 0:
+        return 0
+    total_cells = df.shape[0] * df.shape[1]
+    nulls = int(df.isnull().sum().sum())
+    dups = int(df.duplicated().sum())
+
+    # Completeness (0-50 points)
+    completeness_ratio = 1 - (nulls / max(total_cells, 1))
+    completeness_score = int(completeness_ratio * 50)
+
+    # No duplicates (0-15 points)
+    dup_ratio = dups / max(df.shape[0], 1)
+    dup_score = int((1 - min(dup_ratio * 5, 1)) * 15)
+
+    # Type correctness (0-20 points) — object columns that look numeric lose points
+    type_penalty = 0
+    for col in df.select_dtypes(include=["object"]).columns:
+        numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+        if numeric_count > df.shape[0] * 0.5:
+            type_penalty += 5
+    type_score = max(0, 20 - type_penalty)
+
+    # Column utility (0-15 points) — constant or near-constant columns lose points
+    constant_penalty = 0
+    for col in df.columns:
+        if df[col].nunique() <= 1:
+            constant_penalty += 5
+    utility_score = max(0, 15 - constant_penalty)
+
+    return min(100, max(0, completeness_score + dup_score + type_score + utility_score))
+
+
+def _build_quality_progress_bar(quality_history: list, current_score: int) -> str:
+    """Build a visual quality progress bar showing improvement over the session."""
+    ML_READY_THRESHOLD = 80
+    lines = []
+    lines.append("📈 Dataset Health")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    for entry in quality_history:
+        score = entry["score"]
+        label = entry["label"]
+        bar = _score_to_bar(score)
+        lines.append(f"  {label:<22} {score:>3}/100 {bar}")
+
+    # Current
+    bar = _score_to_bar(current_score)
+    lines.append(f"  {'Current':<22} {current_score:>3}/100 {bar}")
+
+    # ML Ready threshold line
+    lines.append(f"  {'ML Ready threshold':<22} {ML_READY_THRESHOLD:>3}/100 {'─' * 20}")
+
+    if current_score >= ML_READY_THRESHOLD:
+        lines.append("\n✅ Your dataset is now ML-ready!")
+    else:
+        gap = ML_READY_THRESHOLD - current_score
+        lines.append(f"\n⚡ {gap} points to ML-ready. Keep cleaning!")
+
+    return "\n".join(lines)
+
+
+def _score_to_bar(score: int) -> str:
+    """Convert a 0-100 score to a visual bar."""
+    filled = score // 5  # 20 chars max
+    empty = 20 - filled
+    return "█" * filled + "░" * empty
+
+
+def _build_null_scan_response(df: pd.DataFrame) -> str:
+    """Build structured null value scan response in copilot format."""
+    null_cols = []
+    for col in df.columns:
+        col_nulls = int(df[col].isnull().sum())
+        if col_nulls > 0:
+            pct = round(col_nulls / df.shape[0] * 100, 0)
+            # Determine suggested fix
+            if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                median_val = df[col].median()
+                fix = f"Fill with median ({median_val:.0f})" if not pd.isna(median_val) else "Fill with 0"
+            elif df[col].dtype == "object":
+                mode_val = df[col].mode()
+                if not mode_val.empty:
+                    fix = f"Fill with mode ('{mode_val.iloc[0]}')"
+                else:
+                    fix = "Fill with 'Unknown'"
+            else:
+                fix = "Fill with forward fill"
+            null_cols.append((col, col_nulls, int(pct), fix))
+
+    if not null_cols:
+        return "✅ No null values found! Dataset is complete.\n\n🔜 Next: Try 'normalize numeric columns' or 'remove outliers'"
+
+    # Sort by null count descending
+    null_cols.sort(key=lambda x: x[1], reverse=True)
+    total_nulls = sum(n for _, n, _, _ in null_cols)
+
+    response = "🔍 Null Value Scan Complete\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Table header
+    max_col_len = max(len(col) for col, _, _, _ in null_cols)
+    col_width = max(max_col_len, 10)
+    response += f"{'Column':<{col_width}}  Nulls    %     Suggested Fix\n"
+    response += "─" * (col_width + 40) + "\n"
+
+    for col, nulls, pct, fix in null_cols:
+        response += f"{col:<{col_width}}  {nulls:<6}  {pct:>3}%   → {fix}\n"
+
+    response += f"\nTotal: {total_nulls} nulls across {len(null_cols)} columns\n\n"
+    response += "🎯 Type 'fill all null values' to fix everything automatically."
+
+    return response
+
+
+def _build_dataset_profile_for_analysis(df: pd.DataFrame) -> str:
+    """Build a rich text profile of the dataset for the AI analyzer."""
+    lines = []
+    lines.append(f"Shape: {df.shape[0]} rows × {df.shape[1]} columns")
+    lines.append(f"Total null values: {int(df.isnull().sum().sum())}")
+    lines.append(f"Duplicate rows: {int(df.duplicated().sum())}")
+    lines.append(f"Memory usage: {df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+    lines.append("")
+    lines.append("COLUMNS:")
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        nulls = int(df[col].isnull().sum())
+        null_pct = f"{(nulls / len(df)) * 100:.1f}%" if len(df) > 0 else "0%"
+        unique = df[col].nunique()
+        sample = df[col].dropna().head(3).tolist()
+
+        line = f"  - {col} ({dtype}): {unique} unique, {nulls} nulls ({null_pct})"
+        if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+            line += f", range=[{df[col].min()}, {df[col].max()}], mean={df[col].mean():.2f}"
+        else:
+            line += f", sample={sample[:3]}"
+        lines.append(line)
+
+    # Check for potential issues
+    lines.append("")
+    lines.append("DETECTED ISSUES:")
+    issues_found = False
+
+    # High null columns
+    high_null_cols = [(col, int(df[col].isnull().sum())) for col in df.columns if df[col].isnull().sum() > len(df) * 0.1]
+    if high_null_cols:
+        issues_found = True
+        for col, count in high_null_cols:
+            lines.append(f"  ⚠ Column '{col}' has {count} nulls ({count/len(df)*100:.0f}%)")
+
+    # Duplicate rows
+    dup_count = int(df.duplicated().sum())
+    if dup_count > 0:
+        issues_found = True
+        lines.append(f"  ⚠ {dup_count} duplicate rows found")
+
+    # Constant columns
+    for col in df.columns:
+        if df[col].nunique() <= 1:
+            issues_found = True
+            lines.append(f"  ⚠ Column '{col}' has only 1 unique value (constant)")
+
+    # Potential type mismatches (object columns that might be numeric)
+    for col in df.columns:
+        if df[col].dtype == "object":
+            numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+            if numeric_count > len(df) * 0.8:
+                issues_found = True
+                lines.append(f"  ⚠ Column '{col}' is stored as text but appears numeric ({numeric_count}/{len(df)} values)")
+
+    if not issues_found:
+        lines.append("  ✓ No major issues detected")
+
+    return "\n".join(lines)
+
+
+def _parse_analysis_response(raw: Optional[str]) -> dict:
+    """Parse the LLM analysis response into structured format."""
+    fallback = {
+        "quality_score": 50,
+        "issues": [],
+        "column_insights": [],
+        "recommended_transforms": [],
+        "summary": "Could not generate analysis. Try transforming your data manually.",
+    }
+
+    if not raw:
+        return fallback
+
+    # Try to extract JSON
+    text = raw.strip()
+    text = _strip_code_fences(text)
+
+    # Find JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        # Try to salvage a text response
+        return {
+            "quality_score": 60,
+            "issues": [],
+            "column_insights": [],
+            "recommended_transforms": [],
+            "summary": text[:500],
+        }
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+        if not isinstance(parsed, dict):
+            return fallback
+
+        # Ensure required fields
+        return {
+            "quality_score": parsed.get("quality_score", 50),
+            "issues": parsed.get("issues", []),
+            "column_insights": parsed.get("column_insights", []),
+            "recommended_transforms": parsed.get("recommended_transforms", []),
+            "summary": parsed.get("summary", "Analysis complete."),
+        }
+    except json.JSONDecodeError:
+        return {
+            "quality_score": 60,
+            "issues": [],
+            "column_insights": [],
+            "recommended_transforms": [],
+            "summary": text[:500],
+        }
+
+
+def _parse_thinking_response(raw: Optional[str]) -> dict:
+    """Parse the LLM thinking/planning response."""
+    fallback = {
+        "thinking": "Ready to execute",
+        "is_valid": True,
+        "validation_issues": [],
+        "plan": ["Execute transformation"],
+        "estimated_impact": {},
+        "confidence": "medium",
+        "warnings": [],
+    }
+
+    if not raw:
+        return fallback
+
+    text = raw.strip()
+    text = _strip_code_fences(text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return fallback
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+        if not isinstance(parsed, dict):
+            return fallback
+        return {
+            "thinking": parsed.get("thinking", "Ready to execute"),
+            "is_valid": parsed.get("is_valid", True),
+            "validation_issues": parsed.get("validation_issues", []),
+            "plan": parsed.get("plan", ["Execute transformation"]),
+            "estimated_impact": parsed.get("estimated_impact", {}),
+            "confidence": parsed.get("confidence", "medium"),
+            "warnings": parsed.get("warnings", []),
+        }
+    except json.JSONDecodeError:
+        return fallback

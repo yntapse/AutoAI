@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: autoai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pyrun
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-pyrun123}
+      POSTGRES_DB: pyrunai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pyrun -d pyrunai"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: autoai-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://pyrun:${DB_PASSWORD:-pyrun123}@postgres:5432/pyrunai
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - AGENT_EXECUTION_MODE=sandbox
+      - ENABLE_PROMPT_ARCHITECT=true
+      - CORS_ALLOW_ORIGINS=http://${SERVER_IP}:3000,http://${SERVER_IP},http://localhost:3000
+      - SANDBOX_AUTOSTART_WORKER=false
+      - FINE_TUNE_USE_SANDBOX=true
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sandbox-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: autoai-sandbox-worker
+    restart: unless-stopped
+    user: root
+    command: ["python", "sandbox_worker.py"]
+    environment:
+      - DATABASE_URL=postgresql://pyrun:${DB_PASSWORD:-pyrun123}@postgres:5432/pyrunai
+      - SANDBOX_IMAGE=pyrun-sandbox-base
+      - SANDBOX_WORKER_CONCURRENCY=1
+      - SANDBOX_POLL_INTERVAL_SECONDS=3
+      - TMPDIR=/sandbox-tmp
+      - SANDBOX_HOST_TMP_PREFIX=/tmp/sandbox-shared
+      - SANDBOX_CONTAINER_TMP_PREFIX=/sandbox-tmp
+    volumes:
+      - uploads_data:/app/uploads
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker:/usr/libexec/docker:ro
+      - /tmp/sandbox-shared:/sandbox-tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        - NEXT_PUBLIC_API_BASE_URL=http://${SERVER_IP}:8000
+    container_name: autoai-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  uploads_data:

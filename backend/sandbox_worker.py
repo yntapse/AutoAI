@@ -21,6 +21,8 @@ POLL_INTERVAL_SECONDS = int(os.getenv("SANDBOX_POLL_INTERVAL_SECONDS", "2"))
 RECOVER_RUNNING_ON_STARTUP = os.getenv("SANDBOX_RECOVER_ON_STARTUP", "true").lower() in {"true", "1", "yes"}
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "pyrun-sandbox-base")
 SANDBOX_WORKER_CONCURRENCY = int(os.getenv("SANDBOX_WORKER_CONCURRENCY", "2"))
+SANDBOX_HOST_TMP_PREFIX = os.getenv("SANDBOX_HOST_TMP_PREFIX", "")
+SANDBOX_CONTAINER_TMP_PREFIX = os.getenv("SANDBOX_CONTAINER_TMP_PREFIX", "")
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 
@@ -55,6 +57,20 @@ def _resolve_dataset_source(file_id: str) -> Path:
     return source_path
 
 
+def _to_host_path(container_path: Path) -> str:
+    """Translate a container-local path to the corresponding host path.
+
+    When the sandbox worker runs inside Docker, temp files are created at
+    SANDBOX_CONTAINER_TMP_PREFIX (e.g. /sandbox-tmp/job_xxx/script.py) but
+    the Docker daemon needs the host path (e.g. /tmp/sandbox-shared/job_xxx/script.py).
+    """
+    if SANDBOX_HOST_TMP_PREFIX and SANDBOX_CONTAINER_TMP_PREFIX:
+        path_str = str(container_path)
+        if path_str.startswith(SANDBOX_CONTAINER_TMP_PREFIX):
+            return path_str.replace(SANDBOX_CONTAINER_TMP_PREFIX, SANDBOX_HOST_TMP_PREFIX, 1)
+    return str(container_path)
+
+
 def _execute_job_in_sandbox(job: SandboxJob) -> dict:
     db = SessionLocal()
     try:
@@ -85,9 +101,9 @@ def _execute_job_in_sandbox(job: SandboxJob) -> dict:
             "--read-only",
             "--cap-drop=ALL",
             "-v",
-            f"{script_path.resolve()}:/app/script.py:ro",
+            f"{_to_host_path(script_path.resolve())}:/app/script.py:ro",
             "-v",
-            f"{dataset_path.resolve()}:/app/dataset.csv:ro",
+            f"{_to_host_path(dataset_path.resolve())}:/app/dataset.csv:ro",
             SANDBOX_IMAGE,
             "/app/script.py",
         ]
