@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "Claude outputs", "src/app/(dashboard)/new-project/page_backup.tsx"]
+}

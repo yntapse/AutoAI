@@ -1,0 +1,305 @@
+INFO:     127.0.0.1:49550 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49561 - "GET / HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '6f7c750a-cee9-4c2e-a859-c71a026b3a6e', 'project_name': 'stop-test-a', 'file_id': 'd3a1025f-51a0-45f1-83ff-4af8f883cdcd.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49562 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49563 - "POST /agent/start HTTP/1.1" 201 Created
+=== AGENT ITERATION === 1
+INFO:     127.0.0.1:49564 - "GET /agent/status/e90ba240-fdfe-448c-9099-bc9e555ad8e1 HTTP/1.1" 200 OK
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49566 - "GET /agent/status/e90ba240-fdfe-448c-9099-bc9e555ad8e1 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49567 - "GET /agent/status/e90ba240-fdfe-448c-9099-bc9e555ad8e1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49568 - "POST /agent/stop/e90ba240-fdfe-448c-9099-bc9e555ad8e1 HTTP/1.1" 500 Internal Server Error
+[DEBUG] /projects/create response: {'project_id': 'f68938e6-571e-498a-a74d-582bbe89450b', 'project_name': 'stop-test-b', 'file_id': '302186c6-0b44-4fa6-9451-d6b00ba9f9d0.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49569 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49570 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49571 - "POST /agent/stop/fecd1daa-2546-4679-b926-683902ceaf80 HTTP/1.1" 500 Internal Server Error
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+[DEBUG] /projects/create response: {'project_id': '91baa58c-13f3-4f6f-9a3c-f4e3cd60b1bb', 'project_name': 'stop-test-c', 'file_id': '4342cdb4-2a16-4f59-8fe6-e0f0d78dbda8.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49572 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49573 - "POST /agent/start HTTP/1.1" 201 Created
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49575 - "POST /agent/stop/9013ddda-c9c2-4586-a5ff-3665c9035f43 HTTP/1.1" 500 Internal Server Error
+[DEBUG] /projects/create response: {'project_id': 'e75ce1ec-eef4-49fd-b047-b52662eb6b50', 'project_name': 'stop-test-d', 'file_id': 'abe13f44-ab24-4118-91f1-4aceaba488ce.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49576 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49577 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49578 - "GET /agent/status/c35e4abc-c2c3-4eff-a6e7-0c0d1647fabc HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49579 - "GET /agent/status/c35e4abc-c2c3-4eff-a6e7-0c0d1647fabc HTTP/1.1" 200 OK
+=== AGENT ITERATION === 2
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49580 - "GET /agent/status/c35e4abc-c2c3-4eff-a6e7-0c0d1647fabc HTTP/1.1" 200 OK
+=== AGENT ITERATION === 5
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49581 - "GET /agent/status/c35e4abc-c2c3-4eff-a6e7-0c0d1647fabc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49582 - "POST /agent/stop/c35e4abc-c2c3-4eff-a6e7-0c0d1647fabc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49583 - "GET /agent/status/c35e4abc-c2c3-4eff-a6e7-0c0d1647fabc HTTP/1.1" 200 OK
+=== AGENT ITERATION === 3
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 4
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 5
+=== AGENT ITERATION === 5
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+[DEBUG] /projects/create response: {'project_id': '0c3d239e-717d-4f53-a92c-4698b3c8ac2d', 'project_name': 'stop-test-a-repro', 'file_id': 'd7432df9-36a5-4ad8-9cc6-efbe7d986a82.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49601 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49602 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49603 - "GET /agent/status/9510d075-0f18-4d32-b32d-e3c3bed5f012 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49604 - "GET /agent/status/9510d075-0f18-4d32-b32d-e3c3bed5f012 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49607 - "GET /agent/status/9510d075-0f18-4d32-b32d-e3c3bed5f012 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49608 - "POST /agent/stop/9510d075-0f18-4d32-b32d-e3c3bed5f012 HTTP/1.1" 500 Internal Server Error
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 5
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49644 - "GET / HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '964e0e7c-598d-43c6-9485-de52946ee219', 'project_name': 'stop-test-a-prod-debug', 'file_id': 'caa43d29-e95d-4ac4-8c80-ff134725e16b.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49647 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49648 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49649 - "GET /agent/status/060448d0-f077-44d7-b6ee-242c66158e42 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49650 - "GET /agent/status/060448d0-f077-44d7-b6ee-242c66158e42 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49652 - "GET /agent/status/060448d0-f077-44d7-b6ee-242c66158e42 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49654 - "POST /agent/stop/060448d0-f077-44d7-b6ee-242c66158e42 HTTP/1.1" 500 Internal Server Error
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 5
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49921 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49928 - "GET / HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': 'b432937c-a099-481d-88c4-d77f5ee9d7c0', 'project_name': 'stop-test-a', 'file_id': 'a3a8837c-b088-4368-8543-124c1fc7eee6.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49929 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49930 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49931 - "GET /agent/status/6c0bf3ec-cba5-4f66-9bf1-390bfd68a694 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49934 - "GET /agent/status/6c0bf3ec-cba5-4f66-9bf1-390bfd68a694 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49937 - "GET /agent/status/6c0bf3ec-cba5-4f66-9bf1-390bfd68a694 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49938 - "POST /agent/stop/6c0bf3ec-cba5-4f66-9bf1-390bfd68a694 HTTP/1.1" 500 Internal Server Error
+[DEBUG] /projects/create response: {'project_id': '686e51ed-8b44-445f-9db1-2df5d8219c88', 'project_name': 'stop-test-b', 'file_id': 'a1dd1781-14ab-4c88-85a3-983b931da4f8.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49939 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49940 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49941 - "POST /agent/stop/11ca0db9-eec0-471d-bb85-fb84e1a559f8 HTTP/1.1" 500 Internal Server Error
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+[DEBUG] /projects/create response: {'project_id': 'a62dafcf-a488-4874-9307-fa763fc41fa1', 'project_name': 'stop-test-c', 'file_id': 'dfce76c6-4862-4394-b5aa-949038f5b736.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49942 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49943 - "POST /agent/start HTTP/1.1" 201 Created
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49944 - "POST /agent/stop/5614ef01-4f21-4ccd-933d-a0c8bcb03795 HTTP/1.1" 500 Internal Server Error
+[DEBUG] /projects/create response: {'project_id': 'd95e9bd3-e205-431f-aad8-860777980850', 'project_name': 'stop-test-d', 'file_id': 'd33514ee-d7b3-4002-b638-7db6950d9886.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:49945 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49946 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:49947 - "GET /agent/status/2264ffd5-d02e-4d58-9728-3eb7ec889118 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49948 - "GET /agent/status/2264ffd5-d02e-4d58-9728-3eb7ec889118 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49950 - "GET /agent/status/2264ffd5-d02e-4d58-9728-3eb7ec889118 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 3
+INFO:     127.0.0.1:49952 - "GET /agent/status/2264ffd5-d02e-4d58-9728-3eb7ec889118 HTTP/1.1" 200 OK
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:49953 - "POST /agent/stop/2264ffd5-d02e-4d58-9728-3eb7ec889118 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49954 - "GET /agent/status/2264ffd5-d02e-4d58-9728-3eb7ec889118 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 5
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 5
+=== AGENT ITERATION === 6
+=== AGENT ITERATION === 5
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 6
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50102 - "GET / HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '1615db2e-0407-4bc9-904c-56df276dc48b', 'project_name': 'stop-test-a', 'file_id': '858c07b6-d8ff-42fc-bc1b-092576f61e63.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:50103 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50104 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50106 - "GET /agent/status/1326cb2d-6f94-4c39-a2e2-03fa48c2248e HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50107 - "GET /agent/status/1326cb2d-6f94-4c39-a2e2-03fa48c2248e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50108 - "POST /agent/stop/1326cb2d-6f94-4c39-a2e2-03fa48c2248e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50109 - "GET /agent/status/1326cb2d-6f94-4c39-a2e2-03fa48c2248e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50114 - "GET /agent/status/1326cb2d-6f94-4c39-a2e2-03fa48c2248e HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '4af7949a-bca4-4692-9133-4b8ceca3769a', 'project_name': 'stop-test-b', 'file_id': '4ee5e54f-2661-42df-8475-7781f75dabdc.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:50115 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50117 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50118 - "POST /agent/stop/6a563cef-521e-4be3-9131-04e725dd70e2 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50121 - "GET /agent/status/6a563cef-521e-4be3-9131-04e725dd70e2 HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': 'ee6967a4-3651-4726-86ca-8174b3a5444e', 'project_name': 'stop-test-c', 'file_id': '7f07a367-60fa-47b0-8774-b8ef9b2156f3.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:50123 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50124 - "POST /agent/start HTTP/1.1" 201 Created
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50128 - "POST /agent/stop/c4b6bcfd-a87a-4147-9cf0-99bd9d95abcb HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50129 - "POST /agent/stop/c4b6bcfd-a87a-4147-9cf0-99bd9d95abcb HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50130 - "GET /agent/status/c4b6bcfd-a87a-4147-9cf0-99bd9d95abcb HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '2789803b-b4d7-4c5a-9ce8-e4cc70a4d970', 'project_name': 'stop-test-d', 'file_id': '34024ead-35bd-4f97-9e63-a672ce283041.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:50131 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50132 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50133 - "GET /agent/status/4e18b13e-35f4-4691-88f7-c9e0043259e0 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50134 - "GET /agent/status/4e18b13e-35f4-4691-88f7-c9e0043259e0 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50135 - "POST /agent/stop/4e18b13e-35f4-4691-88f7-c9e0043259e0 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50136 - "GET /agent/status/4e18b13e-35f4-4691-88f7-c9e0043259e0 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50138 - "GET / HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '34cf67ba-dc46-4469-a506-655c7b55148b', 'project_name': 'stop-test-a', 'file_id': '3f6ecd62-27a1-4794-9f3a-5302f6a3c7c3.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:50139 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50140 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50141 - "GET /agent/status/403fd4d2-fbef-4d64-97c1-1daabf696418 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50144 - "GET /agent/status/403fd4d2-fbef-4d64-97c1-1daabf696418 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50145 - "POST /agent/stop/403fd4d2-fbef-4d64-97c1-1daabf696418 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50146 - "GET /agent/status/403fd4d2-fbef-4d64-97c1-1daabf696418 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50152 - "GET /agent/status/403fd4d2-fbef-4d64-97c1-1daabf696418 HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '14fde56c-7eb8-4bde-8126-2a9943e41f80', 'project_name': 'stop-test-b', 'file_id': 'abc03512-6af4-4490-b228-f818fd61c328.csv', 'target_column': 'target', 'rows': 8, 'columns': 3}
+INFO:     127.0.0.1:50153 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50154 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50155 - "POST /agent/stop/a7d80ae5-5994-4880-a21d-3962522577e6 HTTP/1.1" 200 OK
+=== AGENT ITERATION === 1
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50385 - "GET / HTTP/1.1" 200 OK
+[DEBUG] /projects/create response: {'project_id': '80b5e593-fcf6-4d15-93e9-52e5e8695db6', 'project_name': 'history-test', 'file_id': '40ce334d-9ea5-415d-8a06-79e769eb6415.csv', 'target_column': 'target', 'rows': 10, 'columns': 4}
+INFO:     127.0.0.1:50386 - "POST /projects/create HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50387 - "POST /agent/start HTTP/1.1" 201 Created
+INFO:     127.0.0.1:50388 - "GET /agent/status/a7d48e2a-58fd-4cbc-a199-2455aa77ee61 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50389 - "GET /agent/history/a7d48e2a-58fd-4cbc-a199-2455aa77ee61 HTTP/1.1" 404 Not Found
+=== AGENT ITERATION === 1
+INFO:     127.0.0.1:50390 - "GET /agent/status/a7d48e2a-58fd-4cbc-a199-2455aa77ee61 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50391 - "GET /agent/history/a7d48e2a-58fd-4cbc-a199-2455aa77ee61 HTTP/1.1" 404 Not Found
+BASELINE TRAINING PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 2
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 3
+MUTATION PATH
+MUTATION PAYLOAD: None
+=== AGENT ITERATION === 4
+MUTATION PATH
+MUTATION PAYLOAD: None
+INFO:     127.0.0.1:50409 - "GET / HTTP/1.1" 200 OK

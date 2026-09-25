@@ -1,0 +1,10050 @@
+import os
+import copy
+import uuid
+import json
+import time
+import re
+import io
+import zipfile
+import pickle
+import sys
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from pathlib import Path
+from typing import List, Dict, Any, Callable, Optional, Tuple
+from dotenv import load_dotenv
+from routers.datamodel import router as datamodel_router
+from routers.etl_agent import router as etl_agent_router
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+import pandas as pd
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    UploadFile,
+    HTTPException,
+    Body,
+    BackgroundTasks,
+    Depends,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, ConfigDict
+from sqlalchemy import func, and_, inspect, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
+
+# ML imports
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from models.training_run import TrainingRun
+from models.model_version import ModelVersion
+from models.agent_run import AgentRun
+from models.sandbox_job import SandboxJob
+from models.dataset_profile import DatasetProfile
+from models.experiment_memory import ExperimentMemory
+from models.project import Project
+from xgboost import XGBRegressor
+import numpy as np
+
+from database import Base, SessionLocal, engine
+from services.llm_service import (
+    get_hyperparameter_suggestions,
+    validate_hyperparameters,
+    SAFE_HYPERPARAMETERS,
+)
+from services.prompt_architect import (
+    ENABLE_PROMPT_ARCHITECT,
+    Blueprint,
+    ErrorContext,
+    ArchitectTelemetry,
+    build_error_context,
+    validate_blueprint,
+    deterministic_blueprint,
+    build_architect_prompt,
+    parse_architect_response,
+    blueprint_to_generator_prompt,
+    enforce_single_model,
+)
+from services.transform_mcp_server import (
+    get_tools_schema as get_mcp_tools_schema,
+    execute_tool as execute_mcp_tool,
+    get_tool_names as get_mcp_tool_names,
+    TRANSFORM_TOOLS,
+)
+
+app = FastAPI(title="PyrunAI Backend", version="1.0.0")
+
+cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS")
+if cors_origins_env:
+    allow_origins = [
+        origin.strip() for origin in cors_origins_env.split(",") if origin.strip()
+    ]
+else:
+    allow_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3010",
+        "http://127.0.0.1:3010",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(datamodel_router)
+app.include_router(etl_agent_router)
+
+try:
+    Base.metadata.create_all(bind=engine)
+except OperationalError as exc:
+    detailed_message = str(getattr(exc, "orig", exc))
+    raise RuntimeError(
+        "Database connection failed during startup. "
+        "Set DATABASE_URL correctly and ensure PostgreSQL is running "
+        f"and accessible. Details: {detailed_message}"
+    ) from exc
+except Exception as exc:
+    raise RuntimeError(
+        "Backend failed to initialize database metadata. "
+        "If using PostgreSQL, verify the driver is installed "
+        "(e.g. `pip install psycopg2-binary`) and DATABASE_URL is valid."
+    ) from exc
+
+# Configuration
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+MAX_FILE_SIZE_MB = 20
+MAX_ROWS = 50000
+MAX_COLUMNS = 200
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+JOB_TTL_MINUTES = 10
+MAX_JOB_STATUS_SIZE = 100
+FINE_TUNE_USE_SANDBOX = os.getenv("FINE_TUNE_USE_SANDBOX", "true").lower() in {
+    "true",
+    "1",
+    "yes",
+}
+FINE_TUNE_SANDBOX_TIMEOUT_SECONDS = max(
+    30, int(os.getenv("FINE_TUNE_SANDBOX_TIMEOUT_SECONDS", "240"))
+)
+FINE_TUNE_SANDBOX_INACTIVITY_TIMEOUT_SECONDS = max(
+    20,
+    int(os.getenv("FINE_TUNE_SANDBOX_INACTIVITY_TIMEOUT_SECONDS", "45")),
+)
+SANDBOX_AUTOSTART_WORKER = os.getenv("SANDBOX_AUTOSTART_WORKER", "true").lower() in {
+    "true",
+    "1",
+    "yes",
+}
+SANDBOX_WORKER_BOOT_TIMEOUT_SECONDS = max(
+    1,
+    int(os.getenv("SANDBOX_WORKER_BOOT_TIMEOUT_SECONDS", "8")),
+)
+
+# In-memory storage for training history
+TRAINING_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+JOB_STATUS: Dict[str, Dict[str, Any]] = {}
+
+# Track models currently being trained for each agent run (for parallel execution UI)
+AGENT_MODELS_IN_PROGRESS: Dict[str, List[Dict[str, Any]]] = {}
+AGENT_SANDBOX_EVENT_LOGS: Dict[str, List[str]] = {}
+MAX_AGENT_SANDBOX_EVENT_LOGS = 250
+
+# In-memory transform sessions: session_id -> session dict
+TRANSFORM_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ── Standalone LLM helpers (used by transform endpoints) ───────────────────
+def _resolve_llm_client_standalone(
+    force_provider: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """Resolve an LLM client/model at module level (no run-agent closure).
+
+    Priority: Groq -> OpenAI -> Gemini (or forced via *force_provider*).
+    """
+    requested = (force_provider or os.getenv("LLM_PROVIDER") or "").strip().lower()
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    gemini_key = (
+        os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    ).strip()
+
+    if not groq_key and not openai_key and not gemini_key:
+        return None, None, None
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        if gemini_key:
+            return None, os.getenv("GEMINI_MODEL") or "gemini-2.0-flash", "gemini"
+        return None, None, None
+
+    use_groq = bool(groq_key) and requested in {"", "groq", "auto"}
+    use_openai = bool(openai_key) and requested == "openai"
+    use_gemini = bool(gemini_key) and requested == "gemini"
+
+    if requested in {"", "auto"}:
+        if groq_key:
+            use_groq = True
+        elif openai_key:
+            use_openai = True
+        elif gemini_key:
+            use_gemini = True
+
+    if use_groq:
+        model = (
+            os.getenv("GROQ_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "llama-3.3-70b-versatile"
+        )
+        client = OpenAI(
+            api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=45.0
+        )
+        return client, model, "groq"
+
+    if use_openai:
+        model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+        client = OpenAI(api_key=openai_key, timeout=45.0)
+        return client, model, "openai"
+
+    if use_gemini or gemini_key:
+        model = (
+            os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
+        )
+        return None, model, "gemini"
+
+    return None, None, None
+
+
+def _call_gemini_text_standalone(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+    model_override: Optional[str] = None,
+) -> Optional[str]:
+    """Call Gemini REST API at module level (no closure dependency)."""
+    gemini_key = (
+        os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    ).strip()
+    if not gemini_key:
+        return None
+
+    gemini_model = model_override or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash"
+
+    payload = {
+        "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_tokens),
+        },
+    }
+
+    import urllib.error
+    import urllib.request
+
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+        f"?key={gemini_key}"
+    )
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=45) as response:
+        raw_body = response.read().decode("utf-8")
+    parsed = json.loads(raw_body)
+
+    candidates = parsed.get("candidates") or []
+    if not candidates:
+        return None
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text_parts = [
+        p["text"] for p in parts if isinstance(p.get("text"), str) and p["text"].strip()
+    ]
+    return "\n".join(text_parts).strip() if text_parts else None
+
+
+def _update_job_status(
+    job_id: str,
+    status: str = None,
+    stage: str = None,
+    progress: int = None,
+    result: Dict[str, Any] = None,
+    error: str = None,
+    completed_at: datetime = None,
+) -> None:
+    """
+    Update JOB_STATUS fields for a given job without overwriting unspecified keys.
+    """
+    current = JOB_STATUS.get(
+        job_id,
+        {
+            "status": "pending",
+            "stage": "pending",
+            "progress": 0,
+            "result": None,
+            "error": None,
+            "completed_at": None,
+        },
+    )
+
+    if status is not None:
+        current["status"] = status
+    if stage is not None:
+        current["stage"] = stage
+    if progress is not None:
+        current["progress"] = progress
+    if result is not None:
+        current["result"] = result
+    if error is not None:
+        current["error"] = error
+    if completed_at is not None:
+        current["completed_at"] = completed_at
+
+    JOB_STATUS[job_id] = current
+
+
+def _append_job_log(job_id: Optional[str], message: str) -> None:
+    if job_id is None:
+        return
+
+    current = JOB_STATUS.get(job_id)
+    if current is None:
+        return
+
+    logs = current.get("logs")
+    if not isinstance(logs, list):
+        logs = []
+
+    timestamp = datetime.utcnow().strftime("%H:%M:%S")
+    logs.append(f"[{timestamp}] {message}")
+    current["logs"] = logs
+    JOB_STATUS[job_id] = current
+
+
+def _append_agent_sandbox_event(agent_id: Optional[Any], message: str) -> None:
+    if agent_id is None:
+        return
+
+    agent_key = str(agent_id)
+    logs = AGENT_SANDBOX_EVENT_LOGS.get(agent_key, [])
+    timestamp = datetime.utcnow().strftime("%H:%M:%S")
+    logs.append(f"[{timestamp}] {message}")
+    AGENT_SANDBOX_EVENT_LOGS[agent_key] = logs[-MAX_AGENT_SANDBOX_EVENT_LOGS:]
+
+
+def _parse_token_list(raw_value: Optional[Any]) -> List[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    if not isinstance(raw_value, str):
+        raw_value = str(raw_value)
+    return [part.strip() for part in raw_value.split(",") if part.strip()]
+
+
+def _safe_float(value: Optional[Any]) -> Optional[float]:
+    try:
+        result = float(value) if value is not None else None
+
+        if result is not None and np.isnan(result):
+            return None
+
+        return result
+
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_accuracy_score(r2_value: Optional[Any]) -> Optional[float]:
+    parsed = _safe_float(r2_value)
+    if parsed is None:
+        return None
+    return max(0.0, min(1.0, parsed))
+
+
+def _build_iteration_log_index(logs: List[str]) -> Dict[int, Dict[str, Any]]:
+    indexed: Dict[int, Dict[str, Any]] = {}
+    active_iteration: Optional[int] = None
+
+    def ensure_iteration(iteration_number: int) -> Dict[str, Any]:
+        if iteration_number not in indexed:
+            indexed[iteration_number] = {
+                "strategy_summary": None,
+                "architect_blueprints": 0,
+                "architect_fallbacks": 0,
+                "single_model_gate_rejections": 0,
+                "compile_fallbacks": 0,
+                "telemetry_events": 0,
+                "log_excerpt": [],
+            }
+        return indexed[iteration_number]
+
+    for raw_line in logs:
+        if not isinstance(raw_line, str):
+            continue
+
+        cleaned = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", raw_line).strip()
+        if not cleaned:
+            continue
+
+        start_match = re.search(r"Starting iteration (\d+)/(\d+)", cleaned)
+        if start_match:
+            active_iteration = int(start_match.group(1))
+            ensure_iteration(active_iteration)
+
+        rmse_match = re.search(r"Iteration (\d+) RMSE:", cleaned)
+        if rmse_match:
+            active_iteration = int(rmse_match.group(1))
+            ensure_iteration(active_iteration)
+
+        failure_match = re.search(r"Iteration (\d+) failed:", cleaned)
+        if failure_match:
+            active_iteration = int(failure_match.group(1))
+            ensure_iteration(active_iteration)
+
+        if active_iteration is None:
+            continue
+
+        bucket = ensure_iteration(active_iteration)
+
+        if cleaned.startswith("Strategy: "):
+            bucket["strategy_summary"] = cleaned.split("Strategy: ", 1)[1].strip()
+        if "Architect: Blueprint generated" in cleaned:
+            bucket["architect_blueprints"] += 1
+        if "Architect: Fallback blueprint" in cleaned:
+            bucket["architect_fallbacks"] += 1
+        if "Single-model gate rejected" in cleaned:
+            bucket["single_model_gate_rejections"] += 1
+        if "Compile gate:" in cleaned:
+            bucket["compile_fallbacks"] += 1
+        if cleaned.startswith("Telemetry ["):
+            bucket["telemetry_events"] += 1
+
+        is_interesting = (
+            cleaned.startswith("Stage:")
+            or cleaned.startswith("Strategy:")
+            or cleaned.startswith("Architect:")
+            or cleaned.startswith("Telemetry [")
+            or "Single-model gate rejected" in cleaned
+            or cleaned.startswith("Iteration ")
+            or cleaned.startswith("New best RMSE")
+        )
+        if is_interesting and len(bucket["log_excerpt"]) < 8:
+            bucket["log_excerpt"].append(cleaned)
+
+    return indexed
+
+
+def _build_strategy_theme_summary(
+    iterations: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    theme_counts: Dict[str, int] = {}
+    for iteration in iterations:
+        for token in iteration.get("preprocessing_tokens", []):
+            theme_counts[token] = theme_counts.get(token, 0) + 1
+        for token in iteration.get("training_tokens", []):
+            theme_counts[token] = theme_counts.get(token, 0) + 1
+
+    ranked = sorted(theme_counts.items(), key=lambda item: (-item[1], item[0]))
+    return [{"name": name, "count": count} for name, count in ranked[:8]]
+
+
+def _is_sandbox_worker_running() -> bool:
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        # If psutil is unavailable, we cannot reliably detect worker processes.
+        return False
+
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.info.get("pid") == current_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            cmdline_str = " ".join(str(arg) for arg in cmdline)
+            if (
+                "sandbox_worker.py" in cmdline_str
+                and "check_sandbox_worker" not in cmdline_str
+            ):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
+
+
+def _ensure_sandbox_worker_running() -> None:
+    if not SANDBOX_AUTOSTART_WORKER:
+        return
+
+    if _is_sandbox_worker_running():
+        return
+
+    backend_dir = Path(__file__).resolve().parent
+    launch_env = os.environ.copy()
+    launch_env.setdefault("SANDBOX_WORKER_CONCURRENCY", "2")
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(backend_dir),
+        "env": launch_env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+
+    subprocess.Popen([sys.executable, "sandbox_worker.py"], **popen_kwargs)
+
+    deadline = time.time() + SANDBOX_WORKER_BOOT_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if _is_sandbox_worker_running():
+            print("SANDBOX AUTOSTART: sandbox worker started successfully")
+            return
+        time.sleep(0.3)
+
+    raise RuntimeError(
+        "Sandbox worker could not be started automatically. "
+        "Start backend/sandbox_worker.py manually and retry."
+    )
+
+
+def _set_agent_model_status(
+    agent_id: Any,
+    model_name: str,
+    status: str,
+    rmse: Optional[float] = None,
+    r2: Optional[float] = None,
+    mae: Optional[float] = None,
+    job_id: Optional[uuid.UUID] = None,
+    error: Optional[str] = None,
+) -> None:
+    agent_key = str(agent_id)
+    models = AGENT_MODELS_IN_PROGRESS.get(agent_key, [])
+    for model in models:
+        if model.get("name") != model_name:
+            continue
+
+        model["status"] = status
+        model["rmse"] = rmse
+        if r2 is not None:
+            model["r2"] = r2
+        if mae is not None:
+            model["mae"] = mae
+        if job_id is not None:
+            model["job_id"] = str(job_id)
+        if error is not None:
+            model["error"] = error
+        elif "error" in model and error is None:
+            model["error"] = None
+        AGENT_MODELS_IN_PROGRESS[agent_key] = models
+        return
+
+
+def cleanup_old_jobs() -> None:
+    """
+    Cleanup completed/failed jobs older than TTL and cap dictionary size.
+    """
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=JOB_TTL_MINUTES)
+
+    expired_job_ids = [
+        job_id
+        for job_id, job in JOB_STATUS.items()
+        if job.get("completed_at") is not None
+        and isinstance(job.get("completed_at"), datetime)
+        and job["completed_at"] < cutoff
+    ]
+
+    for job_id in expired_job_ids:
+        JOB_STATUS.pop(job_id, None)
+
+    if len(JOB_STATUS) <= MAX_JOB_STATUS_SIZE:
+        return
+
+    def _job_sort_key(item: Any) -> Any:
+        _, job = item
+        completed_at = job.get("completed_at")
+        is_active = completed_at is None
+        if isinstance(completed_at, datetime):
+            return (is_active, completed_at)
+        return (is_active, datetime.min)
+
+    sorted_jobs = sorted(JOB_STATUS.items(), key=_job_sort_key, reverse=True)
+    keep_ids = {job_id for job_id, _ in sorted_jobs[:MAX_JOB_STATUS_SIZE]}
+    for job_id in list(JOB_STATUS.keys()):
+        if job_id not in keep_ids:
+            JOB_STATUS.pop(job_id, None)
+
+
+def validate_dataset_limits(df: pd.DataFrame) -> None:
+    """
+    Validate uploaded/training dataset against configured limits.
+
+    Raises:
+        HTTPException: 400 when row/column limits are exceeded
+    """
+    if len(df) > MAX_ROWS:
+        raise HTTPException(
+            status_code=400, detail="Dataset too large. Max 50,000 rows allowed."
+        )
+
+    if len(df.columns) > MAX_COLUMNS:
+        raise HTTPException(
+            status_code=400, detail="Too many columns. Max 200 allowed."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Training readiness
+#
+# validate_dataset_limits() above answers "is this dataset too BIG to accept?"
+# and guards project creation. This answers a different question - "is there
+# enough data here to EVALUATE a model honestly?" - and guards training only.
+#
+# They are deliberately separate. A 4-row table is a perfectly valid project:
+# the user may create it, inspect it, and enrich it through the Transform
+# module. It is only training that cannot produce a meaningful score.
+#
+# WHY THESE THRESHOLDS
+#
+#   The trainer evaluates with DEFAULT_CV_FOLDS-fold cross-validation, so each
+#   fold validates on roughly n_rows / n_folds samples.
+#
+#   MIN_TRAINING_ROWS = folds * 2 - the smallest dataset where every fold has
+#   at least TWO validation rows. Below this, a fold validates on one sample:
+#   r2_score() on a single sample is mathematically undefined and returns nan,
+#   so the leaderboard would be full of nan rather than useful numbers. A clear
+#   refusal beats a meaningless score.
+#
+#   SMALL_DATASET_ROW_THRESHOLD = folds * 6 - at least six validation rows per
+#   fold. Above this the existing behaviour is left completely alone.
+#
+# Both are derived from DEFAULT_CV_FOLDS, so changing the fold count moves the
+# thresholds with it and the three stay consistent.
+#
+# This function is PURE: it reads a DataFrame's shape and returns a verdict.
+# It never raises, never touches the database, never writes a file. The caller
+# decides what to do with the verdict - which is what lets the HTTP layer
+# return 400 while the agent's internal call raises instead.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CV_FOLDS = 5
+MIN_TRAINING_ROWS = DEFAULT_CV_FOLDS * 2          # 10
+SMALL_DATASET_ROW_THRESHOLD = DEFAULT_CV_FOLDS * 6  # 30
+
+TOO_SMALL_MESSAGE = (
+    "Dataset too small for reliable model training. "
+    "Add more rows or modify your table selection."
+)
+
+
+def assess_training_readiness(df: pd.DataFrame) -> Dict[str, Any]:
+    """Decide whether a dataset can be trained on, and with how many CV folds.
+
+    Returns:
+        {
+            "ready":      bool,           # False -> do not train
+            "reason":     Optional[str],  # user-facing text when not ready
+            "n_rows":     int,
+            "n_columns":  int,
+            "n_folds":    int,            # 0 when not ready
+            "warnings":   List[str],      # shown alongside the results
+        }
+
+    Never raises. Never mutates the input frame.
+    """
+    n_rows = int(len(df))
+    n_columns = int(len(df.columns))
+
+    # --- Band 1: too small to evaluate at all ---
+    if n_rows < MIN_TRAINING_ROWS:
+        return {
+            "ready": False,
+            "reason": TOO_SMALL_MESSAGE,
+            "n_rows": n_rows,
+            "n_columns": n_columns,
+            "n_folds": 0,
+            "warnings": [],
+        }
+
+    # --- Band 2: trainable, but the scores are rough ---
+    if n_rows < SMALL_DATASET_ROW_THRESHOLD:
+        # Never more folds than leave 2 validation rows each, never fewer
+        # than 2. With DEFAULT_CV_FOLDS = 5 and a floor of 10 rows this
+        # always resolves to 5; the bounds matter if the fold count changes.
+        n_folds = max(2, min(DEFAULT_CV_FOLDS, n_rows // 2))
+        rows_per_fold = n_rows // n_folds
+
+        return {
+            "ready": True,
+            "reason": None,
+            "n_rows": n_rows,
+            "n_columns": n_columns,
+            "n_folds": n_folds,
+            "warnings": [
+                f"Small dataset: {n_rows} rows. Cross-validation used "
+                f"{n_folds} folds of about {rows_per_fold} rows each. "
+                f"Treat these scores as indicative, not reliable."
+            ],
+        }
+
+    # --- Band 3: normal. Existing behaviour, untouched. ---
+    return {
+        "ready": True,
+        "reason": None,
+        "n_rows": n_rows,
+        "n_columns": n_columns,
+        "n_folds": DEFAULT_CV_FOLDS,
+        "warnings": [],
+    }
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_dataset_profile(df: pd.DataFrame, target_column: str) -> Dict[str, Any]:
+    feature_df = df.drop(columns=[target_column], errors="ignore")
+    rows = int(len(df))
+    num_features = int(feature_df.shape[1])
+
+    numeric_feature_df = feature_df.select_dtypes(include=["number"])
+    categorical_feature_df = feature_df.select_dtypes(exclude=["number"])
+
+    total_cells = max(1, int(df.shape[0] * df.shape[1]))
+    missing_value_count = int(df.isnull().sum().sum())
+    missing_value_ratio = float(missing_value_count / total_cells)
+
+    variance_stats = {
+        "min": 0.0,
+        "max": 0.0,
+        "mean": 0.0,
+        "median": 0.0,
+    }
+    if numeric_feature_df.shape[1] > 0:
+        variances = (
+            numeric_feature_df.var(numeric_only=True)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if len(variances) > 0:
+            variance_stats = {
+                "min": _safe_float(variances.min(), 0.0),
+                "max": _safe_float(variances.max(), 0.0),
+                "mean": _safe_float(variances.mean(), 0.0),
+                "median": _safe_float(variances.median(), 0.0),
+            }
+
+    target_mean = (
+        _safe_float(df[target_column].mean(), 0.0) if target_column in df else 0.0
+    )
+    target_std = (
+        _safe_float(df[target_column].std(), 0.0) if target_column in df else 0.0
+    )
+    target_skew = (
+        _safe_float(df[target_column].skew(), 0.0) if target_column in df else 0.0
+    )
+
+    cardinality_by_column: Dict[str, int] = {}
+    for column in categorical_feature_df.columns:
+        cardinality_by_column[column] = int(
+            categorical_feature_df[column].nunique(dropna=True)
+        )
+
+    high_dimensional = num_features >= 80
+    small_dataset = rows <= 1000
+    high_categorical_ratio = (
+        num_features > 0 and (categorical_feature_df.shape[1] / num_features) >= 0.4
+    )
+
+    return {
+        "rows": rows,
+        "num_features": num_features,
+        "num_numeric_features": int(numeric_feature_df.shape[1]),
+        "num_categorical_features": int(categorical_feature_df.shape[1]),
+        "missing_value_ratio": missing_value_ratio,
+        "missing_value_count": missing_value_count,
+        "feature_variance_stats": variance_stats,
+        "target_distribution": {
+            "mean": target_mean,
+            "std": target_std,
+            "skew": target_skew,
+        },
+        "categorical_cardinality": cardinality_by_column,
+        "heuristics": {
+            "small_dataset": small_dataset,
+            "high_dimensional": high_dimensional,
+            "high_categorical_ratio": high_categorical_ratio,
+        },
+    }
+
+
+def _compute_dataset_fingerprint(profile: Dict[str, Any]) -> str:
+    """Compute a deterministic dataset fingerprint from profile statistics.
+
+    The fingerprint encodes row count, feature counts, numeric/categorical
+    ratios, missing-value ratio, and target variance into a stable hex string.
+    Two datasets with very similar statistical profiles will produce the same
+    fingerprint, enabling cross-run memory retrieval.
+    """
+    import hashlib
+
+    rows = int(profile.get("rows") or 0)
+    num_features = int(profile.get("num_features") or 0)
+    num_numeric = int(profile.get("num_numeric_features") or 0)
+    num_categorical = int(profile.get("num_categorical_features") or 0)
+    missing_ratio = float(profile.get("missing_value_ratio") or 0.0)
+    target_dist = profile.get("target_distribution") or {}
+    target_std = float(target_dist.get("std") or 0.0)
+
+    # Bucket values for similarity tolerance
+    row_bucket = (rows // 500) * 500  # 500-row buckets
+    feat_bucket = num_features  # exact
+    numeric_ratio = round(num_numeric / max(num_features, 1), 2)
+    cat_ratio = round(num_categorical / max(num_features, 1), 2)
+    missing_bucket = round(missing_ratio, 2)
+    std_bucket = round(target_std, 1)
+
+    fingerprint_str = (
+        f"r{row_bucket}|f{feat_bucket}|nr{numeric_ratio}|cr{cat_ratio}"
+        f"|mr{missing_bucket}|ts{std_bucket}"
+    )
+    return hashlib.sha256(fingerprint_str.encode()).hexdigest()[:32]
+
+
+def _retrieve_experiment_memory(
+    db: Session,
+    dataset_fingerprint: str,
+    dataset_profile: Dict[str, Any],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Retrieve the top experiments from memory, ranked by similarity then RMSE.
+
+    Similarity scoring:
+    - Exact fingerprint match gets priority score 0 (best)
+    - Otherwise, compute L1 distance on normalised profile features
+    Returns at most `limit` records sorted by (similarity_rank, rmse_cv).
+    """
+    all_records = (
+        db.query(ExperimentMemory)
+        .filter(ExperimentMemory.rmse_cv.isnot(None))
+        .order_by(ExperimentMemory.rmse_cv.asc())
+        .limit(200)
+        .all()
+    )
+    if not all_records:
+        return []
+
+    cur_rows = int(dataset_profile.get("rows") or 0)
+    cur_feats = int(dataset_profile.get("num_features") or 0)
+    cur_numeric = int(dataset_profile.get("num_numeric_features") or 0)
+    cur_cat = int(dataset_profile.get("num_categorical_features") or 0)
+    cur_missing = float(dataset_profile.get("missing_value_ratio") or 0.0)
+    t_dist = dataset_profile.get("target_distribution") or {}
+    cur_std = float(t_dist.get("std") or 0.0)
+
+    scored: List[Tuple[float, float, Dict[str, Any]]] = []
+    for rec in all_records:
+        if rec.dataset_fingerprint == dataset_fingerprint:
+            sim_score = 0.0
+        else:
+            d_rows = abs((rec.num_rows or 0) - cur_rows) / max(cur_rows, 1)
+            d_feats = abs((rec.num_features or 0) - cur_feats) / max(cur_feats, 1)
+            d_numeric = abs((rec.num_numeric_features or 0) - cur_numeric) / max(
+                cur_numeric, 1
+            )
+            d_cat = abs((rec.num_categorical_features or 0) - cur_cat) / max(cur_cat, 1)
+            d_missing = abs((rec.missing_value_ratio or 0.0) - cur_missing)
+            d_std = abs((rec.target_std or 0.0) - cur_std) / max(cur_std, 1.0)
+            sim_score = d_rows + d_feats + d_numeric + d_cat + d_missing + d_std
+
+        entry = {
+            "model_family": rec.model_family,
+            "preprocessing_tokens": rec.preprocessing_tokens,
+            "training_tokens": rec.training_tokens,
+            "strategy_summary": rec.strategy_summary,
+            "feature_count": rec.feature_count,
+            "categorical_ratio": rec.categorical_ratio,
+            "rmse_cv": rec.rmse_cv,
+            "similarity_score": round(sim_score, 4),
+            "fingerprint_match": rec.dataset_fingerprint == dataset_fingerprint,
+        }
+        scored.append((sim_score, rec.rmse_cv or 999999.0, entry))
+
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [s[2] for s in scored[:limit]]
+
+
+def _format_experiment_memory_for_prompt(memories: List[Dict[str, Any]]) -> str:
+    """Format retrieved experiment memory records into an LLM-readable prompt block."""
+    if not memories:
+        return ""
+
+    lines = ["Previous successful experiments on similar datasets:"]
+    for i, mem in enumerate(memories, 1):
+        fp_tag = " [exact dataset match]" if mem.get("fingerprint_match") else ""
+        lines.append(
+            f"  Experiment {i}{fp_tag}: "
+            f"model={mem.get('model_family')}, "
+            f"rmse_cv={mem.get('rmse_cv')}, "
+            f"preprocessing=[{mem.get('preprocessing_tokens', '')}], "
+            f"training=[{mem.get('training_tokens', '')}], "
+            f"strategy=\"{mem.get('strategy_summary', 'N/A')}\""
+        )
+    lines.append("")
+    lines.append(
+        "Use these past results to inform your strategy. Prefer approaches that worked well before."
+    )
+    return "\n".join(lines)
+
+
+def _insert_experiment_memory(
+    db: Session,
+    dataset_fingerprint: str,
+    dataset_profile: Dict[str, Any],
+    model_family: Optional[str],
+    preprocessing_tokens: List[str],
+    training_tokens: List[str],
+    strategy_summary: Optional[str],
+    rmse_cv: Optional[float],
+    rmse_holdout: Optional[float],
+    project_id: Any,
+    agent_run_id: Any,
+    iteration_number: int,
+) -> None:
+    """Append a completed experiment summary to persistent memory (append-only)."""
+    try:
+        target_dist = dataset_profile.get("target_distribution") or {}
+        num_features = int(dataset_profile.get("num_features") or 0)
+        num_cat = int(dataset_profile.get("num_categorical_features") or 0)
+        cat_ratio = round(num_cat / max(num_features, 1), 4)
+
+        record = ExperimentMemory(
+            dataset_fingerprint=dataset_fingerprint,
+            model_family=model_family,
+            preprocessing_tokens=(
+                ",".join(preprocessing_tokens) if preprocessing_tokens else ""
+            ),
+            training_tokens=",".join(training_tokens) if training_tokens else "",
+            strategy_summary=(strategy_summary or "")[:500],
+            feature_count=num_features,
+            categorical_ratio=cat_ratio,
+            rmse_cv=rmse_cv,
+            rmse_holdout=rmse_holdout,
+            project_id=project_id,
+            agent_run_id=agent_run_id,
+            iteration_number=iteration_number,
+            num_rows=int(dataset_profile.get("rows") or 0),
+            num_features=num_features,
+            num_numeric_features=int(dataset_profile.get("num_numeric_features") or 0),
+            num_categorical_features=num_cat,
+            missing_value_ratio=float(
+                dataset_profile.get("missing_value_ratio") or 0.0
+            ),
+            target_std=float(target_dist.get("std") or 0.0),
+        )
+        db.add(record)
+        db.commit()
+        print(
+            f"EXPERIMENT_MEMORY_INSERTED: model={model_family}, rmse_cv={rmse_cv}, fingerprint={dataset_fingerprint[:12]}..."
+        )
+    except Exception as mem_exc:
+        db.rollback()
+        print(f"EXPERIMENT_MEMORY_INSERT_FAILED: {mem_exc}")
+
+
+def _summarize_dataset_profile(dataset_profile: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(dataset_profile, dict) or not dataset_profile:
+        return "Dataset profile unavailable."
+
+    heuristics = dataset_profile.get("heuristics") or {}
+    recommendations: List[str] = []
+    if heuristics.get("small_dataset"):
+        recommendations.append(
+            "Small dataset detected: favor simpler and regularized models."
+        )
+    if heuristics.get("high_dimensional"):
+        recommendations.append(
+            "High dimensional data: prioritize feature selection and dimensionality control."
+        )
+    if heuristics.get("high_categorical_ratio"):
+        recommendations.append(
+            "High categorical ratio: prioritize robust encoding strategy."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Balanced dataset profile: use moderate preprocessing and stable tuning."
+        )
+
+    variance_stats = dataset_profile.get("feature_variance_stats") or {}
+    target_stats = dataset_profile.get("target_distribution") or {}
+
+    return (
+        f"rows={dataset_profile.get('rows')}, features={dataset_profile.get('num_features')}, "
+        f"numeric={dataset_profile.get('num_numeric_features')}, categorical={dataset_profile.get('num_categorical_features')}, "
+        f"missing_ratio={_safe_float(dataset_profile.get('missing_value_ratio'), 0.0):.4f}, "
+        f"feature_variance_mean={_safe_float(variance_stats.get('mean'), 0.0):.6f}, "
+        f"target_std={_safe_float(target_stats.get('std'), 0.0):.6f}, target_skew={_safe_float(target_stats.get('skew'), 0.0):.6f}. "
+        + " ".join(recommendations)
+    )
+
+
+def _ensure_project_dataset_profile(
+    db: Session, project: Project, dataset_path: Path
+) -> Dict[str, Any]:
+    existing = (
+        db.query(DatasetProfile).filter(DatasetProfile.project_id == project.id).first()
+    )
+    if existing and isinstance(existing.profile_json, dict) and existing.profile_json:
+        return existing.profile_json
+
+    df = pd.read_csv(dataset_path)
+    profile_json = _build_dataset_profile(df, project.target_column)
+
+    if existing is None:
+        existing = DatasetProfile(
+            project_id=project.id,
+            profile_json=profile_json,
+        )
+        db.add(existing)
+    else:
+        existing.profile_json = profile_json
+        existing.profile_version = int(existing.profile_version or 1) + 1
+
+    db.commit()
+    return profile_json
+
+
+def execute_training_with_timeout(
+    func: Callable[[], Any], timeout_seconds: int = 30
+) -> Any:
+    """
+    Execute training logic with timeout protection.
+
+    Args:
+        func: Callable containing training execution logic
+        timeout_seconds: Maximum execution time in seconds
+
+    Returns:
+        Result returned by func
+
+    Raises:
+        HTTPException: 408 if timeout occurs
+        Exception: Re-raises any exception from func
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError:
+            future.cancel()
+            raise HTTPException(status_code=408, detail="Training timed out")
+
+
+@app.get("/")
+def root():
+    return {"message": "PyrunAI Backend Running"}
+
+
+# Training request model
+class TrainingRequest(BaseModel):
+    file_id: str
+    target_column: str
+
+
+# Fine-tune request model
+class FineTuneRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    file_id: str
+    target_column: str
+    llm_provider: str
+    prompt: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+class AgentStartRequest(BaseModel):
+    project_id: uuid.UUID
+    max_iterations: int = Field(gt=0)
+    improvement_threshold: float = Field(ge=0)
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+
+
+class AgentStartByFileRequest(BaseModel):
+    file_id: str
+    target_column: Optional[str] = None
+    max_iterations: int = Field(default=6, gt=0)
+    improvement_threshold: float = Field(default=0.0005, ge=0)
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+
+
+@app.get("/dashboard/overview")
+async def get_dashboard_overview(db: Session = Depends(get_db)):
+    """
+    Return dashboard summary and project list backed by database state.
+    """
+    try:
+        try:
+            project_columns = {
+                column_info.get("name")
+                for column_info in inspect(db.bind).get_columns("projects")
+                if column_info.get("name")
+            }
+        except Exception:
+            project_columns = set()
+
+        def _project_select_expr(
+            column_name: str, alias: str, fallback_sql: str
+        ) -> str:
+            if column_name in project_columns:
+                return f"{column_name} AS {alias}"
+            return f"{fallback_sql} AS {alias}"
+
+        order_by_sql = (
+            "created_at DESC" if "created_at" in project_columns else "id DESC"
+        )
+        project_query = text(
+            "SELECT "
+            + ", ".join(
+                [
+                    _project_select_expr("id", "project_id", "NULL"),
+                    _project_select_expr("file_id", "file_id", "''"),
+                    _project_select_expr("project_name", "project_name", "''"),
+                    _project_select_expr("num_rows", "num_rows", "0"),
+                    _project_select_expr("created_at", "created_at", "NULL"),
+                    _project_select_expr("target_column", "target_column", "''"),
+                ]
+            )
+            + f" FROM projects ORDER BY {order_by_sql}"
+        )
+
+        projects = db.execute(project_query).mappings().all()
+
+        project_ids: List[uuid.UUID] = []
+        for project in projects:
+            try:
+                raw_project_id = project.get("project_id")
+                if raw_project_id is None:
+                    continue
+                project_ids.append(uuid.UUID(str(raw_project_id)))
+            except Exception:
+                continue
+
+        latest_run_by_project: Dict[str, Dict[str, Any]] = {}
+        best_r2_by_project: Dict[str, Optional[float]] = {}
+        if project_ids:
+            try:
+                runs = (
+                    db.query(
+                        TrainingRun.project_id,
+                        TrainingRun.status,
+                        TrainingRun.r2,
+                        TrainingRun.agent_run_id,
+                        TrainingRun.version_number,
+                        TrainingRun.created_at,
+                    )
+                    .filter(TrainingRun.project_id.in_(project_ids))
+                    .order_by(
+                        TrainingRun.project_id.asc(),
+                        TrainingRun.version_number.desc(),
+                        TrainingRun.created_at.desc(),
+                    )
+                    .all()
+                )
+
+                for run in runs:
+                    key = str(run.project_id)
+                    if key in latest_run_by_project:
+                        continue
+                    latest_run_by_project[key] = {
+                        "status": run.status,
+                        "r2": run.r2,
+                        "agent_run_id": (
+                            str(run.agent_run_id) if run.agent_run_id else None
+                        ),
+                    }
+            except Exception:
+                latest_run_by_project = {}
+
+            # Query the actual best model r2 across ALL runs for each project
+            try:
+                all_run_ids_by_project: Dict[str, List] = {}
+                all_runs = (
+                    db.query(TrainingRun.id, TrainingRun.project_id)
+                    .filter(TrainingRun.project_id.in_(project_ids))
+                    .all()
+                )
+                for run in all_runs:
+                    key = str(run.project_id)
+                    all_run_ids_by_project.setdefault(key, []).append(run.id)
+
+                all_run_ids = [r.id for r in all_runs]
+                if all_run_ids:
+                    best_models = (
+                        db.query(
+                            TrainingRun.project_id,
+                            func.max(ModelVersion.r2).label("best_r2"),
+                        )
+                        .join(
+                            TrainingRun, ModelVersion.training_run_id == TrainingRun.id
+                        )
+                        .filter(TrainingRun.project_id.in_(project_ids))
+                        .group_by(TrainingRun.project_id)
+                        .all()
+                    )
+                    for row in best_models:
+                        best_r2_by_project[str(row.project_id)] = row.best_r2
+            except Exception:
+                best_r2_by_project = {}
+
+        def _to_dashboard_status(run_status: Optional[str]) -> str:
+            if not run_status:
+                return "Pending"
+            if run_status in ("running", "queued"):
+                return "Training"
+            if run_status == "completed":
+                return "Completed"
+            if run_status == "failed":
+                return "Failed"
+            return "Pending"
+
+        def _serialize_created_at(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value.isoformat() + "Z"
+
+            raw = str(value)
+            if not raw:
+                return None
+
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                return parsed.isoformat().replace("+00:00", "Z")
+            except Exception:
+                return raw
+
+        project_rows: List[Dict[str, Any]] = []
+        completed_projects = 0
+        running_projects = 0
+
+        for project in projects:
+            try:
+                project_id_raw = project.get("project_id")
+                project_id = str(project_id_raw) if project_id_raw is not None else ""
+                latest_run = latest_run_by_project.get(project_id)
+                run_status = latest_run.get("status") if latest_run else None
+                status = _to_dashboard_status(run_status)
+
+                if status == "Completed":
+                    completed_projects += 1
+                if status == "Training":
+                    running_projects += 1
+
+                accuracy_percent: Optional[float] = None
+                # Use best ModelVersion r2 across all runs; fall back to latest TrainingRun.r2
+                best_r2 = best_r2_by_project.get(project_id)
+                if best_r2 is None:
+                    best_r2 = latest_run.get("r2") if latest_run else None
+                if best_r2 is not None:
+                    candidate_accuracy = float(best_r2) * 100.0
+                    if np.isfinite(candidate_accuracy):
+                        accuracy_percent = candidate_accuracy
+
+                try:
+                    num_rows = int(project.get("num_rows") or 0)
+                except (TypeError, ValueError):
+                    num_rows = 0
+
+                project_rows.append(
+                    {
+                        "project_id": project_id,
+                        "file_id": str(project.get("file_id") or ""),
+                        "project_name": str(
+                            project.get("project_name") or "Untitled Project"
+                        ),
+                        "status": status,
+                        "accuracy_percent": accuracy_percent,
+                        "num_rows": num_rows,
+                        "created_at": _serialize_created_at(project.get("created_at")),
+                        "target_column": str(project.get("target_column") or ""),
+                        "agent_run_id": (
+                            latest_run.get("agent_run_id") if latest_run else None
+                        ),
+                    }
+                )
+            except Exception:
+                continue
+
+        return {
+            "summary": {
+                "total_projects": len(projects),
+                "completed_projects": completed_projects,
+                "running_projects": running_projects,
+            },
+            "projects": project_rows,
+        }
+    except Exception as exc:
+        print(f"Dashboard overview fallback triggered: {exc}")
+        return {
+            "summary": {
+                "total_projects": 0,
+                "completed_projects": 0,
+                "running_projects": 0,
+            },
+            "projects": [],
+        }
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str):
+    """
+    Delete a project and its related records.
+    """
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_uuid).first()
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        file_id = str(project.file_id)
+
+        training_run_ids = [
+            row[0]
+            for row in db.query(TrainingRun.id)
+            .filter(TrainingRun.project_id == project_uuid)
+            .all()
+        ]
+
+        if training_run_ids:
+            db.query(ModelVersion).filter(
+                ModelVersion.training_run_id.in_(training_run_ids)
+            ).delete(synchronize_session=False)
+
+        db.query(SandboxJob).filter(SandboxJob.project_id == project_uuid).delete(
+            synchronize_session=False
+        )
+        db.query(TrainingRun).filter(TrainingRun.project_id == project_uuid).delete(
+            synchronize_session=False
+        )
+        db.query(AgentRun).filter(AgentRun.project_id == project_uuid).delete(
+            synchronize_session=False
+        )
+        db.query(DatasetProfile).filter(
+            DatasetProfile.project_id == project_uuid
+        ).delete(synchronize_session=False)
+        db.query(ExperimentMemory).filter(
+            ExperimentMemory.project_id == project_uuid
+        ).delete(synchronize_session=False)
+        db.query(Project).filter(Project.id == project_uuid).delete(
+            synchronize_session=False
+        )
+
+        db.commit()
+
+        TRAINING_HISTORY.pop(file_id, None)
+
+        uploaded_file_path = UPLOAD_DIR / file_id
+        if uploaded_file_path.exists() and uploaded_file_path.is_file():
+            try:
+                uploaded_file_path.unlink()
+            except Exception:
+                pass
+
+        return {"message": "Project deleted", "project_id": project_id}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    finally:
+        db.close()
+
+
+@app.get("/projects/by-file/{file_id}")
+async def get_project_by_file_id(file_id: str, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.file_id == file_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found for file_id")
+
+    return {
+        "project_id": str(project.id),
+        "file_id": str(project.file_id),
+        "project_name": str(project.project_name or "Untitled Project"),
+        "target_column": str(project.target_column or ""),
+        "num_rows": int(project.num_rows or 0),
+    }
+
+
+def generate_mutated_hyperparameters(previous_best: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate improved hyperparameters using LLM suggestions.
+
+    Args:
+        previous_best: Dictionary containing:
+            - model_name: str
+            - rmse: float
+            - hyperparameters: dict
+
+    Returns:
+        Dictionary containing:
+            - model_name: str
+            - hyperparameters: dict (improved or fallback to original)
+    """
+    try:
+        model_name = previous_best.get("model_name")
+        original_hyperparameters = previous_best.get("hyperparameters", {})
+
+        if not isinstance(model_name, str) or not model_name:
+            return {
+                "model_name": "",
+                "hyperparameters": {},
+            }
+
+        if not isinstance(original_hyperparameters, dict):
+            original_hyperparameters = {}
+
+        if model_name not in SAFE_HYPERPARAMETERS:
+            return {
+                "model_name": model_name,
+                "hyperparameters": {},
+            }
+
+        safe_original_hyperparameters = validate_hyperparameters(
+            model_name,
+            original_hyperparameters,
+        )
+
+        def _to_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        metrics = {
+            "rmse": _to_float(previous_best.get("rmse"), 0.0),
+            "r2": _to_float(previous_best.get("r2"), 0.0),
+            "mae": _to_float(previous_best.get("mae"), 0.0),
+            "improvement": _to_float(previous_best.get("improvement"), 0.0),
+            "number_of_rows": previous_best.get("number_of_rows", "unknown"),
+            "number_of_features": previous_best.get("number_of_features", "unknown"),
+            "numeric_feature_count": previous_best.get(
+                "numeric_feature_count", "unknown"
+            ),
+            "categorical_feature_count": previous_best.get(
+                "categorical_feature_count", "unknown"
+            ),
+            "missing_value_count": previous_best.get("missing_value_count", "unknown"),
+            "target_variance": previous_best.get("target_variance", "unknown"),
+        }
+
+        llm_provider = "gemini"
+        allowed_linear_regression_mutations = {
+            "Ridge",
+            "Lasso",
+            "ElasticNet",
+            "RandomForestRegressor",
+            "XGBRegressor",
+        }
+
+        llm_response = get_hyperparameter_suggestions(
+            model_name=model_name,
+            metrics=metrics,
+            llm_provider=llm_provider,
+        )
+        print("LLM RESPONSE:", llm_response)
+        if not isinstance(llm_response, dict):
+            llm_response = {}
+
+        selected_model_name = model_name
+        suggested_model_name = llm_response.get("model_name")
+
+        if model_name == "LinearRegression":
+            if isinstance(suggested_model_name, str) and suggested_model_name:
+                if suggested_model_name in allowed_linear_regression_mutations:
+                    selected_model_name = suggested_model_name
+                elif suggested_model_name != "LinearRegression":
+                    return {
+                        "model_name": model_name,
+                        "hyperparameters": safe_original_hyperparameters,
+                    }
+        else:
+            if (
+                isinstance(suggested_model_name, str)
+                and suggested_model_name != model_name
+            ):
+                if suggested_model_name not in SAFE_HYPERPARAMETERS:
+                    return {
+                        "model_name": model_name,
+                        "hyperparameters": safe_original_hyperparameters,
+                    }
+                return {
+                    "model_name": model_name,
+                    "hyperparameters": safe_original_hyperparameters,
+                }
+
+        if selected_model_name != model_name:
+            llm_response = get_hyperparameter_suggestions(
+                model_name=selected_model_name,
+                metrics=metrics,
+                llm_provider=llm_provider,
+            )
+            if not isinstance(llm_response, dict):
+                llm_response = {}
+
+            second_model_name = llm_response.get("model_name")
+            if (
+                isinstance(second_model_name, str)
+                and second_model_name in SAFE_HYPERPARAMETERS
+            ):
+                selected_model_name = second_model_name
+
+        suggested_params = llm_response.get("hyperparameters", {})
+        validated_params = validate_hyperparameters(
+            selected_model_name, suggested_params
+        )
+
+        if selected_model_name == model_name:
+            final_hyperparameters = dict(safe_original_hyperparameters)
+            if validated_params:
+                final_hyperparameters.update(validated_params)
+            return {
+                "model_name": selected_model_name,
+                "hyperparameters": final_hyperparameters,
+            }
+
+        return {
+            "model_name": selected_model_name,
+            "hyperparameters": validated_params,
+        }
+
+    except Exception:
+        rows_raw = previous_best.get("number_of_rows", 0)
+        numeric_features_raw = previous_best.get("numeric_feature_count", 0)
+
+        try:
+            rows = int(float(rows_raw))
+        except (TypeError, ValueError):
+            rows = 0
+
+        try:
+            numeric_features = int(float(numeric_features_raw))
+        except (TypeError, ValueError):
+            numeric_features = 0
+
+        print("SMART FALLBACK ACTIVATED: Using deterministic mutation strategy.")
+
+        if rows < 300:
+            if numeric_features >= 5:
+                return {
+                    "model_name": "Lasso",
+                    "hyperparameters": {
+                        "alpha": 0.1,
+                        "max_iter": 5000,
+                    },
+                }
+            return {
+                "model_name": "Ridge",
+                "hyperparameters": {
+                    "alpha": 1.0,
+                },
+            }
+        elif rows < 1000:
+            return {
+                "model_name": "ElasticNet",
+                "hyperparameters": {
+                    "alpha": 0.1,
+                    "l1_ratio": 0.5,
+                    "max_iter": 5000,
+                },
+            }
+        else:
+            return {
+                "model_name": "RandomForestRegressor",
+                "hyperparameters": {
+                    "n_estimators": 100,
+                    "max_depth": 6,
+                },
+            }
+
+
+def run_agent_loop(
+    agent_run_id: uuid.UUID,
+    preferred_llm_provider: Optional[str] = None,
+    preferred_llm_model: Optional[str] = None,
+) -> None:
+    print("RUN_AGENT_LOOP STARTED")
+    execution_mode = os.getenv("AGENT_EXECUTION_MODE", "native").strip().lower()
+    print("=" * 80)
+    print("AGENT EXECUTION MODE =", execution_mode)
+    print("=" * 80)
+    if execution_mode not in {"native", "sandbox"}:
+        execution_mode = "native"
+
+    project_id = None
+    project_file_id = None
+    project_target_column = None
+    project_num_rows = None
+    project_num_features = None
+    project_num_numeric_features = None
+    project_num_categorical_features = None
+    project_missing_value_count = None
+    project_target_variance = None
+    project_dataset_profile: Dict[str, Any] = {}
+    project_dataset_profile_summary = ""
+
+    def _sanitize_code_block(raw_text: Optional[str]) -> str:
+        if not raw_text:
+            return ""
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`").strip()
+            if cleaned.lower().startswith("python"):
+                cleaned = cleaned[6:].lstrip()
+        return cleaned
+
+    def _build_autonomous_script_template(
+        preprocessing_section: str,
+        training_section: str,
+        target_column: str,
+        system_model_section: str = "",
+    ) -> str:
+        def _indent_block(code: str, prefix: str = "    ") -> str:
+            lines = (code or "").splitlines() or [""]
+            return "\n".join(
+                (prefix + line) if line.strip() else prefix for line in lines
+            )
+
+        template = (
+            "import json\n"
+            "import os\n"
+            "import numpy as np\n"
+            "import pandas as pd\n"
+            "from sklearn.model_selection import train_test_split, cross_val_score, KFold, GridSearchCV, RandomizedSearchCV, ParameterGrid\n"
+            "from sklearn.feature_selection import SelectKBest, f_regression, VarianceThreshold\n"
+            "from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score\n"
+            "from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet\n"
+            "from sklearn.ensemble import RandomForestRegressor\n"
+            "from xgboost import XGBRegressor\n"
+            "\n"
+            "df = pd.read_csv('/app/dataset.csv')\n"
+            "TARGET_COLUMN = __TARGET_COLUMN__\n"
+            "\n"
+            "# --- AUTONOMOUS_PREPROCESSING_SECTION ---\n"
+            "try:\n"
+            "__AUTONOMOUS_PREPROCESSING_SECTION__\n"
+            "except Exception:\n"
+            "    X = df.drop(columns=[TARGET_COLUMN])\n"
+            "    y = df[TARGET_COLUMN]\n"
+            "    X = pd.get_dummies(X, drop_first=True)\n"
+            "    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)\n"
+            "\n"
+            "# --- SYSTEM SAFETY: ensure numeric aligned train/test matrices ---\n"
+            "def _ensure_numeric_matrix(frame):\n"
+            "    if not hasattr(frame, 'select_dtypes'):\n"
+            "        frame = pd.DataFrame(frame)\n"
+            "    if hasattr(frame, 'select_dtypes'):\n"
+            "        non_numeric_cols = frame.select_dtypes(exclude=['number']).columns\n"
+            "        if len(non_numeric_cols) > 0:\n"
+            "            frame = pd.get_dummies(frame, drop_first=True)\n"
+            "    frame = frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)\n"
+            "    return frame\n"
+            "\n"
+            "X_train = _ensure_numeric_matrix(X_train)\n"
+            "X_test = _ensure_numeric_matrix(X_test)\n"
+            "X_train, X_test = X_train.align(X_test, join='left', axis=1, fill_value=0.0)\n"
+            "\n"
+            "# --- SYSTEM MODEL SECTION ---\n"
+            "__SYSTEM_MODEL_SECTION__\n"
+            "\n"
+            "# --- AUTONOMOUS_TRAINING_SECTION ---\n"
+            "try:\n"
+            "__AUTONOMOUS_TRAINING_SECTION__\n"
+            "except Exception:\n"
+            "    if 'model' not in locals() or model is None:\n"
+            "        raise ValueError('Model was not created')\n"
+            "    model.fit(X_train, y_train)\n"
+            "    predictions = model.predict(X_test)\n"
+            "\n"
+            "# --- SYSTEM FEATURE SELECTION ENGINE (deterministic + safe) ---\n"
+            "_fs_method_raw = str(globals().get('feature_selection_method', '')).strip().lower()\n"
+            "_fs_params = globals().get('feature_selection_params', {})\n"
+            "if not isinstance(_fs_params, dict):\n"
+            "    _fs_params = {}\n"
+            "if not _fs_method_raw and _fs_params.get('method') is not None:\n"
+            "    _fs_method_raw = str(_fs_params.get('method')).strip().lower()\n"
+            "_fs_method_map = {\n"
+            "    'selectkbest': 'select_k_best',\n"
+            "    'select_k_best': 'select_k_best',\n"
+            "    'kbest': 'select_k_best',\n"
+            "    'variancethreshold': 'variance_filter',\n"
+            "    'variance_threshold': 'variance_filter',\n"
+            "    'variance_filter': 'variance_filter',\n"
+            "    'tree_importance': 'tree_importance',\n"
+            "    'tree_based': 'tree_importance',\n"
+            "    'tree_pruning': 'tree_importance',\n"
+            "}\n"
+            "_fs_method = _fs_method_map.get(_fs_method_raw, '')\n"
+            "if _fs_method and 'X_train' in globals() and 'X_test' in globals() and 'y_train' in globals():\n"
+            "    try:\n"
+            "        _X_train_df = X_train if hasattr(X_train, 'iloc') else pd.DataFrame(X_train)\n"
+            "        _X_test_df = X_test if hasattr(X_test, 'iloc') else pd.DataFrame(X_test)\n"
+            "        _X_train_df, _X_test_df = _X_train_df.align(_X_test_df, join='left', axis=1, fill_value=0.0)\n"
+            "        _X_train_df = _X_train_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)\n"
+            "        _X_test_df = _X_test_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)\n"
+            "        _y_train_arr = np.asarray(y_train).reshape(-1)\n"
+            "\n"
+            "        if _fs_method == 'select_k_best' and _X_train_df.shape[1] > 1:\n"
+            "            _k_raw = globals().get('feature_selection_k', _fs_params.get('k', min(20, _X_train_df.shape[1])))\n"
+            "            _k = int(_k_raw) if str(_k_raw).strip() else min(20, _X_train_df.shape[1])\n"
+            "            _k = max(1, min(_k, _X_train_df.shape[1]))\n"
+            "            _selector = SelectKBest(score_func=f_regression, k=_k)\n"
+            "            X_train = _selector.fit_transform(_X_train_df, _y_train_arr)\n"
+            "            X_test = _selector.transform(_X_test_df)\n"
+            "\n"
+            "        elif _fs_method == 'variance_filter' and _X_train_df.shape[1] > 1:\n"
+            "            _threshold_raw = globals().get('feature_selection_threshold', _fs_params.get('threshold', 0.0))\n"
+            "            _threshold = float(_threshold_raw) if str(_threshold_raw).strip() else 0.0\n"
+            "            _threshold = max(0.0, _threshold)\n"
+            "            _selector = VarianceThreshold(threshold=_threshold)\n"
+            "            X_train = _selector.fit_transform(_X_train_df)\n"
+            "            X_test = _selector.transform(_X_test_df)\n"
+            "\n"
+            "        elif _fs_method == 'tree_importance' and _X_train_df.shape[1] > 1:\n"
+            "            _default_top_k = min(50, _X_train_df.shape[1])\n"
+            "            _top_k_raw = globals().get('feature_selection_top_k', _fs_params.get('top_k', _default_top_k))\n"
+            "            _top_k = int(_top_k_raw) if str(_top_k_raw).strip() else _default_top_k\n"
+            "            _top_k = max(1, min(_top_k, _X_train_df.shape[1]))\n"
+            "            _importance_model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)\n"
+            "            _importance_model.fit(_X_train_df, _y_train_arr)\n"
+            "            _importance = np.asarray(_importance_model.feature_importances_).reshape(-1)\n"
+            "            _selected_idx = np.argsort(_importance)[-int(_top_k):]\n"
+            "            _selected_idx = np.sort(_selected_idx)\n"
+            "            X_train = _X_train_df.iloc[:, _selected_idx]\n"
+            "            X_test = _X_test_df.iloc[:, _selected_idx]\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "\n"
+            "# --- SYSTEM CV CONFIG (shared by search + evaluation) ---\n"
+            "_cv_enabled_raw = str(os.getenv('PYRUN_ENABLE_CV', '1')).strip().lower()\n"
+            "_cv_enabled = _cv_enabled_raw not in {'0', 'false', 'no', 'off'}\n"
+            "try:\n"
+            "    _cv_folds = int(str(os.getenv('PYRUN_CV_FOLDS', '5')).strip() or '5')\n"
+            "except Exception:\n"
+            "    _cv_folds = 5\n"
+            "_cv_folds = max(2, _cv_folds)\n"
+            "_cv_splitter = None\n"
+            "if 'X_train' in globals() and hasattr(X_train, 'shape') and X_train.shape[0] >= _cv_folds:\n"
+            "    _cv_splitter = KFold(n_splits=_cv_folds, shuffle=True, random_state=42)\n"
+            "\n"
+            "# --- SYSTEM HYPERPARAM SEARCH (deterministic scoring + bounded size) ---\n"
+            "_search_space_type = None\n"
+            "if 'param_grid' in globals() and isinstance(param_grid, dict) and len(param_grid) > 0:\n"
+            "    _search_space_type = 'grid'\n"
+            "elif 'param_distributions' in globals() and isinstance(param_distributions, dict) and len(param_distributions) > 0:\n"
+            "    _search_space_type = 'random'\n"
+            "if _search_space_type and 'model' in globals() and model is not None and _cv_splitter is not None:\n"
+            "    try:\n"
+            "        _search_scoring = 'neg_root_mean_squared_error'\n"
+            "        if _search_space_type == 'grid':\n"
+            "            _all_candidates = list(ParameterGrid(param_grid))\n"
+            "            _limited_candidates = _all_candidates[:20]\n"
+            "            if len(_limited_candidates) > 0:\n"
+            "                _grid_list = [{k: [v] for k, v in cand.items()} for cand in _limited_candidates]\n"
+            "                _search = GridSearchCV(estimator=model, param_grid=_grid_list, scoring=_search_scoring, cv=_cv_splitter, n_jobs=1)\n"
+            "                _search.fit(X_train, y_train)\n"
+            "                model = _search.best_estimator_\n"
+            "        else:\n"
+            "            _search = RandomizedSearchCV(estimator=model, param_distributions=param_distributions, n_iter=20, scoring=_search_scoring, cv=_cv_splitter, n_jobs=1, random_state=42)\n"
+            "            _search.fit(X_train, y_train)\n"
+            "            model = _search.best_estimator_\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "\n"
+            "if 'model' in globals() and model is not None and 'X_test' in globals():\n"
+            "    try:\n"
+            "        predictions = model.predict(X_test)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "\n"
+            "# --- SYSTEM METRIC FOOTER (deterministic) ---\n"
+            "_pred_candidates = ['predictions', 'y_pred', 'preds', 'yhat', 'y_test_pred']\n"
+            "_system_predictions = next((globals()[c] for c in _pred_candidates if c in globals() and globals()[c] is not None), None)\n"
+            "if _system_predictions is None:\n"
+            "    raise ValueError('No prediction variable found. Expected one of: predictions, y_pred, preds, yhat, y_test_pred')\n"
+            "\n"
+            "_system_y_true = np.asarray(y_test).reshape(-1)\n"
+            "_system_y_pred = np.asarray(_system_predictions).reshape(-1)\n"
+            "if _system_y_true.shape[0] != _system_y_pred.shape[0]:\n"
+            "    raise ValueError(f'Prediction length mismatch: y_test={_system_y_true.shape[0]}, pred={_system_y_pred.shape[0]}')\n"
+            "rmse_holdout = float(np.sqrt(mean_squared_error(_system_y_true, _system_y_pred)))\n"
+            "mae = float(mean_absolute_error(_system_y_true, _system_y_pred))\n"
+            "r2 = float(r2_score(_system_y_true, _system_y_pred))\n"
+            "rmse_cv = None\n"
+            "if _cv_enabled and 'model' in globals() and model is not None and 'X_train' in globals() and 'y_train' in globals() and _cv_splitter is not None:\n"
+            "    try:\n"
+            "        _cv_y = np.asarray(y_train).reshape(-1)\n"
+            "        _cv_scores = cross_val_score(model, X_train, _cv_y, scoring='neg_root_mean_squared_error', cv=_cv_splitter)\n"
+            "        rmse_cv = float(-np.mean(_cv_scores))\n"
+            "    except Exception:\n"
+            "        rmse_cv = None\n"
+            "rmse = rmse_cv if rmse_cv is not None else rmse_holdout\n"
+            "result_json = {'rmse': rmse, 'rmse_holdout': rmse_holdout, 'rmse_cv': rmse_cv, 'mae': mae, 'r2': r2}\n"
+            "print(json.dumps({'result_json': result_json}))\n"
+        )
+        return (
+            template.replace("__TARGET_COLUMN__", repr(target_column))
+            .replace(
+                "__AUTONOMOUS_PREPROCESSING_SECTION__",
+                _indent_block((preprocessing_section or "").strip()),
+            )
+            .replace("__SYSTEM_MODEL_SECTION__", (system_model_section or "").strip())
+            .replace(
+                "__AUTONOMOUS_TRAINING_SECTION__",
+                _indent_block((training_section or "").strip()),
+            )
+        )
+
+    def _fallback_training_section_with_model() -> str:
+        return (
+            "hyperparams = {'n_estimators': 100, 'max_depth': 6, 'random_state': 42}\n"
+            "model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)\n"
+            "model.fit(X_train, y_train)\n"
+            "predictions = model.predict(X_test)\n"
+        )
+
+
+    def _fallback_training_section_without_model(model_family: str) -> str:
+        if model_family == "LinearRegression":
+            model_line = "model = LinearRegression()"
+        elif model_family == "Ridge":
+            model_line = "model = Ridge(alpha=1.0)"
+
+        elif model_family == "Lasso":
+            model_line = "model = Lasso(alpha=0.1, max_iter=10000)"
+
+        elif model_family == "ElasticNet":
+            model_line = "model = ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=10000)"
+
+        elif model_family == "RandomForestRegressor":
+            model_line = (
+                "model = RandomForestRegressor("
+                "n_estimators=100, "
+                "max_depth=6, "
+                "random_state=42)"
+            )
+
+        elif model_family == "XGBRegressor":
+            model_line = (
+                "model = XGBRegressor("
+                "n_estimators=100, "
+                "max_depth=6, "
+                "learning_rate=0.1, "
+                "random_state=42)"
+            )
+
+        else:
+            model_line = "model = Ridge(alpha=1.0)"
+
+
+        return (
+            f"{model_line}\n"
+            "hyperparams = {}\n"
+            "model.fit(X_train, y_train)\n"
+            "predictions = model.predict(X_test)\n"
+        )
+
+
+
+
+
+
+
+
+    def _parse_sectioned_autonomous_output(
+        raw_text: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        cleaned = _sanitize_code_block(raw_text)
+        if not cleaned:
+            return None, None
+
+        marker_pre = "AUTONOMOUS_PREPROCESSING_SECTION"
+        marker_train = "AUTONOMOUS_TRAINING_SECTION"
+
+        pre_idx = cleaned.find(marker_pre)
+        train_idx = cleaned.find(marker_train)
+
+        if pre_idx != -1 and train_idx != -1:
+            if pre_idx < train_idx:
+                pre_block = cleaned[pre_idx + len(marker_pre) : train_idx]
+                train_block = cleaned[train_idx + len(marker_train) :]
+            else:
+                train_block = cleaned[train_idx + len(marker_train) : pre_idx]
+                pre_block = cleaned[pre_idx + len(marker_pre) :]
+
+            pre_block = pre_block.lstrip(":\n# \t").strip()
+            train_block = train_block.lstrip(":\n# \t").strip()
+            return (pre_block or None, train_block or None)
+
+        return cleaned, None
+
+    def _normalize_training_code_for_compare(code_text: Optional[str]) -> str:
+        if not code_text:
+            return ""
+        return " ".join(code_text.split())
+
+    # Broad natural language keyword pattern for LLM prose lines
+    _NL_PATTERN = re.compile(
+        r"^\s*(Use|Try|Apply|Implement|Consider|Ensure|Remember|Note|Make sure|"
+        r"You should|You can|This will|This should|To improve|For better|"
+        r"Example|Replace|Step|First|Then|Finally|Next|After|Before|Here|The|"
+        r"Load|Add|Create|Define|Generate|Calculate|Compute|Build|Fit|Predict|"
+        r"Evaluate|Scale|Encode|Normalize|Select|Remove|Drop|Handle|Convert|"
+        r"Transform|Split|Train|Tune|Optimize|Adjust|Set|Initialize|Prepare|"
+        r"Start|Continue|Complete|Check|Verify|Validate)\s+[a-zA-Z]",
+        re.IGNORECASE,
+    )
+
+    def _remove_natural_language_from_code(code: Optional[str]) -> Optional[str]:
+        """Remove natural language instruction lines from LLM-generated code,
+        then strip any remaining lines that cause a SyntaxError when compiled."""
+        if not code:
+            return None
+
+        cleaned_lines: List[str] = []
+        for line in code.splitlines():
+            stripped_line = line.strip()
+            if not stripped_line:
+                cleaned_lines.append(line)
+                continue
+            if stripped_line.startswith("#"):
+                cleaned_lines.append(line)
+                continue
+            if _NL_PATTERN.match(stripped_line):
+                continue
+            cleaned_lines.append(line)
+
+        # Second pass: strip individual lines that introduce SyntaxErrors.
+        # We do this iteratively until the accumulated code compiles cleanly
+        # or we run out of lines to remove (max 15 passes).
+        result_lines = cleaned_lines
+        for _ in range(15):
+            candidate = "\n".join(result_lines)
+            try:
+                compile(candidate, "<string>", "exec")
+                break  # compiles fine
+            except SyntaxError as se:
+                bad_lineno = (se.lineno or 1) - 1  # 0-indexed
+                if 0 <= bad_lineno < len(result_lines):
+                    result_lines = [
+                        l for i, l in enumerate(result_lines) if i != bad_lineno
+                    ]
+                else:
+                    break  # can't pinpoint line — leave as-is
+
+        result = "\n".join(result_lines).strip()
+        return result if result else None
+
+    def _sanitize_training_section(
+        training_code: Optional[str],
+        disallow_model_redefinition: bool,
+    ) -> Optional[str]:
+        if not training_code:
+            return None
+
+        cleaned = training_code.strip()
+        if disallow_model_redefinition:
+            training_lines: List[str] = []
+            for line in cleaned.splitlines():
+                if re.match(r"^\s*model\s*=", line):
+                    continue
+                training_lines.append(line)
+            cleaned = "\n".join(training_lines).strip()
+
+        # System owns metric footer/result_json. Strip any LLM attempts to define/override.
+        protected_assignment_pattern = re.compile(
+            r"^\s*(result_json|rmse|rmse_holdout|rmse_cv|mae|r2)\s*=",
+            re.IGNORECASE,
+        )
+        protected_print_pattern = re.compile(
+            r"^\s*print\s*\(",
+            re.IGNORECASE,
+        )
+        protected_import_pattern = re.compile(
+            r"^\s*(import\s+|from\s+\S+\s+import\s+)",
+            re.IGNORECASE,
+        )
+        # Pattern to detect natural language instructions (not valid Python code)
+        natural_language_pattern = re.compile(
+            r"^\s*(Use|Try|Apply|Implement|Consider|Ensure|Remember|Note|Make sure|You should|You can|This will|This should)\s+",
+            re.IGNORECASE,
+        )
+        filtered_lines: List[str] = []
+        for line in cleaned.splitlines():
+            # Skip protected system assignments
+            if protected_assignment_pattern.match(line):
+                continue
+            # Skip print statements
+            if protected_print_pattern.match(line):
+                continue
+            # Skip import statements (system handles these)
+            if protected_import_pattern.match(line):
+                continue
+            # Skip natural language instructions that LLM might output
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith("#"):
+                # If line looks like natural language instruction, skip it
+                if natural_language_pattern.match(stripped_line):
+                    continue
+            filtered_lines.append(line)
+        cleaned = "\n".join(filtered_lines).strip()
+
+        return cleaned or None
+
+    def _is_training_pressure_active(
+        stagnation_count: int,
+        improvement_delta: Optional[float],
+    ) -> bool:
+        if stagnation_count >= 1:
+            return True
+        if improvement_delta is not None and improvement_delta < 0.01:
+            return True
+        return False
+
+    def _structural_training_keywords() -> List[str]:
+        return [
+            "KFold",
+            "GridSearchCV",
+            "SelectKBest",
+            "VarianceThreshold",
+            "feature_selection_method",
+            "select_k_best",
+            "variance_filter",
+            "for fold",
+            "np.mean",
+            "ensemble",
+            "stack",
+            "subsample",
+        ]
+
+    def _list_absent_structural_keywords(
+        previous_training_code: Optional[str],
+    ) -> List[str]:
+        previous_lower = (previous_training_code or "").lower()
+        absent: List[str] = []
+        for keyword in _structural_training_keywords():
+            if keyword.lower() not in previous_lower:
+                absent.append(keyword)
+        return absent
+
+    def _has_new_required_structural_keyword(
+        previous_training_code: Optional[str],
+        new_training_code: Optional[str],
+    ) -> bool:
+        new_lower = (new_training_code or "").lower()
+        if not new_lower:
+            return False
+
+        absent_keywords = _list_absent_structural_keywords(previous_training_code)
+        return any(keyword.lower() in new_lower for keyword in absent_keywords)
+
+    def _should_regenerate_training_section(
+        previous_training_code: Optional[str],
+        new_training_code: Optional[str],
+        stagnation_count: int,
+        improvement_delta: Optional[float],
+    ) -> Tuple[bool, str]:
+        if not _is_training_pressure_active(stagnation_count, improvement_delta):
+            return False, ""
+
+        if (
+            previous_training_code
+            and new_training_code
+            and _normalize_training_code_for_compare(new_training_code)
+            == _normalize_training_code_for_compare(previous_training_code)
+        ):
+            return True, (
+                "previous and current training logic are effectively identical. "
+                "You must introduce structural change now. Minor parameter tweaks are insufficient."
+            )
+
+        if previous_training_code and not _has_new_required_structural_keyword(
+            previous_training_code, new_training_code
+        ):
+            return True, (
+                "no NEW required structural training keyword was introduced from the mandated list. "
+                "You must introduce at least one new structural mechanism now."
+            )
+
+        return False, ""
+
+    def _build_training_pressure_directive(
+        stagnation_count: int,
+        improvement_delta: Optional[float],
+        previous_training_code: Optional[str],
+    ) -> str:
+        directive = ""
+        if previous_training_code:
+            directive += (
+                "\nPrevious training section (you must evolve this):\n"
+                f"{previous_training_code}\n"
+            )
+
+        if _is_training_pressure_active(stagnation_count, improvement_delta):
+            absent_keywords = _list_absent_structural_keywords(previous_training_code)
+            absent_list_text = ", ".join(absent_keywords) if absent_keywords else "none"
+            directive += (
+                "\nMutation Pressure Requirements (mandatory):\n"
+                f"- Previously absent structural keywords: {absent_list_text}.\n"
+                "- You must introduce at least one NEW structural training mechanism from the list above. Minor parameter tweaks are forbidden.\n"
+                "- Required mechanism options:\n"
+                "  1) K-fold cross-validation training loop,\n"
+                "  2) hyperparameter search over at least two candidate values,\n"
+                "  3) feature selection or dimensionality reduction,\n"
+                "  4) subsampling or bootstrap/tree-depth logic modification,\n"
+                "  5) ensemble combination of two models using weighted averaging.\n"
+            )
+
+        return directive
+
+    def _get_model_instantiation_line(model_family: str) -> str:
+        """Return a placeholder comment indicating which model family to use.
+        The LLM will generate the actual instantiation with hyperparameters."""
+        return f"# MODEL_FAMILY: {model_family}\n# LLM: Generate the model instantiation with optimized hyperparameters"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # CONTRACT VALIDATOR - LLM → Sandbox validation layer
+    # ──────────────────────────────────────────────────────────────────────────
+
+    _FORBIDDEN_MODEL_CLASSES: List[str] = [
+        "MLPRegressor",
+        "MLPClassifier",
+        "KerasRegressor",
+        "KerasClassifier",
+        "TensorFlow",
+        "torch",
+        "nn.Module",
+        "Sequential",
+        "Dense",
+        "Conv1D",
+        "Conv2D",
+        "LSTM",
+        "GRU",
+        "Transformer",
+    ]
+
+    _ALLOWED_MODEL_CLASSES: List[str] = [
+        "LinearRegression",
+        "Ridge",
+        "Lasso",
+        "ElasticNet",
+        "RandomForestRegressor",
+        "GradientBoostingRegressor",
+        "XGBRegressor",
+        "LGBMRegressor",
+        "DecisionTreeRegressor",
+        "SVR",
+        "KNeighborsRegressor",
+        "AdaBoostRegressor",
+        "BaggingRegressor",
+        "ExtraTreesRegressor",
+        "HuberRegressor",
+        "RANSACRegressor",
+        "TheilSenRegressor",
+        "PassiveAggressiveRegressor",
+        "SGDRegressor",
+    ]
+
+    @dataclass
+    class ContractValidationResult:
+        """Result of script contract validation."""
+
+        is_valid: bool
+        errors: List[str]
+        warnings: List[str]
+
+    def _validate_script_contract(
+        script_content: str,
+        training_section: str,
+        is_model_injected: bool,
+        exploration_mode: bool,
+        exploitation_lock: bool,
+    ) -> ContractValidationResult:
+        """
+        Validate the assembled script before sandbox submission.
+
+        Checks:
+        1. Script contains model.fit( and a prediction assignment from model.predict(
+        2. No new model class inside training section when exploration_mode or exploitation_lock
+        3. LLM must not define/override result_json in training section
+        4. No forbidden model classes appear
+        5. Training section does not redefine model = when model is system-injected
+        """
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        # ── Check 1: Required training calls ──
+        if "model.fit(" not in script_content:
+            errors.append(
+                "CONTRACT_VIOLATION: script missing required 'model.fit(' call"
+            )
+        prediction_assignment_pattern = re.compile(
+            r"^\s*[A-Za-z_]\w*\s*=\s*model\.predict\s*\(",
+            re.MULTILINE,
+        )
+        if not prediction_assignment_pattern.search(training_section or ""):
+            errors.append(
+                "CONTRACT_VIOLATION: training section missing prediction assignment from model.predict(...)"
+            )
+
+        # ── Check 2: No model instantiation in training section under locked modes ──
+        if (exploration_mode or exploitation_lock) and training_section:
+            model_instantiation_pattern = re.compile(
+                r"\bmodel\s*=\s*("
+                + "|".join(re.escape(m) for m in _ALLOWED_MODEL_CLASSES)
+                + r")\s*\(",
+                re.IGNORECASE,
+            )
+            if model_instantiation_pattern.search(training_section):
+                errors.append(
+                    "CONTRACT_VIOLATION: training section defines new model class while in "
+                    f"exploration_mode={exploration_mode} or exploitation_lock={exploitation_lock}"
+                )
+
+        # ── Check 3: LLM cannot own result_json ──
+        if training_section:
+            result_json_redef_pattern = re.compile(
+                r"^\s*result_json\s*=", re.IGNORECASE | re.MULTILINE
+            )
+            if result_json_redef_pattern.search(training_section):
+                errors.append(
+                    "CONTRACT_VIOLATION: training section attempts to define/override protected variable 'result_json'"
+                )
+
+        result_json_assignment_pattern = re.compile(
+            r"^\s*result_json\s*=", re.IGNORECASE | re.MULTILINE
+        )
+        result_json_assignment_count = len(
+            result_json_assignment_pattern.findall(script_content)
+        )
+        if result_json_assignment_count != 1:
+            errors.append(
+                "CONTRACT_VIOLATION: script must contain exactly one system-owned 'result_json =' assignment"
+            )
+
+        # ── Check 4: Forbidden model classes ──
+        for forbidden_class in _FORBIDDEN_MODEL_CLASSES:
+            forbidden_pattern = re.compile(
+                rf"\b{re.escape(forbidden_class)}\b", re.IGNORECASE
+            )
+            if forbidden_pattern.search(script_content):
+                errors.append(
+                    f"CONTRACT_VIOLATION: script contains forbidden model class '{forbidden_class}'"
+                )
+
+        # ── Check 5: Model redefinition in training section when system-injected ──
+        if is_model_injected and training_section:
+            model_redef_pattern = re.compile(r"^\s*model\s*=", re.MULTILINE)
+            if model_redef_pattern.search(training_section):
+                errors.append(
+                    "CONTRACT_VIOLATION: training section redefines 'model =' while model is system-injected"
+                )
+
+        return ContractValidationResult(
+            is_valid=len(errors) == 0,
+            errors=errors,
+            warnings=warnings,
+        )
+
+    def _safe_deterministic_training_template(is_model_injected: bool) -> str:
+        """
+        Return a guaranteed-safe training template as final fallback.
+
+        This template is deterministically correct and will always pass
+        contract validation. Used when LLM output fails validation twice.
+        """
+        if is_model_injected:
+            # Model already injected by system - just fit and predict
+            return (
+                "# Safe deterministic training (model injected by system)\n"
+                "hyperparams = {}\n"
+                "model.fit(X_train, y_train)\n"
+                "predictions = model.predict(X_test)\n"
+            )
+        else:
+            # Full training with model definition included
+            return (
+                "# Safe deterministic training with RandomForest fallback\n"
+                "hyperparams = {'n_estimators': 100, 'max_depth': 6, 'random_state': 42}\n"
+                "model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)\n"
+                "model.fit(X_train, y_train)\n"
+                "predictions = model.predict(X_test)\n"
+            )
+
+    def _generate_stricter_training_directive(validation_errors: List[str]) -> str:
+        """
+        Build a stricter regeneration directive based on validation errors.
+        """
+        directive = "\n\nSTRICT CONTRACT ENFORCEMENT - Your previous output FAILED validation:\n"
+        for err in validation_errors:
+            directive += f"  - {err}\n"
+        directive += (
+            "\nYou MUST fix these issues:\n"
+            "- Include exactly: model.fit(X_train, y_train)\n"
+            "- Include a prediction assignment from model.predict(X_test) (variable name may vary, e.g., predictions or y_pred)\n"
+            "- Do NOT redefine 'model =' if model is system-injected\n"
+            "- Do NOT define or override result_json, rmse, rmse_holdout, rmse_cv, mae, or r2\n"
+            "- Do NOT use neural network libraries (torch, tensorflow, keras, MLPRegressor)\n"
+            "- System metric footer computes metrics deterministically; do not print JSON metrics from training section\n"
+            "- Use only scikit-learn compatible regressors\n"
+        )
+        return directive
+
+    def _validate_and_regenerate_script(
+        script_content: str,
+        training_section: str,
+        preprocessing_section: str,
+        target_column: str,
+        system_model_section: Optional[str],
+        is_model_injected: bool,
+        exploration_mode: bool,
+        exploitation_lock: bool,
+        original_prompt: str,
+    ) -> Tuple[str, str, bool]:
+        """
+        Validate script contract and regenerate if necessary.
+
+        Returns:
+            (final_script_content, final_training_section, used_safe_fallback)
+        """
+        # First validation attempt
+        validation_result = _validate_script_contract(
+            script_content=script_content,
+            training_section=training_section,
+            is_model_injected=is_model_injected,
+            exploration_mode=exploration_mode,
+            exploitation_lock=exploitation_lock,
+        )
+
+        if validation_result.is_valid:
+            print(f"CONTRACT_VALIDATOR: script passed validation")
+            return script_content, training_section, False
+
+        print(
+            f"CONTRACT_VALIDATOR: first validation failed - {validation_result.errors}"
+        )
+
+        # ── First regeneration attempt with stricter directive ──
+        stricter_directive = _generate_stricter_training_directive(
+            validation_result.errors
+        )
+        stricter_prompt = original_prompt + stricter_directive
+
+        regenerated_sections = _generate_autonomous_section_via_llm(stricter_prompt)
+        regen_preprocessing, regen_training = _parse_sectioned_autonomous_output(
+            regenerated_sections
+        )
+
+        # Remove any natural language instructions
+        regen_preprocessing = _remove_natural_language_from_code(regen_preprocessing)
+        regen_training = _remove_natural_language_from_code(regen_training)
+
+        # Use original preprocessing if regeneration didn't produce valid one
+        if not regen_preprocessing or "train_test_split" not in regen_preprocessing:
+            regen_preprocessing = preprocessing_section
+
+        # Sanitize training section
+        regen_training = _sanitize_training_section(
+            regen_training,
+            disallow_model_redefinition=is_model_injected,
+        )
+
+        if not regen_training:
+            regen_training = _safe_deterministic_training_template(is_model_injected)
+
+        # Rebuild script with regenerated sections
+        regen_script = _build_autonomous_script_template(
+            preprocessing_section=regen_preprocessing,
+            training_section=regen_training,
+            target_column=target_column,
+            system_model_section=system_model_section,
+        )
+
+        # Second validation attempt
+        validation_result_2 = _validate_script_contract(
+            script_content=regen_script,
+            training_section=regen_training,
+            is_model_injected=is_model_injected,
+            exploration_mode=exploration_mode,
+            exploitation_lock=exploitation_lock,
+        )
+
+        if validation_result_2.is_valid:
+            print(f"CONTRACT_VALIDATOR: regenerated script passed validation")
+            return regen_script, regen_training, False
+
+        print(
+            f"CONTRACT_VALIDATOR: second validation failed - {validation_result_2.errors}"
+        )
+        print("CONTRACT_VALIDATOR: falling back to safe deterministic template")
+
+        # ── Final fallback: safe deterministic template ──
+        safe_training = _safe_deterministic_training_template(is_model_injected)
+        safe_script = _build_autonomous_script_template(
+            preprocessing_section=preprocessing_section,
+            training_section=safe_training,
+            target_column=target_column,
+            system_model_section=system_model_section,
+        )
+
+        return safe_script, safe_training, True
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # END CONTRACT VALIDATOR
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _fallback_preprocessing_section(forbidden_preprocessing: List[str]) -> str:
+        """Return preprocessing-only code (no model) for exploration mode."""
+        use_one_hot = "one_hot" not in forbidden_preprocessing
+        if use_one_hot:
+            return (
+                "X = df.drop(columns=[TARGET_COLUMN])\n"
+                "y = df[TARGET_COLUMN]\n"
+                "X = pd.get_dummies(X, drop_first=True)\n"
+                "X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)\n"
+            )
+        else:
+            return (
+                "X = df.drop(columns=[TARGET_COLUMN]).select_dtypes(include=['number']).fillna(0.0)\n"
+                "y = df[TARGET_COLUMN]\n"
+                "X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)\n"
+            )
+
+    def _build_exploration_script_template(
+        preprocessing_section: str,
+        target_column: str,
+        model_line: str,
+        training_section: Optional[str] = None,
+    ) -> str:
+        """Build a complete script where the model is hardwired by the orchestrator.
+
+        Model instantiation is injected deterministically so the LLM cannot
+        override the selected model family. LLM-generated preprocessing/training
+        code can mutate around this fixed model object.
+        """
+        resolved_training = (
+            training_section or _fallback_training_section_without_model()
+        )
+        return _build_autonomous_script_template(
+            preprocessing_section=preprocessing_section,
+            training_section=resolved_training,
+            target_column=target_column,
+            system_model_section=model_line,
+        )
+
+    def _build_performance_context(
+        current_iteration: int,
+        mutation_payload: Optional[Dict[str, Any]],
+        rmse_history: List[float],
+        best_rmse: Optional[float],
+        last_rmse: Optional[float],
+        improvement_delta: Optional[float],
+        stagnation_count: int,
+        previous_failure_types: List[str],
+        previous_model_family: Optional[str],
+        previous_strategy: Optional[str],
+        model_history: List[str],
+        exploration_mode: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "iteration": current_iteration,
+            "rmse_history": rmse_history,
+            "current_best_rmse": best_rmse,
+            "last_rmse": last_rmse,
+            "improvement_delta": improvement_delta,
+            "stagnation_count": stagnation_count,
+            "previous_failure_types": previous_failure_types,
+            "previous_model_family": previous_model_family,
+            "previous_strategy": previous_strategy,
+            "model_history": model_history,
+            "exploration_mode": exploration_mode,
+            "mutation_payload": mutation_payload,
+            "dataset": {
+                "target_column": project_target_column,
+                "num_rows": project_num_rows,
+                "num_features": project_num_features,
+                "num_numeric_features": project_num_numeric_features,
+                "num_categorical_features": project_num_categorical_features,
+                "missing_value_count": project_missing_value_count,
+                "target_variance": project_target_variance,
+            },
+            "dataset_profile": project_dataset_profile,
+            "dataset_profile_summary": project_dataset_profile_summary,
+            "experiment_memory_prompt": experiment_memory_prompt,
+        }
+
+    def _call_gemini_text(
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        model_override: Optional[str] = None,
+    ) -> Optional[str]:
+        gemini_api_key = (
+            os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+        ).strip()
+        if not gemini_api_key:
+            return None
+
+        gemini_model = (
+            model_override
+            or preferred_llm_model
+            or os.getenv("GEMINI_MODEL")
+            or os.getenv("GOOGLE_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "gemini-2.0-flash"
+        )
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": f"{system_prompt}\n\n{user_prompt}",
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": float(temperature),
+                "maxOutputTokens": int(max_tokens),
+            },
+        }
+
+        import urllib.error
+        import urllib.request
+
+        endpoint = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+            f"?key={gemini_api_key}"
+        )
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=45) as response:
+            raw_body = response.read().decode("utf-8")
+        parsed = json.loads(raw_body)
+
+        candidates = parsed.get("candidates") or []
+        if not candidates:
+            return None
+
+        candidate_content = candidates[0].get("content") or {}
+        parts = candidate_content.get("parts") or []
+        text_parts: List[str] = []
+        for part in parts:
+            text_val = part.get("text")
+            if isinstance(text_val, str) and text_val.strip():
+                text_parts.append(text_val)
+
+        if not text_parts:
+            return None
+        return "\n".join(text_parts).strip()
+
+    def _call_autonomous_llm_text(
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        failure_log_prefix: str,
+    ) -> Optional[str]:
+        """Generate text for autonomous loop with provider fallback.
+
+        Primary provider follows per-run preference, then env. On failure (e.g., rate limits),
+        it falls back to other configured providers.
+        """
+        llm_client, llm_model, llm_provider = _resolve_autonomous_llm_client()
+
+        configured_providers: List[str] = []
+        if llm_provider:
+            configured_providers.append(llm_provider)
+
+        for fallback_provider in ["groq", "openai", "gemini"]:
+            if fallback_provider not in configured_providers:
+                configured_providers.append(fallback_provider)
+
+        for provider_name in configured_providers:
+            try:
+                if provider_name == "gemini":
+                    gemini_model_override = (
+                        llm_model if llm_provider == "gemini" else None
+                    )
+                    gemini_text = _call_gemini_text(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        model_override=gemini_model_override,
+                    )
+                    if gemini_text:
+                        return gemini_text
+                    continue
+
+                if provider_name in {"groq", "openai"}:
+                    if provider_name == llm_provider and llm_client and llm_model:
+                        client = llm_client
+                        model = llm_model
+                    else:
+                        client, model, resolved_provider = (
+                            _resolve_autonomous_llm_client(provider_name)
+                        )
+                        if resolved_provider != provider_name:
+                            continue
+
+                    if not client or not model:
+                        continue
+
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    text = (response.choices[0].message.content or "").strip()
+                    if text:
+                        return text
+            except Exception as provider_exc:
+                print(f"{failure_log_prefix}: {provider_name} failed: {provider_exc}")
+
+        return None
+
+    def _generate_strategy_reasoning(performance_context: Dict[str, Any]) -> str:
+        recent_model_history = performance_context.get("model_history")
+        if not isinstance(recent_model_history, list):
+            recent_model_history = []
+        recent_model_history = recent_model_history[-5:]
+        exploration_mode = bool(performance_context.get("exploration_mode"))
+
+        strategy_prompt = (
+            "You are optimizing RMSE in an autonomous ML research loop.\n\n"
+            "Performance Summary:\n\n"
+            f"Iteration: {performance_context.get('iteration')}\n\n"
+            f"Best RMSE: {performance_context.get('current_best_rmse')}\n\n"
+            f"Last RMSE: {performance_context.get('last_rmse')}\n\n"
+            f"Improvement Delta: {performance_context.get('improvement_delta')}\n\n"
+            f"Stagnation Count: {performance_context.get('stagnation_count')}\n\n"
+            f"Previous Model Family: {performance_context.get('previous_model_family')}\n\n"
+            f"Previous Strategy: {performance_context.get('previous_strategy')}\n\n"
+            f"Model History: {str(recent_model_history)}\n\n"
+            f"Dataset Metadata: {performance_context.get('dataset')}\n\n"
+            f"Dataset Profile Summary: {performance_context.get('dataset_profile_summary')}\n\n"
+        )
+
+        # ── Phase E: Inject experiment memory into strategy prompt ──
+        memory_block = performance_context.get("experiment_memory_prompt") or ""
+        if memory_block:
+            strategy_prompt += f"{memory_block}\n\n"
+
+        strategy_prompt += (
+            "Do NOT repeat previous strategy text.\n\n"
+            "Return:\n"
+            "One short paragraph describing the next strategy.\n"
+            "No code.\n"
+            "No explanation."
+        )
+
+        if exploration_mode:
+            strategy_prompt += (
+                "\n\nExploration Mode Active: You must switch to a completely different model family "
+                "than any used in the last 3 iterations. Hyperparameter tuning of the same model is forbidden."
+            )
+
+        try:
+            stagnation_count = int(performance_context.get("stagnation_count") or 0)
+            reflection_temperature = 0.5 if stagnation_count >= 3 else 0.3
+            strategy_text = _call_autonomous_llm_text(
+                system_prompt=(
+                    "You are an ML research strategist. Return one short paragraph with strategy only, no code."
+                ),
+                user_prompt=strategy_prompt,
+                temperature=reflection_temperature,
+                max_tokens=180,
+                failure_log_prefix="SANDBOX STRATEGY FALLBACK",
+            )
+            if strategy_text:
+                return strategy_text[:600]
+            print("SANDBOX STRATEGY FALLBACK: no configured autonomous LLM client")
+        except Exception as strategy_exc:
+            print(f"SANDBOX STRATEGY FALLBACK: {strategy_exc}")
+
+        stagnation_count = int(performance_context.get("stagnation_count") or 0)
+        previous_strategy = str(
+            performance_context.get("previous_strategy") or ""
+        ).strip()
+        if stagnation_count >= 2:
+            fallback = (
+                "Switch away from the previous model family and introduce a stronger ensemble approach with "
+                "feature engineering and regularization tuning, including richer preprocessing to reduce error plateaus."
+            )
+            if previous_strategy and fallback.lower() == previous_strategy.lower():
+                return (
+                    fallback
+                    + " Also add interaction features and calibration-oriented hyperparameter search."
+                )
+            return fallback
+
+        return "Refine the current approach conservatively by tuning key hyperparameters and improving generalization while keeping preprocessing stable."
+
+    def _extract_model_family_from_code(code_text: str) -> Optional[str]:
+        if not code_text:
+            return None
+        candidates = {
+            "XGBRegressor",
+            "RandomForestRegressor",
+            "LinearRegression",
+            "Ridge",
+            "Lasso",
+            "ElasticNet",
+        }
+
+        fit_match = re.search(r"^\s*model\.fit\s*\(", code_text, flags=re.MULTILINE)
+        fit_pos = fit_match.start() if fit_match else len(code_text)
+
+        assignment_re = re.compile(
+            r"^\s*model\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            flags=re.MULTILINE,
+        )
+
+        selected: Optional[str] = None
+        for match in assignment_re.finditer(code_text):
+            if match.start() <= fit_pos:
+                estimator_name = match.group(1)
+                if estimator_name in candidates:
+                    selected = estimator_name
+
+        if selected is not None:
+            return selected
+        return None
+
+    def _contains_forbidden_model_family(
+        code_text: str, forbidden_models: List[str]
+    ) -> bool:
+        if not code_text or not forbidden_models:
+            return False
+        return any(model_name in code_text for model_name in forbidden_models)
+
+    def _extract_preprocessing_tokens_from_code(code_text: str) -> List[str]:
+        if not code_text:
+            return []
+
+        token_patterns = {
+            "one_hot": ["one_hot", "get_dummies", "OneHotEncoder"],
+            "scaling": ["StandardScaler", "MinMaxScaler", "RobustScaler"],
+            "polynomial": ["PolynomialFeatures"],
+            "imputation": ["SimpleImputer", "fillna("],
+        }
+
+        found: List[str] = []
+        lower_code = code_text.lower()
+        for token_name, patterns in token_patterns.items():
+            for pattern in patterns:
+                if pattern.lower() in lower_code:
+                    found.append(token_name)
+                    break
+        return found
+
+    def _violates_forbidden_constraints(
+        code_text: str,
+        forbidden_models: List[str],
+        forbidden_preprocessing: List[str],
+    ) -> bool:
+        if not code_text:
+            return False
+
+        if _contains_forbidden_model_family(code_text, forbidden_models):
+            return True
+
+        code_lower = code_text.lower()
+        for token in forbidden_preprocessing:
+            if token.lower() in code_lower:
+                return True
+
+        return False
+
+    def _fallback_exploration_autonomous_section(
+        selected_model: str,
+        forbidden_preprocessing: List[str],
+    ) -> str:
+        model_lines = {
+            "LinearRegression": "model = LinearRegression()\n",
+            "Ridge": "model = Ridge(alpha=1.0)\n",
+            "Lasso": "model = Lasso(alpha=0.01, max_iter=5000)\n",
+            "ElasticNet": "model = ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000)\n",
+            "RandomForestRegressor": "model = RandomForestRegressor(n_estimators=120, max_depth=8, random_state=42)\n",
+            "XGBRegressor": "model = XGBRegressor(random_state=42, verbosity=0, n_estimators=150, max_depth=6, learning_rate=0.05)\n",
+        }
+
+        selected_model_line = model_lines.get(selected_model, model_lines["Ridge"])
+
+        use_one_hot = "one_hot" not in forbidden_preprocessing
+        if use_one_hot:
+            preprocess_block = (
+                "X = df.drop(columns=[TARGET_COLUMN])\n"
+                "y = df[TARGET_COLUMN]\n"
+                "X = pd.get_dummies(X, drop_first=True)\n"
+            )
+        else:
+            preprocess_block = (
+                "X = df.drop(columns=[TARGET_COLUMN]).select_dtypes(include=['number']).fillna(0.0)\n"
+                "y = df[TARGET_COLUMN]\n"
+            )
+
+        return (
+            preprocess_block
+            + "X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)\n"
+            + selected_model_line
+            + "model.fit(X_train, y_train)\n"
+            + "predictions = model.predict(X_test)\n"
+        )
+
+    def _select_exploration_model_family(
+        recent_model_history: List[str],
+        iteration_number: int,
+    ) -> str:
+        model_pool = [
+            "LinearRegression",
+            "Ridge",
+            "Lasso",
+            "ElasticNet",
+            "RandomForestRegressor",
+            "XGBRegressor",
+        ]
+
+        excluded = set(recent_model_history[-3:])
+        allowed = [
+            model_name for model_name in model_pool if model_name not in excluded
+        ]
+        if not allowed:
+            allowed = model_pool
+
+        return allowed[iteration_number % len(allowed)]
+
+    def _generate_preprocessing_mutation_via_llm(
+        prev_preprocessing_code: Optional[str],
+        best_rmse: Optional[float],
+        last_rmse: Optional[float],
+        stagnation_count: int,
+        dataset_metadata: Dict[str, Any],
+        dataset_profile_summary: str,
+    ) -> Optional[str]:
+        """Ask the LLM to mutate only the preprocessing section, not the model."""
+        prompt = (
+            "You are an autonomous ML researcher performing controlled preprocessing evolution.\n"
+            "Your task is to improve the preprocessing logic to reduce RMSE.\n\n"
+            "Constraints:\n"
+            "- You are NOT allowed to change the model family.\n"
+            "- Do NOT define any model. Do NOT call model.fit or model.predict.\n"
+            "- Do NOT include any import statements.\n"
+            "- Do NOT print anything.\n"
+            "- You MUST define: X_train, X_test, y_train, y_test.\n"
+            "- Dataset is already loaded as df. Target column is TARGET_COLUMN.\n"
+            "- Return only Python preprocessing code. No markdown, no explanation.\n\n"
+            f"Best RMSE so far: {best_rmse}\n"
+            f"Last RMSE: {last_rmse}\n"
+            f"Stagnation count: {stagnation_count}\n"
+            f"Dataset metadata: {json.dumps(dataset_metadata, default=str)}\n\n"
+            f"Dataset profile summary: {dataset_profile_summary}\n\n"
+            "Previous preprocessing code (mutate or extend this):\n"
+            f"{prev_preprocessing_code or '# No previous preprocessing available'}\n\n"
+            "You must modify or extend the preprocessing logic to attempt improvement. "
+            "You are not allowed to change the model family.\n"
+            "Return only updated preprocessing code."
+        )
+        try:
+            response_text = _call_autonomous_llm_text(
+                system_prompt=(
+                    "You are an ML preprocessing specialist. "
+                    "Return only Python code that defines X_train, X_test, y_train, y_test. "
+                    "No model definitions. No imports. No markdown."
+                ),
+                user_prompt=prompt,
+                temperature=0.4,
+                max_tokens=800,
+                failure_log_prefix="PREPROCESSING MUTATION LLM FALLBACK",
+            )
+            if not response_text:
+                return None
+            return _sanitize_code_block(response_text)
+        except Exception as preproc_exc:
+            print(f"PREPROCESSING MUTATION LLM FALLBACK: {preproc_exc}")
+            return None
+
+    def _resolve_autonomous_llm_client(
+        force_provider: Optional[str] = None,
+    ) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+        """Resolve chat client/model for autonomous code generation.
+
+        Provider selection order:
+        1) Per-run override from API request
+        2) LLM_PROVIDER env var
+        3) Default priority: Groq -> OpenAI -> Gemini
+        """
+        requested_provider = (
+            (
+                force_provider
+                or preferred_llm_provider
+                or os.getenv("LLM_PROVIDER")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
+        openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        gemini_api_key = (
+            os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+        ).strip()
+
+        if not groq_api_key and not openai_api_key and not gemini_api_key:
+            return None, None, None
+
+        try:
+            from openai import OpenAI
+        except Exception:
+            # SDK is required for groq/openai; gemini can still be used.
+            if gemini_api_key:
+                gemini_model = (
+                    preferred_llm_model
+                    or os.getenv("GEMINI_MODEL")
+                    or os.getenv("GOOGLE_MODEL")
+                    or "gemini-2.0-flash"
+                )
+                return None, gemini_model, "gemini"
+            return None, None, None
+
+        use_groq = bool(groq_api_key) and requested_provider in {"", "groq", "groak"}
+        use_openai = bool(openai_api_key) and requested_provider == "openai"
+        use_gemini = bool(gemini_api_key) and requested_provider == "gemini"
+
+        if requested_provider in {"", "auto"}:
+            if groq_api_key:
+                use_groq = True
+            elif openai_api_key:
+                use_openai = True
+            elif gemini_api_key:
+                use_gemini = True
+
+        if use_groq:
+            groq_model = (
+                preferred_llm_model
+                or os.getenv("GROQ_MODEL")
+                or os.getenv("GROQ_CHAT_MODEL")
+                or os.getenv("LLM_MODEL")
+                or "llama-3.3-70b-versatile"
+            )
+            client = OpenAI(
+                api_key=groq_api_key,
+                base_url="https://api.groq.com/openai/v1",
+                timeout=45.0,
+            )
+            return client, groq_model, "groq"
+
+        if use_openai:
+            openai_model = (
+                preferred_llm_model
+                or os.getenv("OPENAI_MODEL")
+                or os.getenv("LLM_MODEL")
+                or "gpt-4o-mini"
+            )
+            client = OpenAI(api_key=openai_api_key, timeout=45.0)
+            return client, openai_model, "openai"
+
+        if use_gemini or gemini_api_key:
+            gemini_model = (
+                preferred_llm_model
+                or os.getenv("GEMINI_MODEL")
+                or os.getenv("GOOGLE_MODEL")
+                or os.getenv("LLM_MODEL")
+                or "gemini-2.0-flash"
+            )
+            return None, gemini_model, "gemini"
+
+        return None, None, None
+
+    def _generate_autonomous_section_via_llm(prompt_text: str) -> Optional[str]:
+        try:
+            script_text = _call_autonomous_llm_text(
+                system_prompt="Generate only autonomous section Python code, no markdown.",
+                user_prompt=prompt_text,
+                temperature=0.2,
+                max_tokens=1200,
+                failure_log_prefix="SANDBOX SCRIPT GENERATION FALLBACK",
+            )
+            if not script_text:
+                return None
+            return _sanitize_code_block(script_text)
+        except Exception as llm_script_exc:
+            print(f"SANDBOX SCRIPT GENERATION FALLBACK: {llm_script_exc}")
+            return None
+
+    def _create_sandbox_job(script_content: str, iteration_number: int) -> uuid.UUID:
+        """Create a sandbox job and return its ID without polling."""
+        create_sandbox_job_db = SessionLocal()
+        try:
+            sandbox_job_timeout_seconds = int(
+                os.getenv("SANDBOX_JOB_TIMEOUT_SECONDS", "180")
+            )
+            sandbox_job = SandboxJob(
+                agent_id=agent_run_id,
+                project_id=project_id,
+                iteration_number=iteration_number,
+                script_content=script_content,
+                status="queued",
+                timeout_seconds=sandbox_job_timeout_seconds,
+            )
+            create_sandbox_job_db.add(sandbox_job)
+            create_sandbox_job_db.commit()
+            create_sandbox_job_db.refresh(sandbox_job)
+            return sandbox_job.id
+        except Exception:
+            create_sandbox_job_db.rollback()
+            raise
+        finally:
+            create_sandbox_job_db.close()
+
+    def _empty_sandbox_metrics() -> Dict[str, Optional[float]]:
+        return {
+            "rmse": None,
+            "rmse_cv": None,
+            "rmse_holdout": None,
+            "mae": None,
+            "r2": None,
+        }
+
+    def _parse_sandbox_metrics(
+        sandbox_status: str,
+        sandbox_result_json: Any,
+        sandbox_error_log: Optional[str],
+    ) -> Dict[str, Optional[float]]:
+        if sandbox_status == "timeout":
+            raise RuntimeError("Execution timeout")
+        if sandbox_status != "completed":
+            raise RuntimeError(sandbox_error_log or "Sandbox execution failed")
+
+        parsed_result = sandbox_result_json
+        if isinstance(parsed_result, str):
+            try:
+                parsed_result = json.loads(parsed_result)
+            except json.JSONDecodeError as decode_exc:
+                raise RuntimeError(f"Sandbox result_json parse error: {decode_exc}")
+
+        if not isinstance(parsed_result, dict):
+            raise RuntimeError("Sandbox result_json is not a JSON object")
+
+        system_result_json = parsed_result.get("result_json")
+        if not isinstance(system_result_json, dict):
+            raise RuntimeError(
+                "Sandbox result_json missing required system-generated 'result_json' object"
+            )
+
+        def _to_float(value: Any) -> Optional[float]:
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        rmse_cv = _to_float(system_result_json.get("rmse_cv"))
+        rmse_holdout = _to_float(system_result_json.get("rmse_holdout"))
+        rmse_legacy = _to_float(system_result_json.get("rmse"))
+        rmse = rmse_cv
+        if rmse is None:
+            rmse = rmse_holdout
+        if rmse is None:
+            rmse = rmse_legacy
+
+        return {
+            "rmse": rmse,
+            "rmse_cv": rmse_cv,
+            "rmse_holdout": rmse_holdout,
+            "mae": _to_float(system_result_json.get("mae")),
+            "r2": _to_float(system_result_json.get("r2")),
+        }
+
+    def _poll_single_sandbox_job(
+        sandbox_job_id: uuid.UUID, timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Optional[float]]:
+        """Poll a single sandbox job until completion and return metrics."""
+        sandbox_poll_start = time.time()
+        if timeout_seconds is None:
+            timeout_seconds = int(os.getenv("SANDBOX_POLL_TIMEOUT_SECONDS", "900"))
+        sandbox_status = "queued"
+        sandbox_result_json: Any = None
+        sandbox_error_log: Optional[str] = None
+
+        while True:
+            if time.time() - sandbox_poll_start > timeout_seconds:
+                raise RuntimeError(
+                    f"Sandbox polling timeout exceeded ({timeout_seconds}s)"
+                )
+
+            poll_db = SessionLocal()
+            try:
+                polled_job = (
+                    poll_db.query(SandboxJob)
+                    .filter(SandboxJob.id == sandbox_job_id)
+                    .first()
+                )
+                if polled_job is None:
+                    raise RuntimeError("Sandbox job not found during polling")
+                sandbox_status = polled_job.status
+                sandbox_result_json = polled_job.result_json
+                sandbox_error_log = polled_job.error_log
+            finally:
+                poll_db.close()
+
+            if sandbox_status in {"completed", "failed", "timeout"}:
+                break
+
+            time.sleep(2)
+
+        return _parse_sandbox_metrics(
+            sandbox_status, sandbox_result_json, sandbox_error_log
+        )
+
+    def _poll_sandbox_jobs_parallel(
+        job_ids: List[uuid.UUID],
+        model_names_by_job_id: Optional[Dict[uuid.UUID, str]] = None,
+    ) -> List[Dict[str, Optional[float]]]:
+        """Poll a batch of sandbox jobs while tolerating queueing on a single worker."""
+        if not job_ids:
+            return []
+
+        poll_interval_seconds = 2
+        default_timeout_seconds = int(os.getenv("SANDBOX_POLL_TIMEOUT_SECONDS", "900"))
+        timeout_buffer_seconds = int(os.getenv("SANDBOX_POLL_BUFFER_SECONDS", "120"))
+        max_timeout_seconds = int(os.getenv("SANDBOX_POLL_MAX_TIMEOUT_SECONDS", "3600"))
+        all_queued_timeout_seconds = max(
+            15,
+            int(os.getenv("SANDBOX_ALL_QUEUED_TIMEOUT_SECONDS", "45")),
+        )
+
+        metadata_db = SessionLocal()
+        try:
+            job_rows = (
+                metadata_db.query(SandboxJob.id, SandboxJob.timeout_seconds)
+                .filter(SandboxJob.id.in_(job_ids))
+                .all()
+            )
+        finally:
+            metadata_db.close()
+
+        timeout_by_job_id = {
+            row.id: max(1, int(row.timeout_seconds or 60)) for row in job_rows
+        }
+        expected_runtime_seconds = sum(
+            timeout_by_job_id.get(job_id, 60) for job_id in job_ids
+        )
+        total_timeout = max(
+            default_timeout_seconds, expected_runtime_seconds + timeout_buffer_seconds
+        )
+        total_timeout = min(total_timeout, max_timeout_seconds)
+        inactivity_timeout = max(
+            max(timeout_by_job_id.values(), default=60) + timeout_buffer_seconds,
+            int(os.getenv("SANDBOX_POLL_INACTIVITY_TIMEOUT_SECONDS", "240")),
+        )
+
+        print(
+            "PARALLEL EXECUTION: Polling "
+            f"{len(job_ids)} jobs with batch timeout {total_timeout}s "
+            f"(expected_runtime={expected_runtime_seconds}s, inactivity_timeout={inactivity_timeout}s)"
+        )
+
+        pending_job_ids = list(job_ids)
+        pending_job_id_set = set(job_ids)
+        results: List[Optional[Dict[str, Optional[float]]]] = [None] * len(job_ids)
+        last_status_by_job_id: Dict[uuid.UUID, str] = {}
+        last_observed_status_by_job_id: Dict[uuid.UUID, str] = {}
+        observed_execution_start = False
+        batch_poll_start = time.time()
+        last_progress_at = batch_poll_start
+        first_all_queued_at: Optional[float] = None
+
+        while pending_job_ids:
+            now = time.time()
+            if now - batch_poll_start > total_timeout:
+                for idx, job_id in enumerate(job_ids):
+                    if job_id in pending_job_id_set:
+                        model_name = (model_names_by_job_id or {}).get(
+                            job_id, "UnknownModel"
+                        )
+                        print(
+                            "PARALLEL EXECUTION: Job "
+                            f"{job_id} failed: Sandbox batch polling timeout exceeded ({total_timeout}s)"
+                        )
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox batch timeout: {model_name} ({job_id}) after {total_timeout}s",
+                        )
+                        _set_agent_model_status(
+                            agent_run_id,
+                            model_name,
+                            "failed",
+                            job_id=job_id,
+                            error=f"Sandbox batch polling timeout exceeded ({total_timeout}s)",
+                        )
+                        results[idx] = _empty_sandbox_metrics()
+                break
+
+            if now - last_progress_at > inactivity_timeout:
+                for idx, job_id in enumerate(job_ids):
+                    if job_id in pending_job_id_set:
+                        model_name = (model_names_by_job_id or {}).get(
+                            job_id, "UnknownModel"
+                        )
+                        print(
+                            "PARALLEL EXECUTION: Job "
+                            f"{job_id} failed: No sandbox status change observed for {inactivity_timeout}s"
+                        )
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox polling stalled: {model_name} ({job_id}) for {inactivity_timeout}s",
+                        )
+                        _set_agent_model_status(
+                            agent_run_id,
+                            model_name,
+                            "failed",
+                            job_id=job_id,
+                            error=f"No sandbox status change observed for {inactivity_timeout}s",
+                        )
+                        results[idx] = _empty_sandbox_metrics()
+                break
+
+            poll_db = SessionLocal()
+            try:
+                polled_jobs = (
+                    poll_db.query(SandboxJob)
+                    .filter(SandboxJob.id.in_(pending_job_ids))
+                    .all()
+                )
+            finally:
+                poll_db.close()
+
+            jobs_by_id = {job.id: job for job in polled_jobs}
+
+            for idx, job_id in enumerate(job_ids):
+                if job_id not in pending_job_id_set:
+                    continue
+
+                polled_job = jobs_by_id.get(job_id)
+                if polled_job is None:
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
+                    print(
+                        f"PARALLEL EXECUTION: Job {job_id} failed: Sandbox job not found during polling"
+                    )
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"Sandbox job missing: {model_name} ({job_id})",
+                    )
+                    _set_agent_model_status(
+                        agent_run_id,
+                        model_name,
+                        "failed",
+                        job_id=job_id,
+                        error="Sandbox job not found during polling",
+                    )
+                    results[idx] = _empty_sandbox_metrics()
+                    pending_job_id_set.discard(job_id)
+                    continue
+
+                current_status = polled_job.status
+                last_observed_status_by_job_id[job_id] = current_status
+                previous_status = last_status_by_job_id.get(job_id)
+                if current_status != previous_status:
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
+                    print(
+                        f"PARALLEL EXECUTION: Job {job_id} status {previous_status or 'created'} -> {current_status}"
+                    )
+                    if current_status == "queued":
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox job queued: {model_name} ({job_id})",
+                        )
+                        _set_agent_model_status(
+                            agent_run_id, model_name, "queued", job_id=job_id
+                        )
+                    elif current_status == "running":
+                        observed_execution_start = True
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox job running: {model_name} ({job_id})",
+                        )
+                        _set_agent_model_status(
+                            agent_run_id, model_name, "training", job_id=job_id
+                        )
+                    elif current_status == "completed":
+                        observed_execution_start = True
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox job completed: {model_name} ({job_id})",
+                        )
+                    elif current_status == "timeout":
+                        observed_execution_start = True
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox job timed out: {model_name} ({job_id})",
+                        )
+                    elif current_status == "failed":
+                        observed_execution_start = True
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox job failed: {model_name} ({job_id})",
+                        )
+                    last_status_by_job_id[job_id] = current_status
+                    last_progress_at = now
+
+                if current_status not in {"completed", "failed", "timeout"}:
+                    continue
+
+                try:
+                    metrics = _parse_sandbox_metrics(
+                        current_status,
+                        polled_job.result_json,
+                        polled_job.error_log,
+                    )
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
+                    metrics["_sandbox_status"] = current_status
+                    metrics["_error_message"] = None
+                    results[idx] = metrics
+                    _set_agent_model_status(
+                        agent_run_id,
+                        model_name,
+                        "completed",
+                        rmse=metrics.get("rmse"),
+                        r2=metrics.get("r2"),
+                        mae=metrics.get("mae"),
+                        job_id=job_id,
+                    )
+                    if metrics.get("rmse") is not None:
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Model metrics ready: {model_name} ({job_id}) | RMSE={float(metrics['rmse']):.4f}",
+                        )
+                    print(f"PARALLEL EXECUTION: Job {job_id} completed successfully")
+                except Exception as exc:
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
+                    print(f"PARALLEL EXECUTION: Job {job_id} failed: {exc}")
+                    _set_agent_model_status(
+                        agent_run_id,
+                        model_name,
+                        "failed",
+                        job_id=job_id,
+                        error=str(exc),
+                    )
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"Model metrics unavailable: {model_name} ({job_id}) | {exc}",
+                    )
+                    failed_metrics = _empty_sandbox_metrics()
+                    failed_metrics["_sandbox_status"] = current_status
+                    # Prefer the raw error_log from DB (has full text incl exit codes);
+                    # fall back to exception message if not available.
+                    failed_metrics["_error_message"] = polled_job.error_log or str(exc)
+                    results[idx] = failed_metrics
+
+                pending_job_id_set.discard(job_id)
+                last_progress_at = now
+
+            pending_job_ids = [
+                job_id for job_id in job_ids if job_id in pending_job_id_set
+            ]
+            if pending_job_ids:
+                unresolved_pending_statuses = {
+                    job_id: last_observed_status_by_job_id.get(job_id, "unknown")
+                    for job_id in pending_job_ids
+                }
+                if unresolved_pending_statuses and all(
+                    status == "queued"
+                    for status in unresolved_pending_statuses.values()
+                ):
+                    if first_all_queued_at is None:
+                        first_all_queued_at = now
+                    elif now - first_all_queued_at > all_queued_timeout_seconds:
+                        raise RuntimeError(
+                            "Sandbox worker appears offline: all sandbox jobs remained queued and never started. "
+                            "Start backend/sandbox_worker.py and retry."
+                        )
+                else:
+                    first_all_queued_at = None
+
+            if pending_job_ids:
+                time.sleep(poll_interval_seconds)
+
+        if not observed_execution_start:
+            unresolved_statuses = {
+                job_id: last_observed_status_by_job_id.get(job_id, "unknown")
+                for job_id in job_ids
+            }
+            if unresolved_statuses and all(
+                status == "queued" for status in unresolved_statuses.values()
+            ):
+                raise RuntimeError(
+                    "Sandbox worker appears offline: all sandbox jobs remained queued and never started. "
+                    "Start backend/sandbox_worker.py and retry."
+                )
+
+        return [
+            item if item is not None else _empty_sandbox_metrics() for item in results
+        ]
+
+    def _run_sandbox_script(
+        script_content: str, iteration_number: int
+    ) -> Dict[str, Optional[float]]:
+        """Queue a sandbox job, poll until terminal state, and return parsed metric payload."""
+        job_id = _create_sandbox_job(script_content, iteration_number)
+        return _poll_single_sandbox_job(job_id)
+
+    def _update_training_run_stage(
+        training_run_id: uuid.UUID, stage: str, progress: int
+    ) -> None:
+        stage_db = SessionLocal()
+        try:
+            run = (
+                stage_db.query(TrainingRun)
+                .filter(TrainingRun.id == training_run_id)
+                .first()
+            )
+            if run is None:
+                return
+            run.stage = stage
+            run.progress = progress
+            stage_db.commit()
+        except Exception:
+            stage_db.rollback()
+            raise
+        finally:
+            stage_db.close()
+
+    initial_db = SessionLocal()
+    try:
+        agent_run = (
+            initial_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+        )
+        if agent_run is None:
+            return
+
+        project = (
+            initial_db.query(Project).filter(Project.id == agent_run.project_id).first()
+        )
+        if project is None:
+            agent_run.status = "failed"
+            agent_run.error_message = "Project not found for agent run"
+            agent_run.completed_at = datetime.now(timezone.utc)
+            initial_db.commit()
+            return
+
+        project_id = project.id
+        project_file_id = project.file_id
+        project_target_column = project.target_column
+        project_num_rows = project.num_rows
+        project_num_features = project.num_features
+        project_num_numeric_features = project.num_numeric_features
+        project_num_categorical_features = project.num_categorical_features
+        project_missing_value_count = project.missing_value_count
+        project_target_variance = project.target_variance
+
+        dataset_path = UPLOAD_DIR / str(project_file_id)
+        if dataset_path.exists():
+            try:
+                project_dataset_profile = _ensure_project_dataset_profile(
+                    initial_db, project, dataset_path
+                )
+                project_dataset_profile_summary = _summarize_dataset_profile(
+                    project_dataset_profile
+                )
+            except Exception as profile_exc:
+                print(f"DATASET PROFILE FALLBACK: {profile_exc}")
+                project_dataset_profile = {}
+                project_dataset_profile_summary = (
+                    "Dataset profile unavailable due to profiling fallback."
+                )
+        else:
+            project_dataset_profile = {}
+            project_dataset_profile_summary = (
+                "Dataset profile unavailable because dataset file is missing."
+            )
+
+        # ── Phase E: Compute dataset fingerprint & retrieve experiment memory ──
+        project_dataset_fingerprint = ""
+        experiment_memory_prompt = ""
+        if project_dataset_profile:
+            try:
+                project_dataset_fingerprint = _compute_dataset_fingerprint(
+                    project_dataset_profile
+                )
+                print(f"DATASET_FINGERPRINT: {project_dataset_fingerprint}")
+                memories = _retrieve_experiment_memory(
+                    initial_db,
+                    project_dataset_fingerprint,
+                    project_dataset_profile,
+                    limit=5,
+                )
+                if memories:
+                    experiment_memory_prompt = _format_experiment_memory_for_prompt(
+                        memories
+                    )
+                    print(
+                        f"EXPERIMENT_MEMORY_RETRIEVED: {len(memories)} records loaded"
+                    )
+                else:
+                    print("EXPERIMENT_MEMORY_RETRIEVED: no past experiments found")
+            except Exception as mem_exc:
+                print(f"EXPERIMENT_MEMORY_RETRIEVAL_FAILED: {mem_exc}")
+    finally:
+        initial_db.close()
+
+    try:
+        best_rmse = None
+        rmse_history: List[float] = []
+        last_rmse: Optional[float] = None
+        improvement_delta: Optional[float] = None
+        previous_failure_types: List[str] = []
+        strategy_history: List[str] = []
+        model_history: List[str] = []
+        preprocessing_history: List[List[str]] = []
+        previous_model_family: Optional[str] = None
+        model_family_changed_once = False
+        previous_preprocessing_code: Optional[str] = None
+        best_preprocessing_code: Optional[str] = None
+        previous_training_code: Optional[str] = None
+        best_training_run_id = None
+        patience = 5
+        exploitation_lock_counter: int = 0
+        exploitation_lock_model: Optional[str] = None
+        EXPLOITATION_LOCK_N: int = 2
+        no_improvement_counter = 0
+        refinement_attempted = False
+        terminated_by_status = False
+        model_families = [
+            "LinearRegression",
+            "Ridge",
+            "Lasso",
+            "ElasticNet",
+            "RandomForestRegressor",
+            "XGBRegressor",
+        ]
+        per_model_previous_preprocessing: Dict[str, Optional[str]] = {
+            m: None for m in model_families
+        }
+        per_model_previous_training: Dict[str, Optional[str]] = {
+            m: None for m in model_families
+        }
+        per_model_best_rmse: Dict[str, Optional[float]] = {
+            m: None for m in model_families
+        }
+        # Prompt Architect state
+        per_model_previous_blueprint: Dict[str, Optional[Blueprint]] = {
+            m: None for m in model_families
+        }
+        per_model_last_error: Dict[str, ErrorContext] = {
+            m: ErrorContext(error_type="none") for m in model_families
+        }
+        per_model_telemetry: Dict[str, List[ArchitectTelemetry]] = {
+            m: [] for m in model_families
+        }
+
+        while True:
+            iteration_db = SessionLocal()
+            try:
+                agent_run = (
+                    iteration_db.query(AgentRun)
+                    .filter(AgentRun.id == agent_run_id)
+                    .first()
+                )
+                if agent_run is None:
+                    return
+
+                if agent_run.status != "running":
+                    terminated_by_status = True
+                    break
+
+                if agent_run.current_iteration >= agent_run.max_iterations:
+                    break
+
+                agent_run.current_iteration += 1
+                iteration_db.commit()
+
+                current_iteration = agent_run.current_iteration
+                current_max_iterations = agent_run.max_iterations
+                current_best_training_run_id = agent_run.best_training_run_id
+                improvement_threshold = float(agent_run.improvement_threshold)
+            except Exception:
+                iteration_db.rollback()
+                raise
+            finally:
+                iteration_db.close()
+
+            print("=== AGENT ITERATION ===", current_iteration)
+            _append_agent_sandbox_event(
+                agent_run_id,
+                f"Starting iteration {current_iteration}/{current_max_iterations}",
+            )
+
+            create_training_run_db = SessionLocal()
+            try:
+                current_version = (
+                    create_training_run_db.query(
+                        func.coalesce(func.max(TrainingRun.version_number), 0)
+                    )
+                    .filter(TrainingRun.project_id == project_id)
+                    .scalar()
+                )
+
+                training_run = TrainingRun(
+                    project_id=project_id,
+                    agent_run_id=agent_run_id,
+                    version_number=current_version + 1,
+                    status="running",
+                    stage="analyzing_dataset",
+                    progress=10,
+                    started_at=datetime.now(timezone.utc),
+                )
+                create_training_run_db.add(training_run)
+                create_training_run_db.commit()
+                create_training_run_db.refresh(training_run)
+                training_run_id = training_run.id
+                _append_agent_sandbox_event(
+                    agent_run_id,
+                    f"Stage: Analyzing dataset (training run v{current_version + 1})",
+                )
+            except Exception:
+                create_training_run_db.rollback()
+                raise
+            finally:
+                create_training_run_db.close()
+
+            mutation_payload: Optional[Dict[str, Any]] = None
+            if current_iteration > 1:
+                print("MUTATION PATH")
+                source_training_run_id = (
+                    best_training_run_id or current_best_training_run_id
+                )
+                if source_training_run_id is not None:
+                    mutation_db = SessionLocal()
+                    try:
+                        previous_best_model = (
+                            mutation_db.query(ModelVersion)
+                            .filter(
+                                ModelVersion.training_run_id == source_training_run_id
+                            )
+                            .order_by(ModelVersion.rank_position.asc())
+                            .first()
+                        )
+                    finally:
+                        mutation_db.close()
+
+                    if previous_best_model is not None:
+                        previous_model_name = previous_best_model.model_name
+                        original_params = previous_best_model.hyperparameters
+                        if not isinstance(original_params, dict):
+                            original_params = {}
+
+                        safe_original_params = {}
+                        if previous_model_name in SAFE_HYPERPARAMETERS:
+                            safe_original_params = validate_hyperparameters(
+                                previous_model_name,
+                                original_params,
+                            )
+
+                        previous_best = {
+                            "model_name": previous_model_name,
+                            "rmse": previous_best_model.rmse,
+                            "mae": previous_best_model.mae,
+                            "r2": previous_best_model.r2,
+                            "hyperparameters": safe_original_params,
+                            "number_of_rows": project_num_rows,
+                            "number_of_features": project_num_features,
+                            "numeric_feature_count": project_num_numeric_features,
+                            "categorical_feature_count": project_num_categorical_features,
+                            "missing_value_count": project_missing_value_count,
+                            "target_variance": project_target_variance,
+                        }
+
+                        if (
+                            best_rmse is not None
+                            and previous_best_model.rmse is not None
+                        ):
+                            try:
+                                previous_best["improvement"] = float(best_rmse) - float(
+                                    previous_best_model.rmse
+                                )
+                            except (TypeError, ValueError):
+                                previous_best["improvement"] = 0.0
+                        else:
+                            previous_best["improvement"] = 0.0
+
+                        selected_model_name = previous_model_name
+                        selected_params = safe_original_params
+                        try:
+                            mutated = generate_mutated_hyperparameters(previous_best)
+
+                            mutated_model_name = mutated.get("model_name")
+                            mutated_params = mutated.get("hyperparameters")
+
+                            if (
+                                isinstance(mutated_model_name, str)
+                                and mutated_model_name in SAFE_HYPERPARAMETERS
+                                and isinstance(mutated_params, dict)
+                            ):
+                                validated_mutated_params = validate_hyperparameters(
+                                    mutated_model_name,
+                                    mutated_params,
+                                )
+
+                                if mutated_model_name == previous_model_name:
+                                    if validated_mutated_params:
+                                        selected_params = validated_mutated_params
+                                else:
+                                    selected_model_name = mutated_model_name
+                                    selected_params = validated_mutated_params
+
+                                improvement = 0.0
+                                if (
+                                    best_rmse is not None
+                                    and previous_best_model.rmse is not None
+                                ):
+                                    try:
+                                        improvement = float(best_rmse) - float(
+                                            previous_best_model.rmse
+                                        )
+                                    except (TypeError, ValueError):
+                                        improvement = 0.0
+
+                                unchanged_params = (
+                                    validated_mutated_params == safe_original_params
+                                )
+                                empty_or_unchanged = (
+                                    not validated_mutated_params
+                                ) or unchanged_params
+
+                                if not refinement_attempted:
+                                    if (
+                                        current_iteration > 1
+                                        and improvement <= 0
+                                        and mutated_model_name == previous_model_name
+                                        and empty_or_unchanged
+                                    ):
+                                        if previous_model_name in {
+                                            "LinearRegression",
+                                            "Ridge",
+                                        }:
+                                            selected_model_name = (
+                                                "RandomForestRegressor"
+                                            )
+                                        elif (
+                                            previous_model_name
+                                            == "RandomForestRegressor"
+                                        ):
+                                            selected_model_name = "XGBRegressor"
+                                        elif previous_model_name == "XGBRegressor":
+                                            selected_model_name = (
+                                                "RandomForestRegressor"
+                                            )
+                                        else:
+                                            selected_model_name = (
+                                                "RandomForestRegressor"
+                                            )
+                                        selected_params = {}
+                                        print(
+                                            "DETERMINISTIC OVERRIDE: Forcing model switch due to stagnation."
+                                        )
+                        except Exception:
+                            selected_model_name = previous_model_name
+                            selected_params = safe_original_params
+
+                        mutation_payload = {
+                            "model_name": selected_model_name,
+                            "hyperparameters": selected_params,
+                        }
+
+                        print("=" * 80)
+                        print(f"ITERATION {current_iteration}")
+                        print("SELECTED MODEL:", selected_model_name)
+                        print("SELECTED PARAMS:", selected_params)
+                        print("=" * 80)
+
+            else:
+                print("BASELINE TRAINING PATH")
+
+            try:
+                print("MUTATION PAYLOAD:", mutation_payload)
+                generated_model_family: Optional[str] = None
+                current_iter_preprocessing_code: Optional[str] = None
+                current_iter_training_code: Optional[str] = None
+                model_line: Optional[str] = (
+                    None  # Set by orchestrator when model is system-injected
+                )
+                sandbox_rmse_cv: Optional[float] = None
+                sandbox_rmse_holdout: Optional[float] = None
+                if execution_mode == "sandbox":
+                    _update_training_run_stage(training_run_id, "preprocessing", 20)
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        "Stage: Preprocessing - building performance context",
+                    )
+                    performance_context = _build_performance_context(
+                        current_iteration=current_iteration,
+                        mutation_payload=mutation_payload,
+                        rmse_history=rmse_history,
+                        best_rmse=best_rmse,
+                        last_rmse=last_rmse,
+                        improvement_delta=improvement_delta,
+                        stagnation_count=no_improvement_counter,
+                        previous_failure_types=previous_failure_types,
+                        previous_model_family=previous_model_family,
+                        previous_strategy=(
+                            strategy_history[-1] if strategy_history else None
+                        ),
+                        model_history=model_history,
+                        exploration_mode=False,
+                    )
+                    strategy_reasoning = _generate_strategy_reasoning(
+                        performance_context
+                    )
+                    print(f"SANDBOX STRATEGY: {strategy_reasoning}")
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"Strategy: {strategy_reasoning[:100]}{'...' if len(strategy_reasoning) > 100 else ''}",
+                    )
+                    strategy_history.append(strategy_reasoning)
+                    strategy_history = strategy_history[-20:]
+
+                    per_model_results: List[Dict[str, Any]] = []
+                    best_model_payload: Optional[Dict[str, Any]] = None
+                    best_model_metrics: Optional[Dict[str, Optional[float]]] = None
+
+                    # Phase 1: Generate and validate all model scripts
+                    print(
+                        f"PARALLEL EXECUTION: Generating scripts for all {len(model_families)} models..."
+                    )
+
+                    # Track models being trained for UI
+                    AGENT_SANDBOX_EVENT_LOGS.setdefault(str(agent_run_id), [])
+                    AGENT_MODELS_IN_PROGRESS[str(agent_run_id)] = [
+                        {
+                            "name": model,
+                            "status": "pending",
+                            "rmse": None,
+                            "r2": None,
+                            "mae": None,
+                            "job_id": None,
+                            "error": None,
+                        }
+                        for model in model_families
+                    ]
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"Initialized parallel sandbox execution for {len(model_families)} models.",
+                    )
+
+                    model_scripts_data = []
+
+                    for model_family in model_families:
+                        previous_model_preprocessing = (
+                            per_model_previous_preprocessing.get(model_family)
+                        )
+                        previous_model_training = per_model_previous_training.get(
+                            model_family
+                        )
+                        model_specific_best = per_model_best_rmse.get(model_family)
+                        model_line = _get_model_instantiation_line(model_family)
+
+                        # --- Telemetry record for this model+iteration ---
+                        telemetry = ArchitectTelemetry(
+                            model_family=model_family,
+                            iteration=current_iteration,
+                        )
+
+                        # ============================================================
+                        #  TWO-STAGE PIPELINE: Prompt Architect → Script Generator
+                        # ============================================================
+                        if ENABLE_PROMPT_ARCHITECT:
+                            # ── Stage 1: Architect Agent produces blueprint ──
+                            error_ctx = per_model_last_error.get(
+                                model_family, ErrorContext(error_type="none")
+                            )
+                            prev_bp = per_model_previous_blueprint.get(model_family)
+
+                            arch_sys, arch_user = build_architect_prompt(
+                                model_family=model_family,
+                                iteration=current_iteration,
+                                strategy_reasoning=strategy_reasoning,
+                                dataset_metadata=performance_context.get("dataset", {}),
+                                dataset_profile_summary=performance_context.get(
+                                    "dataset_profile_summary"
+                                ),
+                                previous_rmse=model_specific_best,
+                                best_rmse=best_rmse,
+                                stagnation_count=no_improvement_counter,
+                                error_context=error_ctx,
+                                previous_blueprint=prev_bp,
+                            )
+
+                            architect_raw = _call_autonomous_llm_text(
+                                system_prompt=arch_sys,
+                                user_prompt=arch_user,
+                                temperature=0.25,
+                                max_tokens=800,
+                                failure_log_prefix=f"ARCHITECT FALLBACK ({model_family})",
+                            )
+
+                            bp_ok, blueprint, bp_errors = parse_architect_response(
+                                architect_raw, model_family
+                            )
+
+                            if bp_ok and blueprint is not None:
+                                blueprint.architect_raw = architect_raw
+                                telemetry.architect_success = True
+                                print(f"ARCHITECT: Blueprint OK for {model_family}")
+                                _append_agent_sandbox_event(
+                                    agent_run_id,
+                                    f"Architect: Blueprint generated for {model_family}",
+                                )
+                            else:
+                                print(
+                                    f"ARCHITECT: Blueprint FAILED for {model_family}: {bp_errors}. "
+                                    "Using deterministic fallback."
+                                )
+                                blueprint = deterministic_blueprint(model_family)
+                                telemetry.architect_success = False
+                                telemetry.reason_code = "architect_parse_fail"
+                                _append_agent_sandbox_event(
+                                    agent_run_id,
+                                    f"Architect: Fallback blueprint for {model_family}",
+                                )
+
+                            per_model_previous_blueprint[model_family] = blueprint
+
+                            # ── Stage 2: Generator Agent writes code from blueprint ──
+                            generator_prompt = blueprint_to_generator_prompt(
+                                blueprint, project_target_column
+                            )
+                            generator_prompt += _build_training_pressure_directive(
+                                no_improvement_counter,
+                                improvement_delta,
+                                previous_model_training,
+                            )
+
+                            raw_sections = _generate_autonomous_section_via_llm(
+                                generator_prompt
+                            )
+
+                        else:
+                            # ── Legacy single-stage path (feature flag off) ──
+                            # Build previous iteration context for this specific model
+                            previous_iteration_context = ""
+                            if previous_model_preprocessing or previous_model_training:
+                                previous_iteration_context = (
+                                    f"\n=== PREVIOUS ITERATION FOR {model_family} ===\n"
+                                    f"Previous RMSE: {model_specific_best if model_specific_best else 'N/A'}\n"
+                                    f"\nPrevious Preprocessing Code:\n"
+                                    f"{previous_model_preprocessing or '# No previous preprocessing'}\n"
+                                    f"\nPrevious Training Code:\n"
+                                    f"{previous_model_training or '# No previous training'}\n"
+                                    f"\nWhat worked: {json.dumps(performance_context.get('successful_patterns', []), default=str)}\n"
+                                    f"What failed: {json.dumps(performance_context.get('failed_patterns', []), default=str)}\n"
+                                    f"==========================================\n"
+                                )
+
+                            model_prompt = (
+                                f"You are an autonomous ML optimization expert for {model_family}.\n\n"
+                                "YOUR TASK: Generate unique, model-specific code to maximize performance.\n\n"
+                                "Generate TWO sections using these exact markers:\n"
+                                "AUTONOMOUS_PREPROCESSING_SECTION\n"
+                                "AUTONOMOUS_TRAINING_SECTION\n\n"
+                                f"=== CURRENT SITUATION ===\n"
+                                f"Model Family: {model_family}\n"
+                                f"Iteration: {current_iteration}\n"
+                                f"Your Best RMSE So Far: {model_specific_best if model_specific_best else 'Not trained yet'}\n"
+                                f"Global Best RMSE (all models): {best_rmse}\n"
+                                f"Last Iteration RMSE: {last_rmse}\n"
+                                f"Stagnation Count: {no_improvement_counter}\n"
+                                f"Strategy Needed: {strategy_reasoning}\n\n"
+                                f"=== DATASET INFORMATION ===\n"
+                                f"Dataset Metadata: {json.dumps(performance_context.get('dataset', {}), default=str)}\n"
+                                f"Dataset Profile: {performance_context.get('dataset_profile_summary')}\n\n"
+                                f"{previous_iteration_context}\n"
+                                f"=== YOUR CREATIVE FREEDOM ===\n"
+                                f"For {model_family}, you have FULL CONTROL to:\n"
+                                f"1. Define model instantiation with ANY hyperparameters you think will work best\n"
+                                f"2. Choose unique preprocessing strategies tailored to {model_family}'s strengths\n"
+                                f"3. Implement model-specific feature engineering\n"
+                                f"4. Use hyperparameter tuning (GridSearch/RandomSearch) if beneficial\n"
+                                f"5. Apply cross-validation strategies\n"
+                                f"6. Experiment with feature selection techniques\n"
+                                f"7. Try ensemble methods, stacking, or blending\n"
+                                f"8. Use domain knowledge about what works well for {model_family}\n\n"
+                                f"REQUIREMENTS:\n"
+                                f"- PREPROCESSING must define: X_train, X_test, y_train, y_test\n"
+                                f"- TRAINING must include: model instantiation, model.fit(), predictions = model.predict()\n"
+                                f"- Use {model_family} as the base model class (import from sklearn/xgboost)\n"
+                                f"- Be CREATIVE and DIFFERENT from other models - each model should have unique optimizations\n\n"
+                                f"CRITICAL OUTPUT RULES:\n"
+                                f"- Output ONLY executable Python code - NO natural language explanations\n"
+                                f"- NO markdown formatting (no ```, no language tags)\n"
+                                f"- NO instructional text like 'Use this' or 'Try that'\n"
+                                f"- NO bullet points or suggestions - only valid Python statements\n"
+                                f"- Every line must be valid Python syntax (code or comments starting with #)\n"
+                                f"- Comments MUST start with # symbol\n"
+                                f"- Write code AS IF you're writing a .py file that will be executed directly\n\n"
+                                f"MAKE YOUR CODE UNIQUE FOR {model_family} - Don't generate generic code!\n"
+                            )
+                            model_prompt += _build_training_pressure_directive(
+                                no_improvement_counter,
+                                improvement_delta,
+                                previous_model_training,
+                            )
+
+                            raw_sections = _generate_autonomous_section_via_llm(
+                                model_prompt
+                            )
+
+                        # ── Common post-processing (both paths) ──
+                        preprocessing_code, training_code = (
+                            _parse_sectioned_autonomous_output(raw_sections)
+                        )
+
+                        # Remove any natural language instructions from LLM output
+                        preprocessing_code = _remove_natural_language_from_code(
+                            preprocessing_code
+                        )
+                        training_code = _remove_natural_language_from_code(
+                            training_code
+                        )
+
+                        if (
+                            not preprocessing_code
+                            or "train_test_split" not in preprocessing_code
+                        ):
+                            preprocessing_code = _fallback_preprocessing_section([])
+
+                        training_code = _sanitize_training_section(
+                            training_code,
+                            disallow_model_redefinition=False,  # Allow LLM to define model with hyperparameters
+                        )
+
+                        needs_regen, regen_reason = _should_regenerate_training_section(
+                            previous_model_training,
+                            training_code,
+                            no_improvement_counter,
+                            improvement_delta,
+                        )
+                        if needs_regen:
+                            if ENABLE_PROMPT_ARCHITECT:
+                                stronger_prompt = (
+                                    generator_prompt
+                                    + "\nSTRICT REGENERATION DIRECTIVE: "
+                                    + regen_reason
+                                    + "\n"
+                                )
+                            else:
+                                stronger_prompt = (
+                                    model_prompt
+                                    + "\nSTRICT REGENERATION DIRECTIVE: "
+                                    + regen_reason
+                                    + "\n"
+                                )
+                            stronger_sections = _generate_autonomous_section_via_llm(
+                                stronger_prompt
+                            )
+                            _, stronger_training = _parse_sectioned_autonomous_output(
+                                stronger_sections
+                            )
+                            # Remove natural language from regenerated code
+                            stronger_training = _remove_natural_language_from_code(
+                                stronger_training
+                            )
+                            training_code = _sanitize_training_section(
+                                stronger_training,
+                                disallow_model_redefinition=False,  # Allow LLM to define model
+                            )
+
+                        if (
+                            not training_code
+                            or "model.fit" not in training_code
+                            or "predict" not in training_code
+                        ):
+                           
+                            training_code = _fallback_training_section_without_model(
+                                model_family
+                            )
+                            telemetry.fallback_used = True
+                            telemetry.reason_code = (
+                                telemetry.reason_code or "generator_output_invalid"
+                            )
+
+                        script_content = _build_exploration_script_template(
+                            preprocessing_code,
+                            project_target_column,
+                            "",  # No model injection - LLM generates it
+                            training_code,
+                        )
+
+                        # ── Single-model AST enforcement gate ──
+                        if ENABLE_PROMPT_ARCHITECT:
+                            sm_passed, sm_violations = enforce_single_model(
+                                script_content, model_family
+                            )
+                            if not sm_passed:
+                                print(
+                                    f"SINGLE-MODEL GATE: Rejected {model_family} script: "
+                                    f"{sm_violations}"
+                                )
+                                _append_agent_sandbox_event(
+                                    agent_run_id,
+                                    f"Single-model gate rejected {model_family}: {sm_violations[0][:80]}",
+                                )
+                                telemetry.reason_code = "multi_model_detected"
+                                # Re-generate with ultra-strict prompt
+                                strict_regen_prompt = (
+                                    f"Generate code for EXACTLY ONE model: {model_family}.\n"
+                                    f"Do NOT use any other model class.\n\n"
+                                    f"AUTONOMOUS_PREPROCESSING_SECTION\n"
+                                    f"AUTONOMOUS_TRAINING_SECTION\n\n"
+                                    f"model = {model_family}(...)\n"
+                                    f"model.fit(X_train, y_train)\n"
+                                    f"predictions = model.predict(X_test)\n"
+                                )
+                                regen_raw = _generate_autonomous_section_via_llm(
+                                    strict_regen_prompt
+                                )
+                                regen_pre, regen_train = (
+                                    _parse_sectioned_autonomous_output(regen_raw)
+                                )
+                                regen_pre = _remove_natural_language_from_code(
+                                    regen_pre
+                                )
+                                regen_train = _remove_natural_language_from_code(
+                                    regen_train
+                                )
+
+                                if regen_pre and "train_test_split" in regen_pre:
+                                    preprocessing_code = regen_pre
+                                regen_train = _sanitize_training_section(
+                                    regen_train, disallow_model_redefinition=False
+                                )
+                                if (
+                                    regen_train
+                                    and "model.fit" in regen_train
+                                    and "predict" in regen_train
+                                ):
+                                    training_code = regen_train
+                                else:
+                                    training_code = (
+                                        _fallback_training_section_without_model()
+                                    )
+                                    telemetry.fallback_used = True
+
+                                script_content = _build_exploration_script_template(
+                                    preprocessing_code,
+                                    project_target_column,
+                                    "",
+                                    training_code,
+                                )
+
+                        validation_result = _validate_script_contract(
+                            script_content=script_content,
+                            training_section=training_code,
+                            is_model_injected=False,  # LLM generates model in training section
+                            exploration_mode=False,
+                            exploitation_lock=False,
+                        )
+                        if not validation_result.is_valid:
+                            recovery_prompt = (
+                                f"Generate TWO sections only:\n"
+                                f"AUTONOMOUS_PREPROCESSING_SECTION\n"
+                                f"AUTONOMOUS_TRAINING_SECTION\n\n"
+                                f"For {model_family}, you must:\n"
+                                f"- Define model instantiation: model = {model_family}(...)\n"
+                                f"- Include model.fit(X_train, y_train)\n"
+                                f"- Include predictions = model.predict(X_test)\n"
+                                f"- No imports/prints/markdown\n"
+                            )
+                            script_content, training_code, used_fallback = (
+                                _validate_and_regenerate_script(
+                                    script_content=script_content,
+                                    training_section=training_code or "",
+                                    preprocessing_section=preprocessing_code,
+                                    target_column=project_target_column,
+                                    system_model_section="",  # No model injection
+                                    is_model_injected=False,  # LLM generates model
+                                    exploration_mode=False,
+                                    exploitation_lock=False,
+                                    original_prompt=recovery_prompt,
+                                )
+                            )
+                            if used_fallback:
+                                telemetry.fallback_used = True
+                                telemetry.reason_code = (
+                                    telemetry.reason_code or "validator_fail"
+                                )
+                        else:
+                            telemetry.generator_success = True
+                            telemetry.validator_pass = True
+
+                        # Record telemetry
+                        per_model_telemetry[model_family].append(telemetry)
+
+                        # ── Final compile gate: catch any residual SyntaxErrors ──
+                        try:
+                            compile(script_content, "<string>", "exec")
+                        except SyntaxError as _syntax_err:
+                            print(
+                                f"COMPILE GATE: SyntaxError in {model_family} script "
+                                f"(line {_syntax_err.lineno}): {_syntax_err.msg} — using safe fallback"
+                            )
+                            _append_agent_sandbox_event(
+                                agent_run_id,
+                                f"Compile gate: SyntaxError in {model_family} script — using safe fallback",
+                            )
+                            # Rebuild from deterministic fallback blueprint
+                            _safe_bp = deterministic_blueprint(model_family)
+                            _safe_gen_prompt = blueprint_to_generator_prompt(
+                                _safe_bp, project_target_column
+                            )
+                            _safe_raw = _generate_autonomous_section_via_llm(
+                                _safe_gen_prompt
+                            )
+                            _safe_pre, _safe_train = _parse_sectioned_autonomous_output(
+                                _safe_raw
+                            )
+                            _safe_pre = _remove_natural_language_from_code(
+                                _safe_pre
+                            ) or _fallback_preprocessing_section([])
+                            _safe_train = _remove_natural_language_from_code(
+                                _safe_train
+                            )
+                            _safe_train = _sanitize_training_section(
+                                _safe_train, disallow_model_redefinition=False
+                            )
+                            if not _safe_train or "model.fit" not in _safe_train:
+                                _safe_train = _fallback_training_section_without_model()
+                            script_content = _build_exploration_script_template(
+                                _safe_pre, project_target_column, "", _safe_train
+                            )
+                            preprocessing_code = _safe_pre
+                            training_code = _safe_train
+                            telemetry.fallback_used = True
+                            telemetry.reason_code = (
+                                telemetry.reason_code or "syntax_error_fallback"
+                            )
+
+                        model_scripts_data.append(
+                            {
+                                "model_family": model_family,
+                                "script_content": script_content,
+                                "preprocessing_code": preprocessing_code,
+                                "training_code": training_code,
+                            }
+                        )
+                        print(
+                            f"PARALLEL EXECUTION: Script validated for {model_family}"
+                        )
+                        if ENABLE_PROMPT_ARCHITECT:
+                            telem_msg = (
+                                f"Telemetry [{model_family}]: "
+                                f"architect={'OK' if telemetry.architect_success else 'FAIL'} | "
+                                f"generator={'OK' if telemetry.generator_success else 'FAIL'} | "
+                                f"validator={'PASS' if telemetry.validator_pass else 'FAIL'}"
+                            )
+                            if telemetry.fallback_used:
+                                telem_msg += (
+                                    f" | fallback=YES ({telemetry.reason_code})"
+                                )
+                            print(telem_msg)
+                            _append_agent_sandbox_event(agent_run_id, telem_msg)
+
+                    # Phase 2: Create all sandbox jobs at once
+                    _update_training_run_stage(training_run_id, "training_models", 40)
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"Stage: Training models - executing {len(model_scripts_data)} sandbox jobs",
+                    )
+                    print(
+                        f"PARALLEL EXECUTION: Creating {len(model_scripts_data)} sandbox jobs..."
+                    )
+                    job_ids = []
+                    model_names_by_job_id: Dict[uuid.UUID, str] = {}
+                    for idx, script_data in enumerate(model_scripts_data):
+                        print("=" * 100)
+                        print(f"MODEL FAMILY: {script_data['model_family']}")
+                        print("=" * 100)
+                        print("PREPROCESSING CODE:")
+                        print(script_data["preprocessing_code"])
+                        print("=" * 100)
+                        print("TRAINING CODE:")
+                        print(script_data["training_code"])
+                        print("=" * 100)
+                        job_id = _create_sandbox_job(
+                            script_data["script_content"], current_iteration
+                        )
+                        job_ids.append(job_id)
+                        model_names_by_job_id[job_id] = script_data["model_family"]
+                        print(
+                            f"PARALLEL EXECUTION: Created job {job_id} for {script_data['model_family']}"
+                        )
+                        _append_agent_sandbox_event(
+                            agent_run_id,
+                            f"Sandbox job created: {script_data['model_family']} ({job_id})",
+                        )
+
+                        # Update model status to training
+                        _set_agent_model_status(
+                            agent_run_id,
+                            script_data["model_family"],
+                            "queued",
+                            job_id=job_id,
+                        )
+
+                    # Phase 3: Poll all jobs in parallel
+                    print(
+                        f"PARALLEL EXECUTION: Polling {len(job_ids)} jobs in parallel..."
+                    )
+                    metrics_payloads = _poll_sandbox_jobs_parallel(
+                        job_ids, model_names_by_job_id
+                    )
+                    print(
+                        f"PARALLEL EXECUTION: All {len(metrics_payloads)} jobs reached terminal state"
+                    )
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"All {len(metrics_payloads)} sandbox jobs reached terminal state.",
+                    )
+
+                    # Phase 4: Process results
+                    _update_training_run_stage(training_run_id, "evaluating_models", 70)
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        "Stage: Evaluating models - processing results",
+                    )
+                    for idx, script_data in enumerate(model_scripts_data):
+                        model_family = script_data["model_family"]
+                        preprocessing_code = script_data["preprocessing_code"]
+                        training_code = script_data["training_code"]
+                        metrics_payload = metrics_payloads[idx]
+                        model_rmse = metrics_payload.get("rmse")
+
+                        # Update model status to completed
+                        if model_rmse is not None:
+                            _set_agent_model_status(
+                                agent_run_id,
+                                model_family,
+                                "completed",
+                                rmse=model_rmse,
+                                r2=metrics_payload.get("r2"),
+                                mae=metrics_payload.get("mae"),
+                                job_id=job_ids[idx],
+                            )
+                            _append_agent_sandbox_event(
+                                agent_run_id,
+                                f"Model {model_family} completed with RMSE: {model_rmse:.6f}",
+                            )
+                        else:
+                            _append_agent_sandbox_event(
+                                agent_run_id,
+                                f"Model {model_family} finished (no RMSE returned)",
+                            )
+
+                        per_model_previous_preprocessing[model_family] = (
+                            preprocessing_code
+                        )
+                        per_model_previous_training[model_family] = training_code
+
+                        # Capture error context for Prompt Architect next iteration
+                        if ENABLE_PROMPT_ARCHITECT:
+                            _err_ctx = build_error_context(
+                                {
+                                    "status": metrics_payload.get(
+                                        "_sandbox_status", "completed"
+                                    ),
+                                    "error_log": metrics_payload.get("_error_message"),
+                                }
+                            )
+                            per_model_last_error[model_family] = _err_ctx
+                            if _err_ctx.error_type != "none":
+                                _err_log_msg = (
+                                    f"Error context captured for {model_family}: "
+                                    f"type={_err_ctx.error_type} stage={_err_ctx.stage} "
+                                    f"— Architect will adapt next iteration"
+                                )
+                                print(f"ARCHITECT ERROR CONTEXT: {_err_log_msg}")
+                                _append_agent_sandbox_event(agent_run_id, _err_log_msg)
+
+                        if model_rmse is not None:
+                            prior_best_for_model = per_model_best_rmse.get(model_family)
+                            if (
+                                prior_best_for_model is None
+                                or model_rmse < prior_best_for_model
+                            ):
+                                per_model_best_rmse[model_family] = model_rmse
+
+                        model_result_payload = {
+                            "name": model_family,
+                            "rmse": model_rmse,
+                            "mae": metrics_payload.get("mae"),
+                            "r2": metrics_payload.get("r2"),
+                            "accuracy": metrics_payload.get("r2"),
+                            "hyperparameters": None,
+                        }
+                        per_model_results.append(model_result_payload)
+
+                        if model_rmse is not None and (
+                            best_model_payload is None
+                            or best_model_payload.get("rmse") is None
+                            or model_rmse < float(best_model_payload.get("rmse"))
+                        ):
+                            best_model_payload = dict(model_result_payload)
+                            best_model_metrics = metrics_payload
+                            generated_model_family = model_family
+                            current_iter_preprocessing_code = preprocessing_code
+                            current_iter_training_code = training_code
+
+                    if not per_model_results:
+                        raise RuntimeError(
+                            "No model scripts executed in sandbox iteration"
+                        )
+
+                    if best_model_payload is None:
+                        sorted_results = sorted(
+                            per_model_results,
+                            key=lambda item: (
+                                item.get("rmse") is None,
+                                (
+                                    item.get("rmse")
+                                    if item.get("rmse") is not None
+                                    else float("inf")
+                                ),
+                            ),
+                        )
+                        best_model_payload = dict(sorted_results[0])
+                        generated_model_family = best_model_payload.get("name")
+
+                    if current_iter_preprocessing_code:
+                        current_preprocessing_tokens = (
+                            _extract_preprocessing_tokens_from_code(
+                                current_iter_preprocessing_code
+                            )
+                        )
+                        preprocessing_history.append(current_preprocessing_tokens)
+                        preprocessing_history = preprocessing_history[-20:]
+
+                    if best_model_metrics is not None:
+                        sandbox_rmse_cv = best_model_metrics.get("rmse_cv")
+                        sandbox_rmse_holdout = best_model_metrics.get("rmse_holdout")
+
+                    training_output = {
+                        "best_model": best_model_payload,
+                        "all_models": per_model_results,
+                    }
+
+                    # Clear models in progress for this agent after iteration completes
+                    if str(agent_run_id) in AGENT_MODELS_IN_PROGRESS:
+                        del AGENT_MODELS_IN_PROGRESS[str(agent_run_id)]
+                else:
+                    if mutation_payload is None:
+                        training_output = _execute_start_training_with_progress(
+                            None,
+                            project_file_id,
+                            project_target_column,
+                        )
+                    else:
+                        try:
+                            training_output = _execute_start_training_with_progress(
+                                None,
+                                project_file_id,
+                                project_target_column,
+                                hyperparameter_overrides=mutation_payload,
+                            )
+                        except TypeError:
+                            training_output = _execute_start_training_with_progress(
+                                None,
+                                project_file_id,
+                                project_target_column,
+                            )
+
+                best_model = training_output.get("best_model", {})
+                current_model_family = generated_model_family or best_model.get("name")
+                if isinstance(current_model_family, str) and current_model_family:
+                    if (
+                        previous_model_family
+                        and previous_model_family != current_model_family
+                    ):
+                        model_family_changed_once = True
+                        print(
+                            f"MODEL FAMILY CHANGED: {previous_model_family} -> {current_model_family}"
+                        )
+                    previous_model_family = current_model_family
+                    model_history.append(current_model_family)
+                    model_history = model_history[-20:]
+                current_rmse = best_model.get("rmse")
+                print(
+                    f"ITERATION {current_iteration} RESULT → Model: {best_model.get('name')}, RMSE: {best_model.get('rmse')}"
+                )
+
+                all_models = training_output.get("all_models")
+                if not isinstance(all_models, list):
+                    all_models = training_output.get("models", [])
+
+                normalized_models: List[Dict[str, Any]] = []
+                for model_data in all_models:
+                    if not isinstance(model_data, dict):
+                        continue
+
+                    model_name = model_data.get("name") or model_data.get("model_name")
+                    if not model_name:
+                        continue
+
+                    rmse_value = model_data.get("rmse")
+                    mae_value = model_data.get("mae")
+                    r2_value = model_data.get("r2")
+                    hyperparameters = model_data.get("hyperparameters")
+
+                    try:
+                        rmse_value = (
+                            float(rmse_value) if rmse_value is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        rmse_value = None
+
+                    try:
+                        mae_value = float(mae_value) if mae_value is not None else None
+                    except (TypeError, ValueError):
+                        mae_value = None
+
+                    try:
+                        r2_value = float(r2_value) if r2_value is not None else None
+                    except (TypeError, ValueError):
+                        r2_value = None
+
+                    if hyperparameters is not None and not isinstance(
+                        hyperparameters,
+                        (dict, list, str, int, float, bool),
+                    ):
+                        hyperparameters = None
+
+                    normalized_models.append(
+                        {
+                            "model_name": str(model_name),
+                            "rmse": rmse_value,
+                            "mae": mae_value,
+                            "r2": r2_value,
+                            "hyperparameters": hyperparameters,
+                        }
+                    )
+
+                ranked_models = sorted(
+                    normalized_models,
+                    key=lambda item: (
+                        item.get("rmse") is None,
+                        (
+                            item.get("rmse")
+                            if item.get("rmse") is not None
+                            else float("inf")
+                        ),
+                    ),
+                )
+
+                write_success_db = SessionLocal()
+                try:
+                    _update_training_run_stage(training_run_id, "ranking_models", 90)
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        f"Stage: Ranking models - selecting best from {len(ranked_models)} candidates",
+                    )
+                    run_to_update = (
+                        write_success_db.query(TrainingRun)
+                        .filter(TrainingRun.id == training_run_id)
+                        .first()
+                    )
+                    if run_to_update is None:
+                        raise RuntimeError("Training run not found for update")
+
+                    run_to_update.status = "completed"
+                    run_to_update.stage = "completed"
+                    run_to_update.progress = 100
+                    run_to_update.error_message = None
+                    run_to_update.best_model_name = best_model.get("name")
+                    run_to_update.rmse = best_model.get("rmse")
+                    run_to_update.mae = best_model.get("mae")
+                    run_to_update.r2 = best_model.get("r2")
+                    run_to_update.completed_at = datetime.now(timezone.utc)
+
+                    for rank_position, model_data in enumerate(ranked_models, start=1):
+                        write_success_db.add(
+                            ModelVersion(
+                                training_run_id=training_run_id,
+                                model_name=model_data["model_name"],
+                                rmse=model_data["rmse"],
+                                mae=model_data["mae"],
+                                r2=model_data["r2"],
+                                hyperparameters=model_data["hyperparameters"],
+                                rank_position=rank_position,
+                            )
+                        )
+
+                    write_success_db.commit()
+                except Exception:
+                    write_success_db.rollback()
+                    raise
+                finally:
+                    write_success_db.close()
+
+                # ── Phase E: Insert experiment memory record ──
+                if project_dataset_fingerprint and project_dataset_profile:
+                    mem_rmse_cv = (
+                        sandbox_rmse_cv if execution_mode == "sandbox" else None
+                    )
+                    mem_rmse_holdout = (
+                        sandbox_rmse_holdout if execution_mode == "sandbox" else None
+                    )
+                    if (
+                        mem_rmse_cv is None
+                        and mem_rmse_holdout is None
+                        and current_rmse is not None
+                    ):
+                        mem_rmse_holdout = current_rmse
+                    mem_preprocess_tokens = _extract_preprocessing_tokens_from_code(
+                        current_iter_preprocessing_code or ""
+                    )
+                    mem_training_tokens = _extract_preprocessing_tokens_from_code(
+                        current_iter_training_code or ""
+                    )
+                    # Use more specific training token extraction
+                    mem_training_tokens_real = []
+                    if current_iter_training_code:
+                        for tok_name, tok_pat in [
+                            ("cv", "cross_val_score"),
+                            ("grid_search", "GridSearchCV"),
+                            ("random_search", "RandomizedSearchCV"),
+                            ("early_stopping", "early_stopping"),
+                            ("regularization", "alpha="),
+                            ("fit", "model.fit("),
+                        ]:
+                            if tok_pat in (current_iter_training_code or ""):
+                                mem_training_tokens_real.append(tok_name)
+                    mem_strategy = strategy_history[-1] if strategy_history else None
+                    mem_db = SessionLocal()
+                    try:
+                        _insert_experiment_memory(
+                            db=mem_db,
+                            dataset_fingerprint=project_dataset_fingerprint,
+                            dataset_profile=project_dataset_profile,
+                            model_family=generated_model_family
+                            or previous_model_family,
+                            preprocessing_tokens=mem_preprocess_tokens,
+                            training_tokens=mem_training_tokens_real,
+                            strategy_summary=mem_strategy,
+                            rmse_cv=mem_rmse_cv,
+                            rmse_holdout=mem_rmse_holdout,
+                            project_id=project_id,
+                            agent_run_id=agent_run_id,
+                            iteration_number=current_iteration,
+                        )
+                    finally:
+                        mem_db.close()
+
+            except Exception as training_exc:
+                lower_exc = str(training_exc).lower()
+                failure_type = "training_failed"
+                if "timeout" in lower_exc:
+                    failure_type = "timeout"
+                elif "json" in lower_exc:
+                    failure_type = "invalid_json"
+                elif "sandbox" in lower_exc:
+                    failure_type = "sandbox_failed"
+
+                infrastructure_failure = execution_mode == "sandbox" and (
+                    "sandbox worker appears offline" in lower_exc
+                    or "never started" in lower_exc
+                )
+
+                previous_failure_types.append(failure_type)
+                previous_failure_types = previous_failure_types[-10:]
+
+                write_failure_db = SessionLocal()
+                try:
+                    failed_run = (
+                        write_failure_db.query(TrainingRun)
+                        .filter(TrainingRun.id == training_run_id)
+                        .first()
+                    )
+                    if failed_run is not None:
+                        failed_run.status = "failed"
+                        failed_run.stage = "failed"
+                        failed_run.error_message = str(training_exc)
+                        failed_run.completed_at = datetime.now(timezone.utc)
+                        write_failure_db.commit()
+                except Exception:
+                    write_failure_db.rollback()
+                finally:
+                    write_failure_db.close()
+
+                _append_agent_sandbox_event(
+                    agent_run_id,
+                    f"Iteration {current_iteration} failed: {training_exc}",
+                )
+                if str(agent_run_id) in AGENT_MODELS_IN_PROGRESS:
+                    for model_state in AGENT_MODELS_IN_PROGRESS[str(agent_run_id)]:
+                        if model_state.get("status") not in {"completed", "failed"}:
+                            model_state["status"] = "failed"
+                            model_state["error"] = str(training_exc)
+
+                if infrastructure_failure:
+                    raise RuntimeError(str(training_exc))
+                continue
+
+            if current_rmse is None:
+                previous_failure_types.append("no_valid_rmse")
+                previous_failure_types = previous_failure_types[-10:]
+                print(
+                    f"ITERATION {current_iteration}: No valid RMSE produced; continuing to next iteration."
+                )
+                continue
+
+            try:
+                current_rmse = float(current_rmse)
+            except (TypeError, ValueError):
+                current_rmse = None
+
+            if current_rmse is None:
+                previous_failure_types.append("invalid_rmse")
+                previous_failure_types = previous_failure_types[-10:]
+                print(
+                    f"ITERATION {current_iteration}: Invalid RMSE value; continuing to next iteration."
+                )
+                continue
+
+            rmse_history.append(current_rmse)
+            rmse_history = rmse_history[-20:]
+            improvement_delta = (
+                None if last_rmse is None else (last_rmse - current_rmse)
+            )
+            last_rmse = current_rmse
+            _append_agent_sandbox_event(
+                agent_run_id,
+                f"Iteration {current_iteration} RMSE: {current_rmse:.6f}"
+                + (
+                    f" (delta: {improvement_delta:+.6f})"
+                    if improvement_delta is not None
+                    else ""
+                ),
+            )
+
+            if best_rmse is None:
+                best_rmse = current_rmse
+                best_training_run_id = training_run_id
+                _append_agent_sandbox_event(
+                    agent_run_id,
+                    f"New best RMSE: {current_rmse:.6f} (first iteration)",
+                )
+                if execution_mode == "sandbox" and current_iter_preprocessing_code:
+                    previous_preprocessing_code = current_iter_preprocessing_code
+                    best_preprocessing_code = current_iter_preprocessing_code
+                continue
+
+            if current_rmse >= (best_rmse - 1e-9):
+                improvement = best_rmse - current_rmse
+                no_improvement_counter += 1
+            else:
+                improvement = best_rmse - current_rmse
+                no_improvement_counter = 0
+                best_rmse = current_rmse
+                best_training_run_id = training_run_id
+                _append_agent_sandbox_event(
+                    agent_run_id,
+                    f"New best RMSE: {current_rmse:.6f} (improved by {improvement:.6f})",
+                )
+                if execution_mode == "sandbox" and current_iter_preprocessing_code:
+                    best_preprocessing_code = current_iter_preprocessing_code
+                # Activate exploitation lock on new best
+                if execution_mode == "sandbox":
+                    lock_candidate = generated_model_family or exploitation_lock_model
+                    if lock_candidate:
+                        exploitation_lock_counter = EXPLOITATION_LOCK_N
+                        exploitation_lock_model = lock_candidate
+                        print(
+                            f"EXPLOITATION LOCK ACTIVATED: model={exploitation_lock_model}, "
+                            f"iterations_locked={EXPLOITATION_LOCK_N}"
+                        )
+
+            if execution_mode == "sandbox" and current_iter_preprocessing_code:
+                previous_preprocessing_code = current_iter_preprocessing_code
+            if execution_mode == "sandbox" and current_iter_training_code:
+                previous_training_code = current_iter_training_code
+
+            if no_improvement_counter >= patience:
+                if not model_family_changed_once:
+                    print(
+                        "EARLY STOPPING SUPPRESSED: no model-family exploration has occurred yet."
+                    )
+                    continue
+
+                if not refinement_attempted:
+                    refinement_attempted = True
+
+                    if best_training_run_id is not None:
+                        refinement_db = SessionLocal()
+                        try:
+                            best_run_for_refinement = (
+                                refinement_db.query(TrainingRun)
+                                .filter(TrainingRun.id == best_training_run_id)
+                                .first()
+                            )
+                            if best_run_for_refinement is not None:
+                                print(
+                                    f"REFINEMENT TARGET MODEL: {best_run_for_refinement.best_model_name}"
+                                )
+                        finally:
+                            refinement_db.close()
+
+                    print(
+                        "REFINEMENT PHASE: Attempting fine-tuning of best model before stopping."
+                    )
+                    continue
+
+                print("EARLY STOPPING: Patience limit reached.")
+                break
+
+        finalize_db = SessionLocal()
+        try:
+            agent_run = (
+                finalize_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+            )
+            if agent_run is None:
+                return
+
+            agent_run.best_training_run_id = best_training_run_id
+            if not terminated_by_status:
+                if best_training_run_id is None:
+                    agent_run.status = "failed"
+                    agent_run.error_message = "No iteration produced a valid RMSE."
+                    _append_agent_sandbox_event(
+                        agent_run_id,
+                        "Training failed: No iteration produced a valid RMSE",
+                    )
+                else:
+                    agent_run.status = "completed"
+                    agent_run.error_message = None
+                    completion_msg = (
+                        f"Training completed successfully! Best RMSE: {best_rmse:.6f}"
+                        if best_rmse
+                        else "Training completed successfully!"
+                    )
+                    _append_agent_sandbox_event(agent_run_id, completion_msg)
+                agent_run.completed_at = datetime.now(timezone.utc)
+            finalize_db.commit()
+        except Exception:
+            finalize_db.rollback()
+            raise
+        finally:
+            finalize_db.close()
+
+    except Exception as exc:
+        failure_db = SessionLocal()
+        try:
+            agent_run = (
+                failure_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+            )
+            if agent_run is not None:
+                agent_run.status = "failed"
+                agent_run.error_message = str(exc)
+                agent_run.completed_at = datetime.now(timezone.utc)
+                failure_db.commit()
+        except Exception:
+            failure_db.rollback()
+        finally:
+            failure_db.close()
+
+
+def train_regression_models(file_path: Path, target_column: str) -> Dict[str, Any]:
+    """
+    Train multiple regression models and evaluate their performance.
+
+    Args:
+        file_path: Path to the CSV file
+        target_column: Name of the target column
+
+    Returns:
+        Dictionary containing model results and best model
+    """
+    # Load dataset
+    df = pd.read_csv(file_path)
+    validate_dataset_limits(df)
+
+    # Validate target column exists
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in dataset.")
+
+    # Validate target is numeric
+    if not pd.api.types.is_numeric_dtype(df[target_column]):
+        raise ValueError("Target column must be numeric for regression.")
+
+    # Split features and target
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    # Handle categorical columns with one-hot encoding
+    X = pd.get_dummies(X, drop_first=True)
+
+    # Split into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    # Define models to train
+    models = {
+        "LinearRegression": LinearRegression(),
+        "Ridge": Ridge(),
+        "RandomForestRegressor": RandomForestRegressor(random_state=42),
+        "XGBRegressor": XGBRegressor(random_state=42, verbosity=0),
+    }
+
+    # Train and evaluate each model
+    results = []
+
+    for model_name, model in models.items():
+        # Train the model
+        model.fit(X_train, y_train)
+
+        # Make predictions
+        y_pred = model.predict(X_test)
+
+        # Calculate metrics
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        results.append(
+            {
+                "name": model_name,
+                "rmse": float(rmse),
+                "mae": float(mae),
+                "r2": float(r2),
+            }
+        )
+
+    # Sort by RMSE (ascending - lower is better)
+    results.sort(key=lambda x: x["rmse"])
+
+    # Best model is the first one after sorting
+    best_model = results[0]
+
+    return {"models": results, "best_model": best_model}
+
+
+def _execute_start_training_with_progress(
+    job_id: Optional[str],
+    file_id: str,
+    target_column: str,
+    lifecycle_update: Callable[[str, int], None] = None,
+    hyperparameter_overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Execute training/start logic with staged progress updates, timeout protection,
+    and training-history versioning.
+    """
+    file_path = UPLOAD_DIR / file_id
+
+    if lifecycle_update is not None:
+        lifecycle_update("analyzing_dataset", 10)
+    elif job_id is not None:
+        _update_job_status(
+            job_id, status="running", stage="analyzing_dataset", progress=10
+        )
+    _append_job_log(job_id, "Analyzing dataset")
+
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"File '{file_id}' not found. Please upload a CSV file first.",
+        )
+
+    df = pd.read_csv(file_path)
+    validate_dataset_limits(df)
+
+    # Backstop. run_agent_loop() calls this worker directly (lines ~4405,
+    # 4412, 4419) with no HTTP layer in front of it, so the guard has to live
+    # here as well as in /training/start. cv_folds is consumed by
+    # _train_and_evaluate() below.
+    readiness = assess_training_readiness(df)
+    if not readiness["ready"]:
+        raise HTTPException(status_code=400, detail=readiness["reason"])
+    cv_folds = readiness["n_folds"]
+
+    if lifecycle_update is not None:
+        lifecycle_update("preprocessing", 20)
+    elif job_id is not None:
+        _update_job_status(job_id, stage="preprocessing", progress=20)
+    _append_job_log(job_id, "Preprocessing dataset")
+
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in dataset.")
+
+    if not pd.api.types.is_numeric_dtype(df[target_column]):
+        raise ValueError("Target column must be numeric for regression.")
+
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+    X = pd.get_dummies(X, drop_first=True)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    def _build_model(model_name: str, params: Dict[str, Any]) -> Any:
+        if model_name == "LinearRegression":
+            return LinearRegression(**params)
+        if model_name == "Ridge":
+            return Ridge(**params)
+        if model_name == "Lasso":
+            return Lasso(**params)
+        if model_name == "ElasticNet":
+            return ElasticNet(**params)
+        if model_name == "RandomForestRegressor":
+            base_params = {"random_state": 42}
+            base_params.update(params)
+            return RandomForestRegressor(**base_params)
+        if model_name == "XGBRegressor":
+            base_params = {"random_state": 42, "verbosity": 0}
+            base_params.update(params)
+            return XGBRegressor(**base_params)
+        raise ValueError(f"Unsupported model '{model_name}'")
+
+    # Default mode: train all supported models.
+    # Directed mode: train only the requested model with provided hyperparameters.
+
+    directed_hyperparameters_by_model: Dict[str, Dict[str, Any]] = {}
+    models = {
+        "LinearRegression": _build_model("LinearRegression", {}),
+        "Ridge": _build_model("Ridge", {}),
+        "Lasso": _build_model("Lasso", {}),
+        "ElasticNet": _build_model("ElasticNet", {}),
+        "RandomForestRegressor": _build_model("RandomForestRegressor", {}),
+        "XGBRegressor": _build_model("XGBRegressor", {}),
+    }
+
+    if hyperparameter_overrides is not None:
+        if not isinstance(hyperparameter_overrides, dict):
+            raise ValueError("hyperparameter_overrides must be a dictionary")
+
+        directed_model_name = hyperparameter_overrides.get("model_name")
+        if not isinstance(directed_model_name, str) or not directed_model_name:
+            raise ValueError("hyperparameter_overrides.model_name is required")
+
+        if directed_model_name not in models:
+            raise ValueError(
+                f"hyperparameter_overrides.model_name '{directed_model_name}' "
+                f"is not a supported candidate model"
+            )
+
+        raw_hyperparameters = hyperparameter_overrides.get("hyperparameters", {})
+        if not isinstance(raw_hyperparameters, dict):
+            raw_hyperparameters = {}
+
+        validated_hyperparameters = validate_hyperparameters(
+            directed_model_name,
+            raw_hyperparameters,
+        )
+
+        directed_hyperparameters_by_model[directed_model_name] = validated_hyperparameters
+
+        models[directed_model_name] = _build_model(
+            directed_model_name,
+            validated_hyperparameters,
+        )
+
+    if lifecycle_update is not None:
+        lifecycle_update("training_models", 40)
+    elif job_id is not None:
+        _update_job_status(job_id, stage="training_models", progress=40)
+    _append_job_log(job_id, "Training candidate models")
+
+    def _train_and_evaluate() -> List[Dict[str, Any]]:
+        print("******** TRAIN FUNCTION CALLED ********")
+        from sklearn.model_selection import KFold
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.compose import ColumnTransformer
+        from sklearn.pipeline import Pipeline
+
+        metrics: List[Dict[str, Any]] = []
+        numeric_columns = X.select_dtypes(include=["number"]).columns
+        print("=" * 80)
+        print(f"X Shape: {X.shape}")
+        print(f"Y Shape: {y.shape}")
+        print(f"Numeric Columns: {list(numeric_columns)}")
+        print(f"Target Unique Values: {y.nunique()}")
+        print("=" * 80)
+
+        # One splitter for every model: identical folds, so the leaderboard
+        # compares models rather than fold luck. cv_folds comes from
+        # assess_training_readiness() in the enclosing function and is 5 for
+        # any dataset of 30+ rows - unchanged from the previous behaviour.
+        kfold = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+
+        for model_name, model_instance in models.items():
+            _append_job_log(job_id, f"Training model: {model_name}")
+
+            preprocessor = ColumnTransformer(
+                transformers=[("num", StandardScaler(), numeric_columns)],
+                remainder="passthrough",
+            )
+
+            model_pipeline = Pipeline(
+                [("preprocessor", preprocessor), ("model", model_instance)]
+            )
+            rmse_list: List[float] = []
+            mae_list: List[float] = []
+            r2_list: List[float] = []
+
+            for train_index, val_index in kfold.split(X, y):
+                X_train_fold = X.iloc[train_index]
+                X_val_fold = X.iloc[val_index]
+                y_train_fold = y.iloc[train_index]
+                y_val_fold = y.iloc[val_index]
+
+                model_pipeline.fit(X_train_fold, y_train_fold)
+                y_pred_fold = model_pipeline.predict(X_val_fold)
+
+                rmse_list.append(
+                    float(np.sqrt(mean_squared_error(y_val_fold, y_pred_fold)))
+                )
+                mae_list.append(float(mean_absolute_error(y_val_fold, y_pred_fold)))
+                r2_list.append(float(r2_score(y_val_fold, y_pred_fold)))
+
+            rmse = float(np.mean(rmse_list))
+            mae = float(np.mean(mae_list))
+            r2 = float(np.mean(r2_list))
+
+            print(
+                f"MODEL={model_name} | RMSE={rmse:.6f} | MAE={mae:.6f} | R2={r2:.6f}"
+            )
+
+            metrics.append(
+                {
+                    "name": model_name,
+                    "rmse": float(rmse),
+                    "mae": float(mae),
+                    "r2": float(r2),
+                    "hyperparameters": directed_hyperparameters_by_model.get(
+                        model_name
+                    ),
+                }
+            )
+            _append_job_log(job_id, f"Completed model: {model_name} | RMSE={rmse:.4f}")
+        return metrics
+
+    results = execute_training_with_timeout(_train_and_evaluate)
+
+    if lifecycle_update is not None:
+        lifecycle_update("evaluating_models", 70)
+    elif job_id is not None:
+        _update_job_status(job_id, stage="evaluating_models", progress=70)
+    _append_job_log(job_id, "Evaluating model metrics")
+
+    # Metrics are computed in the timed execution above; this stage marks evaluation completion.
+    if lifecycle_update is not None:
+        lifecycle_update("ranking_models", 90)
+    elif job_id is not None:
+        _update_job_status(job_id, stage="ranking_models", progress=90)
+    _append_job_log(job_id, "Ranking models and selecting best")
+
+    results.sort(key=lambda x: x["rmse"])
+    best_model = results[0]
+
+    if file_id not in TRAINING_HISTORY:
+        TRAINING_HISTORY[file_id] = []
+        version = 1
+    else:
+        version = len(TRAINING_HISTORY[file_id]) + 1
+
+    version_entry = {"version": version, "models": results, "best_model": best_model}
+    TRAINING_HISTORY[file_id].append(copy.deepcopy(version_entry))
+
+    return {
+        "version": version,
+        "models": results,
+        "best_model": best_model,
+        "dataset_rows": readiness["n_rows"],
+        "cv_folds": cv_folds,
+        "warnings": readiness["warnings"],
+    }
+
+
+@app.post("/upload-temp")
+async def upload_temp_file(
+    file: UploadFile = File(..., description="CSV file to upload for transformation"),
+    db: Session = Depends(get_db),
+):
+    """Upload a CSV file temporarily and create a minimal project record so
+    the transform workflow can reference it.  Returns the generated file_id."""
+    if not file.filename or not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413, detail="File too large. Max 20 MB allowed."
+        )
+
+    unique_filename = f"{uuid.uuid4()}.csv"
+    file_path = UPLOAD_DIR / unique_filename
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    try:
+        df = pd.read_csv(file_path)
+        validate_dataset_limits(df)
+    except HTTPException:
+        file_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {exc}")
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    categorical_cols = [c for c in df.columns if c not in numeric_cols]
+    target_col = df.columns[-1]
+
+    project = Project(
+        project_name=Path(file.filename).stem,
+        file_id=unique_filename,
+        target_column=str(target_col),
+        num_rows=len(df),
+        num_features=len(df.columns),
+        num_numeric_features=len(numeric_cols),
+        num_categorical_features=len(categorical_cols),
+        missing_value_count=int(df.isnull().sum().sum()),
+        target_variance=(
+            float(df[target_col].var()) if target_col in numeric_cols else 0.0
+        ),
+    )
+    db.add(project)
+    db.commit()
+
+    return {"file_id": unique_filename}
+
+
+# =============================================================================
+# AutoAI Builder - Database Connectivity (Step 2)
+#
+# HOW TO USE THIS FILE
+#
+#   1. Open  backend/main.py  in your editor.
+#   2. Press Ctrl+F and search for this exact text:
+#
+#          @app.post("/projects/create")
+#
+#   3. Click at the START of that line to put your cursor there.
+#   4. Copy EVERYTHING in this file from the line below marked
+#      "COPY FROM HERE" all the way to the bottom, and paste it.
+#   5. Save the file.
+#
+#   The import is included at the top of the block, so this is the ONLY
+#   place you need to paste. There is no second edit.
+#
+# =============================================================================
+
+
+# ============================ COPY FROM HERE =================================
+
+# ---------------------------------------------------------------------------
+# Database Connectivity - lets a user pull data from their own SQL Server or
+# PostgreSQL database instead of uploading a CSV.
+#
+# The design point: /datasource/extract saves the query result into uploads/
+# and returns a file_id in exactly the same format /projects/create does.
+# Because every downstream feature reads UPLOAD_DIR / file_id, training, the
+# agent, transform, results and downloads all work with no further changes.
+# ---------------------------------------------------------------------------
+
+from services.db_connector import (
+    DataSourceError,
+    build_connection_string,
+    extract_to_dataframe,
+    list_tables,
+    list_columns,
+    list_foreign_keys,
+    preview_to_dataframe,
+    test_connection as test_db_connection,
+)
+
+
+class DataSourceConnection(BaseModel):
+    """Connection details. Sent with every call and never stored on disk."""
+
+    db_type: str = Field(default="mssql", description="'mssql' or 'postgresql'")
+    host: str = Field(..., description="Server hostname or IP, e.g. localhost")
+    port: Optional[int] = Field(default=None, description="Defaults to 1433 / 5432")
+    database: str = Field(..., description="Database name")
+    username: Optional[str] = Field(default=None)
+    password: Optional[str] = Field(default=None)
+    trusted_connection: bool = Field(
+        default=False, description="SQL Server Windows Authentication"
+    )
+    odbc_driver: Optional[str] = Field(
+        default=None, description="Override the ODBC driver name if needed"
+    )
+
+
+class DataSourceQueryRequest(DataSourceConnection):
+    query: str = Field(..., description="A single SELECT statement")
+
+
+class DataSourceExtractRequest(DataSourceQueryRequest):
+    project_name: str = Field(..., description="Name for the new project")
+    target_column: Optional[str] = Field(
+        default=None, description="Column to predict. Defaults to the last column."
+    )
+
+
+def _connection_string_from(request: DataSourceConnection) -> str:
+    """Turn the request fields into a connection URL, or raise a 400."""
+    try:
+        return build_connection_string(
+            db_type=request.db_type,
+            host=request.host,
+            port=request.port,
+            database=request.database,
+            username=request.username,
+            password=request.password,
+            trusted_connection=request.trusted_connection,
+            odbc_driver=request.odbc_driver,
+        )
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _rows_as_json(df: pd.DataFrame, limit: int = 20) -> list:
+    """Convert sample rows to plain JSON, avoiding UUID/timestamp
+    serialization issues from pandas.to_json()."""
+
+    preview_df = df.head(limit).copy()
+
+    # Convert all values to strings so FastAPI can safely return them.
+    preview_df = preview_df.astype(str)
+
+    return preview_df.to_dict(orient="records")
+
+
+@app.post("/datasource/test")
+async def datasource_test(request: DataSourceConnection):
+    """Check that the database is reachable before the user types a query."""
+    connection_string = _connection_string_from(request)
+    try:
+        info = test_db_connection(connection_string)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"ok": True, "server_version": info["server_version"]}
+
+
+@app.post("/datasource/tables")
+async def datasource_tables(request: DataSourceConnection):
+    """List the tables and views the user can choose from."""
+    connection_string = _connection_string_from(request)
+    try:
+        tables = list_tables(connection_string)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"tables": tables, "count": len(tables)}
+
+
+@app.post("/datasource/preview")
+async def datasource_preview(request: DataSourceQueryRequest):
+    """Run the query and show the columns and a few rows. Saves nothing.
+
+    This is what lets the user pick a target column before committing, the same
+    way the CSV screen reads the file before asking for a target.
+    """
+    connection_string = _connection_string_from(request)
+    try:
+        df, has_more = preview_to_dataframe(connection_string, request.query)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+    return {
+        "preview_rows": len(df),
+        "has_more": has_more,
+        "columns": len(df.columns),
+        "column_names": [str(c) for c in df.columns],
+        "numeric_columns": [str(c) for c in numeric_cols],
+        "sample_rows": _rows_as_json(df, limit=len(df)),
+    }
+
+
+@app.post("/datasource/extract")
+async def datasource_extract(
+    request: DataSourceExtractRequest,
+    db: Session = Depends(get_db),
+):
+    """Run the query, save the result as a CSV in uploads/, and create a
+    Project - exactly as if the user had uploaded that CSV by hand.
+
+    Returns a file_id. Every existing feature (training, agent, transform,
+    results, downloads) then works with no further change.
+    """
+    connection_string = _connection_string_from(request)
+
+    # 1. Pull the data
+    try:
+        df = extract_to_dataframe(connection_string, request.query)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # 2. Apply the same row/column limits as an uploaded CSV
+    validate_dataset_limits(df)
+
+    # 3. Work out the target column
+    target_column = request.target_column or str(df.columns[-1])
+    if target_column not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Target column '{target_column}' is not in the query result. "
+                f"Available columns: {', '.join(map(str, df.columns))}"
+            ),
+        )
+
+    # Same rule the CSV path enforces today (regression only).
+    if not pd.api.types.is_numeric_dtype(df[target_column]):
+        raise HTTPException(
+            status_code=400,
+            detail="Currently only regression (numeric target) is supported.",
+        )
+
+    # 4. Save it into uploads/ under a generated file_id
+    unique_filename = f"{uuid.uuid4()}.csv"
+    file_path = UPLOAD_DIR / unique_filename
+    try:
+        df.to_csv(file_path, index=False)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Could not save the extracted data: {exc}"
+        )
+
+    # 5. Create the Project row, mirroring /projects/create
+    try:
+        numeric_features = df.drop(columns=[target_column]).select_dtypes(
+            include=["number"]
+        )
+        categorical_features = df.drop(columns=[target_column]).select_dtypes(
+            exclude=["number"]
+        )
+
+        dataset_profile = _build_dataset_profile(df, target_column)
+        dataset_profile_summary = _summarize_dataset_profile(dataset_profile)
+
+        new_project = Project(
+            project_name=request.project_name,
+            file_id=unique_filename,
+            target_column=target_column,
+            num_rows=len(df),
+            num_features=df.shape[1] - 1,
+            num_numeric_features=numeric_features.shape[1],
+            num_categorical_features=categorical_features.shape[1],
+            missing_value_count=int(df.isnull().sum().sum()),
+            target_variance=float(df[target_column].var()),
+        )
+        db.add(new_project)
+        db.commit()
+        db.refresh(new_project)
+
+        db.add(
+            DatasetProfile(
+                project_id=new_project.id,
+                profile_json=dataset_profile,
+            )
+        )
+    except Exception as e:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Database insert failed: {str(e)}")
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "project_id": str(new_project.id),
+            "project_name": request.project_name,
+            "file_id": unique_filename,
+            "target_column": target_column,
+            "rows": len(df),
+            "columns": len(df.columns),
+            "source": f"{request.db_type}://{request.host}/{request.database}",
+            "dataset_profile_summary": dataset_profile_summary,
+        },
+    )
+
+
+# ============================= END OF PASTE ==================================
+
+
+@app.post("/projects/create")
+async def create_project(
+    project_name: str = Form(..., description="Name of the project"),
+    target_column: str = Form(..., description="Target column for regression"),
+    file: UploadFile = File(..., description="CSV file to upload"),
+):
+    """
+    Create a new project by uploading a CSV file.
+
+    Validates that the target column exists and is numeric (regression only).
+    Returns project metadata including row/column counts and column names.
+    """
+    try:
+        # Validate file extension
+        if not file.filename.endswith(".csv"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only CSV files are supported. Please upload a .csv file.",
+            )
+
+        # Generate unique filename
+        file_extension = Path(file.filename).suffix
+        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        file_path = UPLOAD_DIR / unique_filename
+
+        # Save uploaded file
+        try:
+            contents = await file.read()
+
+            if len(contents) > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413, detail="File too large. Max 20MB allowed."
+                )
+
+            with open(file_path, "wb") as f:
+                f.write(contents)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
+        # Read and analyze CSV
+        try:
+            df = pd.read_csv(file_path)
+            validate_dataset_limits(df)
+            project_id = None
+
+            # Validate target column exists
+            if target_column not in df.columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Target column '{target_column}' not found in CSV. Available columns: {', '.join(df.columns.tolist())}",
+                )
+
+            # Validate target column is numeric (regression only)
+            if not pd.api.types.is_numeric_dtype(df[target_column]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Currently only regression (numeric target) is supported.",
+                )
+
+            num_rows = len(df)
+            num_features = df.shape[1] - 1
+            numeric_features = df.drop(columns=[target_column]).select_dtypes(
+                include=["number"]
+            )
+            categorical_features = df.drop(columns=[target_column]).select_dtypes(
+                exclude=["number"]
+            )
+            num_numeric_features = numeric_features.shape[1]
+            num_categorical_features = categorical_features.shape[1]
+            missing_value_count = int(df.isnull().sum().sum())
+            target_variance = float(df[target_column].var())
+            dataset_profile = _build_dataset_profile(df, target_column)
+            dataset_profile_summary = _summarize_dataset_profile(dataset_profile)
+
+            db = SessionLocal()
+            try:
+                new_project = Project(
+                    project_name=project_name,
+                    file_id=unique_filename,
+                    target_column=target_column,
+                    num_rows=num_rows,
+                    num_features=num_features,
+                    num_numeric_features=num_numeric_features,
+                    num_categorical_features=num_categorical_features,
+                    missing_value_count=missing_value_count,
+                    target_variance=target_variance,
+                )
+                db.add(new_project)
+                db.commit()
+                db.refresh(new_project)
+
+                profile_row = DatasetProfile(
+                    project_id=new_project.id,
+                    profile_json=dataset_profile,
+                )
+                db.add(profile_row)
+                db.commit()
+                project_id = str(new_project.id)
+            except Exception:
+                db.rollback()
+                if file_path.exists():
+                    os.remove(file_path)
+                raise HTTPException(status_code=500, detail="Database insert failed")
+            finally:
+                db.close()
+
+            response_data = {
+                "project_id": project_id,
+                "project_name": project_name,
+                "file_id": str(unique_filename),
+                "target_column": target_column,
+                "rows": len(df),
+                "columns": len(df.columns),
+                "dataset_profile_summary": dataset_profile_summary,
+            }
+            print(f"[DEBUG] /projects/create response: {response_data}")
+
+            return JSONResponse(status_code=201, content=response_data)
+
+        except HTTPException:
+            if file_path.exists():
+                os.remove(file_path)
+            raise
+        except pd.errors.EmptyDataError:
+            # Clean up the invalid file
+            if file_path.exists():
+                os.remove(file_path)
+            raise HTTPException(
+                status_code=400, detail="The uploaded CSV file is empty."
+            )
+        except pd.errors.ParserError as e:
+            # Clean up the invalid file
+            if file_path.exists():
+                os.remove(file_path)
+            raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
+        except Exception:
+            # Clean up on any other error
+            if file_path.exists():
+                os.remove(file_path)
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.post("/training/start")
+async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
+    """
+    Start training regression models on the uploaded dataset.
+
+    Trains models asynchronously and returns a job ID immediately.
+    """
+    try:
+        cleanup_old_jobs()
+
+        # Construct file path
+        file_path = UPLOAD_DIR / request.file_id
+
+        # Check if file exists
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"File '{request.file_id}' not found. Please upload a CSV file first.",
+            )
+
+        # Refuse a dataset too small to evaluate BEFORE queueing a job, so the
+        # user gets an immediate, readable 400 instead of a 200 followed by a
+        # failed background job they have to poll for.
+        try:
+            readiness_df = pd.read_csv(file_path)
+        except Exception:
+            # Unreadable file is not this check's problem - let the existing
+            # training path report it the way it always has.
+            readiness_df = None
+
+        if readiness_df is not None:
+            readiness = assess_training_readiness(readiness_df)
+            if not readiness["ready"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=readiness["reason"],
+                )
+
+        job_id = str(uuid.uuid4())
+        JOB_STATUS[job_id] = {
+            "status": "pending",
+            "stage": "pending",
+            "progress": 0,
+            "result": None,
+            "error": None,
+            "completed_at": None,
+            "logs": [],
+        }
+        _append_job_log(job_id, "Training job queued")
+
+        background_tasks.add_task(
+            run_training_job, job_id, request.file_id, request.target_column
+        )
+
+        return JSONResponse(
+            status_code=200, content={"job_id": job_id, "status": "started"}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.post("/agent/start")
+async def start_agent(request: AgentStartRequest, background_tasks: BackgroundTasks):
+    agent_run = None
+    try:
+        _ensure_sandbox_worker_running()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    db = SessionLocal()
+    try:
+        project = (
+            db.query(Project).filter(Project.id == str(request.project_id)).first()
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        agent_run = AgentRun(
+            project_id=request.project_id,
+            status="running",
+            current_iteration=0,
+            max_iterations=request.max_iterations,
+            improvement_threshold=request.improvement_threshold,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(agent_run)
+        db.commit()
+        db.refresh(agent_run)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    finally:
+        db.close()
+
+    background_tasks.add_task(
+        run_agent_loop,
+        agent_run.id,
+        request.llm_provider,
+        request.llm_model,
+    )
+
+    return JSONResponse(
+        status_code=201,
+        content={"agent_run_id": str(agent_run.id)},
+    )
+
+
+@app.post("/agent/start-by-file")
+async def start_agent_by_file(
+    request: AgentStartByFileRequest, background_tasks: BackgroundTasks
+):
+    """
+    Start autonomous agent loop using file_id (frontend-friendly bridge).
+    """
+    agent_run = None
+    try:
+        _ensure_sandbox_worker_running()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.file_id == request.file_id).first()
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found for file_id")
+
+        if request.target_column and project.target_column != request.target_column:
+            project.target_column = request.target_column
+            db.commit()
+
+        agent_run = AgentRun(
+            project_id=project.id,
+            status="running",
+            current_iteration=0,
+            max_iterations=request.max_iterations,
+            improvement_threshold=request.improvement_threshold,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(agent_run)
+        db.commit()
+        db.refresh(agent_run)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    finally:
+        db.close()
+
+    background_tasks.add_task(
+        run_agent_loop,
+        agent_run.id,
+        request.llm_provider,
+        request.llm_model,
+    )
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "job_id": str(agent_run.id),
+            "agent_run_id": str(agent_run.id),
+            "status": "started",
+        },
+    )
+
+
+@app.get("/agent/status/{agent_id}")
+def get_agent_status(agent_id: uuid.UUID, db: Session = Depends(get_db)):
+    agent_run = db.query(AgentRun).filter(AgentRun.id == agent_id).first()
+    if agent_run is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    best_model_name = None
+    best_rmse = None
+    stage = "pending"
+    progress = 0
+    logs: List[str] = []
+    error_message = agent_run.error_message
+
+    if agent_run.best_training_run_id is not None:
+        best_training_run = (
+            db.query(TrainingRun)
+            .filter(TrainingRun.id == agent_run.best_training_run_id)
+            .first()
+        )
+        if best_training_run is not None:
+            best_model_name = best_training_run.best_model_name
+            best_rmse = best_training_run.rmse
+
+    latest_run = (
+        db.query(TrainingRun)
+        .filter(TrainingRun.agent_run_id == agent_run.id)
+        .order_by(TrainingRun.version_number.desc(), TrainingRun.created_at.desc())
+        .first()
+    )
+    if latest_run is not None:
+        stage = latest_run.stage or stage
+        progress = int(latest_run.progress or 0)
+        if latest_run.error_message and not error_message:
+            error_message = latest_run.error_message
+
+    logs.append(
+        f"Agent iteration: {agent_run.current_iteration}/{agent_run.max_iterations}"
+    )
+    if stage:
+        logs.append(f"Current stage: {stage}")
+    if best_model_name:
+        logs.append(f"Best model so far: {best_model_name}")
+    if best_rmse is not None:
+        logs.append(f"Best RMSE: {best_rmse:.4f}")
+    sandbox_event_logs = AGENT_SANDBOX_EVENT_LOGS.get(str(agent_id), [])
+    if sandbox_event_logs:
+        logs.extend(sandbox_event_logs)
+
+    # Get models currently being trained in parallel
+    models_in_progress = AGENT_MODELS_IN_PROGRESS.get(str(agent_id), [])
+
+    if progress == 0:
+        if agent_run.max_iterations == 0:
+            progress = 0
+        else:
+            progress = int(
+                round((agent_run.current_iteration / agent_run.max_iterations) * 100)
+            )
+
+    if agent_run.max_iterations == 0:
+        progress_percent = 0.0
+    else:
+        progress_percent = round(
+            (agent_run.current_iteration / agent_run.max_iterations) * 100,
+            2,
+        )
+
+    if agent_run.status == "completed":
+        progress_percent = 100.0
+        progress = 100
+        stage = "completed"
+
+    status_value = "running"
+    if agent_run.status == "completed":
+        status_value = "completed"
+    elif agent_run.status in {"failed", "stopped"}:
+        status_value = "failed"
+
+    return {
+        "agent_id": str(agent_run.id),
+        "status": status_value,
+        "stage": stage,
+        "progress": progress,
+        "error": error_message,
+        "logs": logs,
+        "result": {
+            "best_model_name": best_model_name,
+            "best_rmse": best_rmse,
+        },
+        "completed_at": (
+            agent_run.completed_at.isoformat() if agent_run.completed_at else None
+        ),
+        "current_iteration": agent_run.current_iteration,
+        "max_iterations": agent_run.max_iterations,
+        "best_model_name": best_model_name,
+        "best_rmse": best_rmse,
+        "progress_percent": progress_percent,
+        "models_in_progress": models_in_progress,
+    }
+
+
+@app.post("/agent/stop/{agent_id}")
+def stop_agent(agent_id: uuid.UUID, db: Session = Depends(get_db)):
+    agent_run = db.query(AgentRun).filter(AgentRun.id == agent_id).first()
+    if agent_run is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if agent_run.status == "completed":
+        return {
+            "agent_id": str(agent_run.id),
+            "new_status": "completed",
+            "message": "Agent already completed",
+        }
+
+    if agent_run.status == "failed":
+        return {
+            "agent_id": str(agent_run.id),
+            "new_status": "failed",
+            "message": "Agent already failed",
+        }
+
+    if agent_run.status == "stopped":
+        return {
+            "agent_id": str(agent_run.id),
+            "new_status": "stopped",
+            "message": "Agent already stopped",
+        }
+
+    if agent_run.status == "running":
+        agent_run.status = "stopped"
+        agent_run.completed_at = datetime.now(timezone.utc)
+        db.commit()
+
+        return {
+            "agent_id": str(agent_run.id),
+            "new_status": "stopped",
+            "message": "Agent execution stopped successfully",
+        }
+
+    return {
+        "agent_id": str(agent_run.id),
+        "new_status": agent_run.status,
+        "message": f"Agent is in '{agent_run.status}' state",
+    }
+
+
+@app.get("/agent/history/{agent_id}")
+def get_agent_history(agent_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Fetch iteration history for an agent.
+    Returns all training runs for the agent's project, ordered by version_number.
+    """
+    agent_run = db.query(AgentRun).filter(AgentRun.id == agent_id).first()
+    if agent_run is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    training_runs = (
+        db.query(TrainingRun)
+        .filter(TrainingRun.project_id == agent_run.project_id)
+        .order_by(TrainingRun.version_number.asc())
+        .all()
+    )
+
+    iterations = []
+    for train_run in training_runs:
+        iterations.append(
+            {
+                "iteration": train_run.version_number,
+                "training_run_id": str(train_run.id),
+                "model_name": train_run.best_model_name,
+                "rmse": train_run.rmse,
+                "mae": train_run.mae,
+                "r2": train_run.r2,
+                "started_at": (
+                    train_run.started_at.isoformat() if train_run.started_at else None
+                ),
+                "completed_at": (
+                    train_run.completed_at.isoformat()
+                    if train_run.completed_at
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "agent_id": str(agent_run.id),
+        "iterations": iterations,
+    }
+
+
+def run_training_job(job_id: Optional[str], file_id: str, target_column: str) -> None:
+    """
+    Background job runner for training/start endpoint.
+    """
+    training_run_id = None
+    lifecycle_db = None
+
+    def _update_run_lifecycle(
+        stage: str = None,
+        progress: int = None,
+        status: str = None,
+        error_message: str = None,
+        completed: bool = False,
+    ) -> None:
+        if training_run_id is None or lifecycle_db is None:
+            return
+        try:
+            _update_job_status(
+                job_id,
+                status=status,
+                stage=stage,
+                progress=progress,
+                error=error_message,
+                completed_at=datetime.utcnow() if completed else None,
+            )
+
+            run = (
+                lifecycle_db.query(TrainingRun)
+                .filter(TrainingRun.id == training_run_id)
+                .first()
+            )
+            if run is not None:
+                if status is not None:
+                    run.status = status
+                if stage is not None:
+                    run.stage = stage
+                if progress is not None:
+                    run.progress = progress
+                if error_message is not None:
+                    run.error_message = error_message
+                if completed:
+                    run.completed_at = datetime.utcnow()
+                lifecycle_db.commit()
+        except Exception:
+            lifecycle_db.rollback()
+
+    try:
+        db = SessionLocal()
+        try:
+            project = db.query(Project).filter(Project.file_id == file_id).first()
+            if project is None:
+                return
+
+            current_version = (
+                db.query(func.coalesce(func.max(TrainingRun.version_number), 0))
+                .filter(TrainingRun.project_id == project.id)
+                .scalar()
+            )
+
+            training_run = TrainingRun(
+                project_id=project.id,
+                version_number=current_version + 1,
+                status="running",
+                stage="analyzing_dataset",
+                progress=10,
+                started_at=datetime.utcnow(),
+            )
+            db.add(training_run)
+            db.commit()
+            db.refresh(training_run)
+            training_run_id = training_run.id
+            lifecycle_db = SessionLocal()
+        except Exception:
+            db.rollback()
+            return
+        finally:
+            db.close()
+    except Exception:
+        return
+
+    _append_job_log(job_id, f"Training job started for file: {file_id}")
+
+    try:
+        training_output = _execute_start_training_with_progress(
+            job_id,
+            file_id,
+            target_column,
+            lifecycle_update=lambda stage, progress: _update_run_lifecycle(
+                stage=stage,
+                progress=progress,
+                status="running",
+            ),
+        )
+        safe_result = copy.deepcopy(training_output)
+        _update_job_status(
+            job_id,
+            status="completed",
+            stage="completed",
+            progress=100,
+            result=safe_result,
+            error=None,
+            completed_at=datetime.utcnow(),
+        )
+        _append_job_log(job_id, "Training completed successfully")
+
+        if training_run_id is not None:
+            db = SessionLocal()
+            try:
+                run = (
+                    db.query(TrainingRun)
+                    .filter(TrainingRun.id == training_run_id)
+                    .first()
+                )
+                if run is not None:
+                    best_model = safe_result.get("best_model", {})
+                    run.status = "completed"
+                    run.stage = "completed"
+                    run.progress = 100
+                    run.error_message = None
+                    run.best_model_name = best_model.get("name")
+                    run.rmse = best_model.get("rmse")
+                    run.mae = best_model.get("mae")
+                    run.r2 = best_model.get("r2")
+                    run.completed_at = datetime.utcnow()
+
+                    all_models = safe_result.get("all_models")
+                    if not isinstance(all_models, list):
+                        all_models = safe_result.get("models", [])
+
+                    normalized_models: List[Dict[str, Any]] = []
+                    for model_data in all_models:
+                        if not isinstance(model_data, dict):
+                            continue
+
+                        model_name = model_data.get("name") or model_data.get(
+                            "model_name"
+                        )
+                        if not model_name:
+                            continue
+
+                        rmse_value = model_data.get("rmse")
+                        mae_value = model_data.get("mae")
+                        r2_value = model_data.get("r2")
+                        hyperparameters = model_data.get("hyperparameters")
+
+                        try:
+                            rmse_value = (
+                                float(rmse_value) if rmse_value is not None else None
+                            )
+                        except (TypeError, ValueError):
+                            rmse_value = None
+
+                        try:
+                            mae_value = (
+                                float(mae_value) if mae_value is not None else None
+                            )
+                        except (TypeError, ValueError):
+                            mae_value = None
+
+                        try:
+                            r2_value = float(r2_value) if r2_value is not None else None
+                        except (TypeError, ValueError):
+                            r2_value = None
+
+                        if hyperparameters is not None and not isinstance(
+                            hyperparameters,
+                            (dict, list, str, int, float, bool),
+                        ):
+                            hyperparameters = None
+
+                        normalized_models.append(
+                            {
+                                "model_name": str(model_name),
+                                "rmse": rmse_value,
+                                "mae": mae_value,
+                                "r2": r2_value,
+                                "hyperparameters": hyperparameters,
+                            }
+                        )
+
+                    ranked_models = sorted(
+                        normalized_models,
+                        key=lambda item: (
+                            item.get("rmse") is None,
+                            (
+                                item.get("rmse")
+                                if item.get("rmse") is not None
+                                else float("inf")
+                            ),
+                        ),
+                    )
+
+                    for rank_position, model_data in enumerate(ranked_models, start=1):
+                        db.add(
+                            ModelVersion(
+                                training_run_id=training_run_id,
+                                model_name=model_data["model_name"],
+                                rmse=model_data["rmse"],
+                                mae=model_data["mae"],
+                                r2=model_data["r2"],
+                                hyperparameters=model_data["hyperparameters"],
+                                rank_position=rank_position,
+                            )
+                        )
+
+                    db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+    except HTTPException as e:
+        error_message = e.detail if isinstance(e.detail, str) else str(e.detail)
+        _update_run_lifecycle(
+            stage="failed",
+            status="failed",
+            error_message=error_message,
+            completed=True,
+        )
+        _append_job_log(job_id, f"Training failed: {error_message}")
+    except Exception as e:
+        _update_run_lifecycle(
+            stage="failed",
+            status="failed",
+            error_message=str(e),
+            completed=True,
+        )
+        _append_job_log(job_id, f"Training failed: {str(e)}")
+    finally:
+        if lifecycle_db is not None:
+            lifecycle_db.close()
+
+
+@app.get("/training/status/{job_id}")
+async def get_training_job_status(job_id: str):
+    """
+    Get asynchronous training job status/result.
+    """
+    cleanup_old_jobs()
+
+    if job_id not in JOB_STATUS:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    job = copy.deepcopy(JOB_STATUS[job_id])
+    completed_at = job.get("completed_at")
+    if isinstance(completed_at, datetime):
+        job["completed_at"] = completed_at.isoformat() + "Z"
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": job.get("status"),
+            "stage": job.get("stage"),
+            "progress": job.get("progress"),
+            "result": job.get("result"),
+            "error": job.get("error"),
+            "completed_at": job.get("completed_at"),
+            "logs": job.get("logs", []),
+        },
+    )
+
+
+@app.get("/training/history/{file_id}")
+async def get_training_history(file_id: str):
+    """
+    Get training history for a specific file.
+
+    Returns all training versions for the given file_id.
+    """
+    try:
+        db = SessionLocal()
+        version_to_training_run_id: Dict[int, str] = {}
+        version_to_generation_source: Dict[int, str] = {}
+        version_to_run_duration_seconds: Dict[int, float] = {}
+        training_runs: List[TrainingRun] = []
+        target_column: Optional[str] = None
+        try:
+            project = db.query(Project).filter(Project.file_id == file_id).first()
+            if project is not None:
+                target_column = project.target_column
+                training_runs = (
+                    db.query(TrainingRun)
+                    .filter(TrainingRun.project_id == project.id)
+                    .order_by(TrainingRun.version_number.asc())
+                    .all()
+                )
+                for run in training_runs:
+                    version_to_training_run_id[int(run.version_number)] = str(run.id)
+                    if run.started_at is not None and run.completed_at is not None:
+                        duration_seconds = (
+                            run.completed_at - run.started_at
+                        ).total_seconds()
+                        version_to_run_duration_seconds[int(run.version_number)] = max(
+                            0.0, float(duration_seconds)
+                        )
+                    else:
+                        version_to_run_duration_seconds[int(run.version_number)] = 0.0
+                    if run.agent_run_id is not None:
+                        version_to_generation_source[int(run.version_number)] = (
+                            "llm_generated"
+                        )
+                    elif (run.stage or "").lower() == "fine_tuned":
+                        version_to_generation_source[int(run.version_number)] = (
+                            "fine_tuned"
+                        )
+                    else:
+                        version_to_generation_source[int(run.version_number)] = (
+                            "standard"
+                        )
+        finally:
+            db.close()
+
+        versions_with_ids: List[Dict[str, Any]] = []
+
+
+        if (not training_runs) and file_id in TRAINING_HISTORY and len(TRAINING_HISTORY[file_id]) > 0:
+            for version_entry in TRAINING_HISTORY[file_id]:
+                if isinstance(version_entry, dict):
+                    version_number = int(version_entry.get("version", 0) or 0)
+                    enriched = copy.deepcopy(version_entry)
+                    enriched["training_run_id"] = version_to_training_run_id.get(
+                        version_number
+                    )
+                    run_duration_seconds = version_to_run_duration_seconds.get(
+                        version_number, 0.0
+                    )
+                    enriched["training_time_seconds"] = run_duration_seconds
+                    generated_by = version_to_generation_source.get(
+                        version_number, "standard"
+                    )
+                    enriched["generated_by"] = generated_by
+
+                    if isinstance(enriched.get("models"), list):
+                        model_count = max(1, len(enriched["models"]))
+                        per_model_time = run_duration_seconds / model_count
+                        next_models: List[Dict[str, Any]] = []
+                        for model_entry in enriched["models"]:
+                            if isinstance(model_entry, dict):
+                                model_copy = copy.deepcopy(model_entry)
+                                model_copy["generated_by"] = model_copy.get(
+                                    "generated_by", generated_by
+                                )
+                                model_copy["training_time_seconds"] = float(
+                                    model_copy.get(
+                                        "training_time_seconds", per_model_time
+                                    )
+                                )
+                                next_models.append(model_copy)
+                            else:
+                                next_models.append(model_entry)
+                        enriched["models"] = next_models
+
+                    versions_with_ids.append(enriched)
+                else:
+                    versions_with_ids.append(version_entry)
+        else:
+            if not training_runs:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No training history found for file '{file_id}'.",
+                )
+
+            db = SessionLocal()
+            try:
+                for run in training_runs:
+                    model_versions = (
+                        db.query(ModelVersion)
+                        .filter(ModelVersion.training_run_id == run.id)
+                        .order_by(
+                            ModelVersion.rank_position.asc(),
+                            ModelVersion.created_at.asc(),
+                        )
+                        .all()
+                    )
+
+                    run_duration_seconds = version_to_run_duration_seconds.get(
+                        int(run.version_number), 0.0
+                    )
+                    model_count = max(1, len(model_versions))
+                    per_model_time = run_duration_seconds / model_count
+
+                    models_payload: List[Dict[str, Any]] = []
+                    for mv in model_versions:
+                        models_payload.append(
+                            {
+                                "model_name": mv.model_name,
+                                "name": mv.model_name,
+                                "rmse": mv.rmse,
+                                "mae": mv.mae,
+                                "r2": mv.r2,
+                                "hyperparameters": mv.hyperparameters,
+                                "rank_position": mv.rank_position,
+                                "training_time_seconds": per_model_time,
+                                "generated_by": (
+                                    "llm_generated"
+                                    if run.agent_run_id is not None
+                                    else (
+                                        "fine_tuned"
+                                        if (run.stage or "").lower() == "fine_tuned"
+                                        else "standard"
+                                    )
+                                ),
+                            }
+                        )
+
+                    best_model_payload: Dict[str, Any] = {
+                        "name": run.best_model_name,
+                        "model_name": run.best_model_name,
+                        "rmse": run.rmse,
+                        "mae": run.mae,
+                        "r2": run.r2,
+                    }
+
+                    versions_with_ids.append(
+                        {
+                            "version": int(run.version_number),
+                            "models": models_payload,
+                            "training_time_seconds": run_duration_seconds,
+                            "best_model": best_model_payload,
+                            "training_run_id": str(run.id),
+                            "generated_by": (
+                                "llm_generated"
+                                if run.agent_run_id is not None
+                                else (
+                                    "fine_tuned"
+                                    if (run.stage or "").lower() == "fine_tuned"
+                                    else "standard"
+                                )
+                            ),
+                        }
+                    )
+            finally:
+                db.close()
+
+        # Return history
+        response = {
+            "file_id": file_id,
+            "target_column": target_column,
+            "versions": versions_with_ids,
+        }
+
+        return JSONResponse(status_code=200, content=response)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.get("/training/report/{file_id}")
+async def get_training_report(file_id: str):
+    """
+    Build an experiment report for the latest autonomous agent run on a dataset.
+    """
+    try:
+        db = SessionLocal()
+        try:
+            project = db.query(Project).filter(Project.file_id == file_id).first()
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+            latest_agent_run = (
+                db.query(AgentRun)
+                .filter(AgentRun.project_id == project.id)
+                .order_by(AgentRun.started_at.desc(), AgentRun.created_at.desc())
+                .first()
+            )
+            if latest_agent_run is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No autonomous experiment report found for file '{file_id}'.",
+                )
+
+            training_runs = (
+                db.query(TrainingRun)
+                .filter(TrainingRun.agent_run_id == latest_agent_run.id)
+                .order_by(
+                    TrainingRun.version_number.asc(), TrainingRun.created_at.asc()
+                )
+                .all()
+            )
+            if not training_runs:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No autonomous training iterations found for file '{file_id}'.",
+                )
+
+            experiment_memory_rows = (
+                db.query(ExperimentMemory)
+                .filter(ExperimentMemory.project_id == project.id)
+                .filter(ExperimentMemory.agent_run_id == latest_agent_run.id)
+                .order_by(
+                    ExperimentMemory.iteration_number.asc(),
+                    ExperimentMemory.created_at.asc(),
+                )
+                .all()
+            )
+
+            training_run_ids = [run.id for run in training_runs]
+            model_versions = (
+                db.query(ModelVersion)
+                .filter(ModelVersion.training_run_id.in_(training_run_ids))
+                .order_by(
+                    ModelVersion.training_run_id.asc(),
+                    ModelVersion.rank_position.asc(),
+                    ModelVersion.created_at.asc(),
+                )
+                .all()
+                if training_run_ids
+                else []
+            )
+        finally:
+            db.close()
+
+        memory_by_iteration: Dict[int, ExperimentMemory] = {}
+        for row in experiment_memory_rows:
+            iteration_number = int(row.iteration_number or 0)
+            if iteration_number > 0:
+                memory_by_iteration[iteration_number] = row
+
+        model_versions_by_run_id: Dict[str, List[ModelVersion]] = {}
+        for model_version in model_versions:
+            model_versions_by_run_id.setdefault(
+                str(model_version.training_run_id), []
+            ).append(model_version)
+
+        retained_logs = AGENT_SANDBOX_EVENT_LOGS.get(str(latest_agent_run.id), [])
+        log_index = _build_iteration_log_index(retained_logs)
+
+        iterations: List[Dict[str, Any]] = []
+        previous_rmse: Optional[float] = None
+        best_rmse_so_far: Optional[float] = None
+        first_completed_iteration: Optional[Dict[str, Any]] = None
+        best_iteration: Optional[Dict[str, Any]] = None
+
+        for run in training_runs:
+            iteration_number = int(run.version_number or 0)
+            memory_row = memory_by_iteration.get(iteration_number)
+            log_details = log_index.get(iteration_number, {})
+
+            rmse_value = _safe_float(run.rmse)
+            mae_value = _safe_float(run.mae)
+            r2_value = _safe_float(run.r2)
+            duration_seconds = None
+            if run.started_at is not None and run.completed_at is not None:
+                duration_seconds = max(
+                    0.0, float((run.completed_at - run.started_at).total_seconds())
+                )
+
+            delta_from_previous = None
+            if previous_rmse is not None and rmse_value is not None:
+                delta_from_previous = previous_rmse - rmse_value
+
+            delta_from_best = None
+            if best_rmse_so_far is not None and rmse_value is not None:
+                delta_from_best = best_rmse_so_far - rmse_value
+
+            strategy_summary = None
+            if memory_row is not None and memory_row.strategy_summary:
+                strategy_summary = memory_row.strategy_summary.strip()
+            elif isinstance(log_details.get("strategy_summary"), str):
+                strategy_summary = str(log_details.get("strategy_summary")).strip()
+
+            candidate_models: List[Dict[str, Any]] = []
+            for model_version in model_versions_by_run_id.get(str(run.id), []):
+                candidate_models.append(
+                    {
+                        "model_name": model_version.model_name,
+                        "rank_position": model_version.rank_position,
+                        "rmse": _safe_float(model_version.rmse),
+                        "mae": _safe_float(model_version.mae),
+                        "r2": _safe_float(model_version.r2),
+                        "hyperparameters": (
+                            model_version.hyperparameters
+                            if isinstance(model_version.hyperparameters, dict)
+                            else None
+                        ),
+                    }
+                )
+
+            is_new_best = bool(
+                rmse_value is not None
+                and (best_rmse_so_far is None or rmse_value < best_rmse_so_far)
+            )
+
+            iteration_payload: Dict[str, Any] = {
+                "iteration": iteration_number,
+                "training_run_id": str(run.id),
+                "status": run.status,
+                "model_name": run.best_model_name,
+                "rmse": rmse_value,
+                "mae": mae_value,
+                "r2": r2_value,
+                "duration_seconds": duration_seconds,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "completed_at": (
+                    run.completed_at.isoformat() if run.completed_at else None
+                ),
+                "delta_from_previous_rmse": delta_from_previous,
+                "delta_from_best_rmse": delta_from_best,
+                "is_new_best": is_new_best,
+                "strategy_summary": strategy_summary,
+                "candidate_models": candidate_models,
+                "preprocessing_tokens": _parse_token_list(
+                    memory_row.preprocessing_tokens if memory_row else None
+                ),
+                "training_tokens": _parse_token_list(
+                    memory_row.training_tokens if memory_row else None
+                ),
+                "agent_signals": {
+                    "architect_blueprints": int(
+                        log_details.get("architect_blueprints", 0) or 0
+                    ),
+                    "architect_fallbacks": int(
+                        log_details.get("architect_fallbacks", 0) or 0
+                    ),
+                    "single_model_gate_rejections": int(
+                        log_details.get("single_model_gate_rejections", 0) or 0
+                    ),
+                    "compile_fallbacks": int(
+                        log_details.get("compile_fallbacks", 0) or 0
+                    ),
+                    "telemetry_events": int(
+                        log_details.get("telemetry_events", 0) or 0
+                    ),
+                },
+                "log_excerpt": list(log_details.get("log_excerpt", [])),
+            }
+            iterations.append(iteration_payload)
+
+            if run.status == "completed" and rmse_value is not None:
+                previous_rmse = rmse_value
+                if first_completed_iteration is None:
+                    first_completed_iteration = iteration_payload
+                if best_rmse_so_far is None or rmse_value < best_rmse_so_far:
+                    best_rmse_so_far = rmse_value
+                    best_iteration = iteration_payload
+
+        baseline_rmse = (
+            first_completed_iteration.get("rmse") if first_completed_iteration else None
+        )
+        best_rmse = best_iteration.get("rmse") if best_iteration else None
+        baseline_r2 = (
+            first_completed_iteration.get("r2") if first_completed_iteration else None
+        )
+        best_r2 = best_iteration.get("r2") if best_iteration else None
+
+        rmse_reduction = None
+        rmse_reduction_percent = None
+        if baseline_rmse is not None and best_rmse is not None:
+            rmse_reduction = baseline_rmse - best_rmse
+            if abs(baseline_rmse) > 1e-12:
+                rmse_reduction_percent = (rmse_reduction / baseline_rmse) * 100.0
+
+        r2_gain = None
+        if baseline_r2 is not None and best_r2 is not None:
+            r2_gain = best_r2 - baseline_r2
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "file_id": file_id,
+                "project_id": str(project.id),
+                "project_name": project.project_name,
+                "target_column": project.target_column,
+                "agent_run_id": str(latest_agent_run.id),
+                "agent_status": latest_agent_run.status,
+                "started_at": (
+                    latest_agent_run.started_at.isoformat()
+                    if latest_agent_run.started_at
+                    else None
+                ),
+                "completed_at": (
+                    latest_agent_run.completed_at.isoformat()
+                    if latest_agent_run.completed_at
+                    else None
+                ),
+                "summary": {
+                    "iterations_completed": len(iterations),
+                    "max_iterations": latest_agent_run.max_iterations,
+                    "baseline_iteration": first_completed_iteration,
+                    "best_iteration": best_iteration,
+                    "rmse_reduction": rmse_reduction,
+                    "rmse_reduction_percent": rmse_reduction_percent,
+                    "r2_gain": r2_gain,
+                    "best_model_name": (
+                        best_iteration.get("model_name") if best_iteration else None
+                    ),
+                },
+                "iterations": iterations,
+                "strategy_themes": _build_strategy_theme_summary(iterations),
+                "log_retention": {
+                    "available": str(latest_agent_run.id) in AGENT_SANDBOX_EVENT_LOGS,
+                    "captured_lines": len(retained_logs),
+                },
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to build experiment report: {exc}"
+        )
+
+
+def _build_training_code(
+    training_run: TrainingRun, model_versions: List[ModelVersion]
+) -> str:
+    model_blocks: List[str] = []
+    for mv in model_versions:
+        model_name = mv.model_name
+        params = mv.hyperparameters if isinstance(mv.hyperparameters, dict) else {}
+        model_blocks.append(
+            f'    {{"model_name": "{model_name}", "hyperparameters": {json.dumps(params)} }}'
+        )
+
+    models_literal = "[\n" + ",\n".join(model_blocks) + "\n]" if model_blocks else "[]"
+
+    return f"""import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+import numpy as np
+
+# Generated from training_run_id: {training_run.id}
+# Version: {training_run.version_number}
+
+DATA_PATH = "YOUR_DATASET.csv"
+TARGET_COLUMN = "YOUR_TARGET_COLUMN"
+
+MODEL_CONFIGS = {models_literal}
+
+
+def build_model(model_name: str, hyperparameters: dict):
+    if model_name == "LinearRegression":
+        return LinearRegression(**hyperparameters)
+    if model_name == "Ridge":
+        return Ridge(**hyperparameters)
+    if model_name == "Lasso":
+        return Lasso(**hyperparameters)
+    if model_name == "ElasticNet":
+        return ElasticNet(**hyperparameters)
+    if model_name == "RandomForestRegressor":
+        base_params = {{"random_state": 42}}
+        base_params.update(hyperparameters)
+        return RandomForestRegressor(**base_params)
+    if model_name == "XGBRegressor":
+        base_params = {{"random_state": 42, "verbosity": 0}}
+        base_params.update(hyperparameters)
+        return XGBRegressor(**base_params)
+    raise ValueError(f"Unsupported model: {{model_name}}")
+
+
+def run_training():
+    df = pd.read_csv(DATA_PATH)
+    X = pd.get_dummies(df.drop(columns=[TARGET_COLUMN]), drop_first=True)
+    y = df[TARGET_COLUMN]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    summary = []
+    for cfg in MODEL_CONFIGS:
+        model = build_model(cfg["model_name"], cfg.get("hyperparameters", {{}}))
+        model.fit(X_train, y_train)
+        preds = model.predict(X_test)
+
+        rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+        mae = float(mean_absolute_error(y_test, preds))
+        r2 = float(r2_score(y_test, preds))
+        summary.append({{
+            "model_name": cfg["model_name"],
+            "rmse": rmse,
+            "mae": mae,
+            "r2": r2,
+        }})
+
+    summary.sort(key=lambda x: x["rmse"])
+    return summary
+
+
+if __name__ == "__main__":
+    output = run_training()
+    print(output)
+"""
+
+
+@app.get("/models/download/{training_run_id}")
+def download_model_artifact(
+    training_run_id: uuid.UUID, model_name: Optional[str] = None
+):
+    db = SessionLocal()
+    try:
+        training_run = (
+            db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+        )
+        if training_run is None:
+            raise HTTPException(status_code=404, detail="Training run not found")
+
+        source_training_run = training_run
+        query = db.query(ModelVersion).filter(
+            ModelVersion.training_run_id == training_run_id
+        )
+        if model_name:
+            query = query.filter(ModelVersion.model_name == model_name)
+
+        model_versions = query.order_by(ModelVersion.rank_position.asc()).all()
+        if model_name and not model_versions:
+            # The UI can display models aggregated across project versions.
+            # Fall back to the latest run in the same project that contains the requested model.
+            fallback_row = (
+                db.query(ModelVersion, TrainingRun)
+                .join(TrainingRun, ModelVersion.training_run_id == TrainingRun.id)
+                .filter(
+                    TrainingRun.project_id == training_run.project_id,
+                    ModelVersion.model_name == model_name,
+                )
+                .order_by(
+                    TrainingRun.version_number.desc(), TrainingRun.created_at.desc()
+                )
+                .first()
+            )
+            if fallback_row is not None:
+                fallback_model_version, fallback_training_run = fallback_row
+                model_versions = [fallback_model_version]
+                source_training_run = fallback_training_run
+
+        if not model_versions:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No model artifacts found for model '{model_name}' in this project."
+                    if model_name
+                    else "No model artifacts found"
+                ),
+            )
+
+        project = (
+            db.query(Project)
+            .filter(Project.id == source_training_run.project_id)
+            .first()
+        )
+        if project is None:
+            raise HTTPException(
+                status_code=404, detail="Project not found for training run"
+            )
+
+        file_path = UPLOAD_DIR / project.file_id
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404, detail="Dataset file not found for training run"
+            )
+
+        df = pd.read_csv(file_path)
+        validate_dataset_limits(df)
+
+        target_column = project.target_column
+        if target_column not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Target column '{target_column}' not found in dataset",
+            )
+
+        X = pd.get_dummies(df.drop(columns=[target_column]), drop_first=True)
+        y = df[target_column]
+
+        def _build_model(model_name_local: str, params: Dict[str, Any]) -> Any:
+            safe_params = params if isinstance(params, dict) else {}
+            if model_name_local == "LinearRegression":
+                return LinearRegression(**safe_params)
+            if model_name_local == "Ridge":
+                return Ridge(**safe_params)
+            if model_name_local == "Lasso":
+                return Lasso(**safe_params)
+            if model_name_local == "ElasticNet":
+                return ElasticNet(**safe_params)
+            if model_name_local == "RandomForestRegressor":
+                base_params = {"random_state": 42}
+                base_params.update(safe_params)
+                return RandomForestRegressor(**base_params)
+            if model_name_local == "XGBRegressor":
+                base_params = {"random_state": 42, "verbosity": 0}
+                base_params.update(safe_params)
+                return XGBRegressor(**base_params)
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported model '{model_name_local}'"
+            )
+
+        def _build_pickle_payload(mv: ModelVersion, source_run: TrainingRun) -> bytes:
+            params = mv.hyperparameters if isinstance(mv.hyperparameters, dict) else {}
+            model = _build_model(mv.model_name, params)
+            model.fit(X, y)
+
+            artifact = {
+                "model": model,
+                "model_name": mv.model_name,
+                "hyperparameters": params,
+                "feature_columns": X.columns.tolist(),
+                "target_column": target_column,
+                "training_run_id": str(source_run.id),
+                "version_number": source_run.version_number,
+            }
+            return pickle.dumps(artifact)
+
+        if model_name:
+            selected_model = model_versions[0]
+            data = _build_pickle_payload(selected_model, source_training_run)
+            model_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", selected_model.model_name)
+            filename = f"model_artifact_{source_training_run.id}_{model_slug}.pkl"
+            return StreamingResponse(
+                io.BytesIO(data),
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as zf:
+            for mv in model_versions:
+                model_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", mv.model_name)
+                artifact_name = f"{model_slug}.pkl"
+                zf.writestr(
+                    artifact_name, _build_pickle_payload(mv, source_training_run)
+                )
+
+        zip_buffer.seek(0)
+        zip_filename = f"model_artifacts_{training_run_id}.zip"
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
+        )
+    finally:
+        db.close()
+
+
+def _synthesize_native_training_script(
+    target_column: str,
+    model_versions: list,
+    training_run_id: str,
+    file_id: Optional[str] = None,
+) -> str:
+    """Generate a runnable Python training script from native-mode ModelVersion records."""
+    import json as _json
+
+    model_entries = []
+    for mv in model_versions:
+        name = mv.model_name or "RandomForestRegressor"
+        hp = mv.hyperparameters or {}
+        if isinstance(hp, str):
+            try:
+                hp = _json.loads(hp)
+            except Exception:
+                hp = {}
+        model_entries.append((name, hp, mv.rmse, mv.mae, mv.r2, mv.rank_position))
+
+    # Build model instantiation lines
+    model_init_lines = []
+    for name, hp, *_ in model_entries:
+        if hp:
+            hp_str = ", ".join(f"{k}={repr(v)}" for k, v in hp.items())
+            model_init_lines.append(f'    ("{name}", {name}({hp_str})),')
+        else:
+            model_init_lines.append(f'    ("{name}", {name}()),')
+
+    models_block = (
+        "\n".join(model_init_lines)
+        if model_init_lines
+        else '    ("RandomForestRegressor", RandomForestRegressor()),'
+    )
+
+    dataset_comment = (
+        f"# Dataset file_id: {file_id}"
+        if file_id
+        else "# Replace DATA_PATH with the path to your CSV file."
+    )
+    data_path_line = (
+        f'DATA_PATH = "{file_id}"  # update this path'
+        if file_id
+        else 'DATA_PATH = "dataset.csv"  # update this path'
+    )
+
+    script = f'''\
+"""
+AutoAI Builder — Training Script
+Generated for training run: {training_run_id}
+Target column: {target_column}
+"""
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+{dataset_comment}
+{data_path_line}
+TARGET_COLUMN = {repr(target_column)}
+
+# Load data
+df = pd.read_csv(DATA_PATH)
+
+# --- Preprocessing ---
+X = df.drop(columns=[TARGET_COLUMN])
+y = df[TARGET_COLUMN]
+
+# One-hot encode categorical columns
+X = pd.get_dummies(X, drop_first=True)
+
+# Fill any remaining NaN values
+X = X.replace([float("inf"), float("-inf")], float("nan")).fillna(0.0)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# --- Models ---
+models = [
+{models_block}
+]
+
+# --- Training & Evaluation ---
+results = []
+for model_name, model in models:
+    try:
+        model.fit(X_train, y_train)
+        preds = model.predict(X_test)
+        rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+        mae = float(mean_absolute_error(y_test, preds))
+        r2 = float(r2_score(y_test, preds))
+        results.append({{"model": model_name, "rmse": rmse, "mae": mae, "r2": r2}})
+        print(f"{{model_name:35s}}  RMSE={{rmse:12.4f}}  MAE={{mae:12.4f}}  R2={{r2:.4f}}")
+    except Exception as exc:
+        print(f"{{model_name}} failed: {{exc}}")
+
+# --- Summary ---
+if results:
+    best = min(results, key=lambda x: x["rmse"])
+    print(f"\\nBest model: {{best[\'model\']}} (RMSE={{best[\'rmse\']:.4f}})")
+'''
+    return script
+
+
+@app.get("/models/code/{training_run_id}")
+def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = None):
+    db = SessionLocal()
+    try:
+        training_run = (
+            db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+        )
+        if training_run is None:
+            raise HTTPException(status_code=404, detail="Training run not found")
+
+        source_training_run = training_run
+        ordered_agent_run_ids: List[str] = []
+        sandbox_job = None
+
+        # If this training run has an agent_run_id, try to find sandbox code
+        if training_run.agent_run_id is not None:
+            # training_run.version_number is project-global, while SandboxJob.iteration_number
+            # is agent-local. Build the agent-local iteration index for this run.
+            agent_runs_for_project = (
+                db.query(TrainingRun.id)
+                .filter(TrainingRun.agent_run_id == training_run.agent_run_id)
+                .order_by(
+                    TrainingRun.version_number.asc(), TrainingRun.created_at.asc()
+                )
+                .all()
+            )
+            ordered_agent_run_ids = [str(row[0]) for row in agent_runs_for_project]
+            expected_iteration_number: Optional[int] = None
+            current_training_run_id = str(training_run.id)
+            if current_training_run_id in ordered_agent_run_ids:
+                expected_iteration_number = (
+                    ordered_agent_run_ids.index(current_training_run_id) + 1
+                )
+
+            if expected_iteration_number is not None:
+                sandbox_job = (
+                    db.query(SandboxJob)
+                    .filter(
+                        SandboxJob.agent_id == training_run.agent_run_id,
+                        SandboxJob.iteration_number == expected_iteration_number,
+                    )
+                    .order_by(SandboxJob.created_at.desc())
+                    .first()
+                )
+
+            # Fallback in case of legacy runs where agent_id linkage was not preserved.
+            if sandbox_job is None:
+                sandbox_job = (
+                    db.query(SandboxJob)
+                    .filter(
+                        SandboxJob.project_id == training_run.project_id,
+                        SandboxJob.iteration_number
+                        == (
+                            expected_iteration_number
+                            if expected_iteration_number is not None
+                            else training_run.version_number
+                        ),
+                    )
+                    .order_by(SandboxJob.created_at.desc())
+                    .first()
+                )
+
+            # Final fallback: latest sandbox job for this agent run.
+            if sandbox_job is None:
+                sandbox_job = (
+                    db.query(SandboxJob)
+                    .filter(SandboxJob.agent_id == training_run.agent_run_id)
+                    .order_by(SandboxJob.created_at.desc())
+                    .first()
+                )
+
+        if (
+            sandbox_job is not None
+            and isinstance(sandbox_job.script_content, str)
+            and sandbox_job.script_content.strip()
+        ):
+            llm_code = sandbox_job.script_content
+            model_slug = (
+                re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)
+                if model_name
+                else "all_models"
+            )
+            filename = f"training_code_{training_run_id}_{model_slug}.py"
+            return StreamingResponse(
+                io.BytesIO(llm_code.encode("utf-8")),
+                media_type="text/x-python",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        # No SandboxJob found (native execution mode) — synthesize a runnable script
+        # from the ModelVersion records persisted for this training run.
+        model_versions_query = db.query(ModelVersion).filter(
+            ModelVersion.training_run_id == training_run.id
+        )
+        # If a specific model is requested, filter to just that model
+        if model_name:
+            model_versions_query = model_versions_query.filter(
+                ModelVersion.model_name == model_name
+            )
+        model_versions = model_versions_query.order_by(
+            ModelVersion.rank_position.asc()
+        ).all()
+
+        # If this specific run has no models, collect from all runs in this agent session
+        # so the user always gets a script with the full model list.
+        if not model_versions:
+            all_run_ids = [uuid.UUID(rid) for rid in ordered_agent_run_ids]
+            fallback_query = db.query(ModelVersion).filter(
+                ModelVersion.training_run_id.in_(all_run_ids)
+            )
+            if model_name:
+                fallback_query = fallback_query.filter(
+                    ModelVersion.model_name == model_name
+                )
+            model_versions = fallback_query.order_by(ModelVersion.rmse.asc()).all()
+
+        # Secondary fallback: search across all project training runs for the requested model
+        if not model_versions and model_name and training_run.project_id:
+            project_fallback_row = (
+                db.query(ModelVersion, TrainingRun)
+                .join(TrainingRun, ModelVersion.training_run_id == TrainingRun.id)
+                .filter(
+                    TrainingRun.project_id == training_run.project_id,
+                    ModelVersion.model_name == model_name,
+                )
+                .order_by(
+                    TrainingRun.version_number.desc(), TrainingRun.created_at.desc()
+                )
+                .first()
+            )
+            if project_fallback_row is not None:
+                fallback_model_version, fallback_training_run = project_fallback_row
+                model_versions = [fallback_model_version]
+                source_training_run = fallback_training_run
+
+        if not model_versions:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No code data found for model '{model_name}' in this project."
+                    if model_name
+                    else "No model data found for this training run."
+                ),
+            )
+
+        # Fetch project for target_column / file_id (use source_training_run in case of fallback)
+        project = (
+            db.query(Project)
+            .filter(Project.id == source_training_run.project_id)
+            .first()
+        )
+        target_col = (
+            project.target_column if project and project.target_column else "target"
+        )
+        file_id_val = project.file_id if project else None
+
+        synthesized = _synthesize_native_training_script(
+            target_column=target_col,
+            model_versions=model_versions,
+            training_run_id=str(source_training_run.id),
+            file_id=file_id_val,
+        )
+        model_slug = (
+            re.sub(r"[^a-zA-Z0-9_-]", "_", model_name) if model_name else "all_models"
+        )
+        filename = f"training_code_{training_run_id}_{model_slug}.py"
+        return StreamingResponse(
+            io.BytesIO(synthesized.encode("utf-8")),
+            media_type="text/x-python",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    finally:
+        db.close()
+
+
+def _canonical_regression_model_name(model_name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]", "", str(model_name).lower())
+    if normalized in {"linearregression", "linear"}:
+        return "LinearRegression"
+    if normalized == "ridge":
+        return "Ridge"
+    if normalized == "lasso":
+        return "Lasso"
+    if normalized in {"elasticnet", "elastic"}:
+        return "ElasticNet"
+    if normalized in {"randomforestregressor", "randomforest", "rf"}:
+        return "RandomForestRegressor"
+    if normalized in {"xgbregressor", "xgboost", "xgb"}:
+        return "XGBRegressor"
+    raise ValueError(f"Unknown model type: {model_name}")
+
+
+def _apply_prompt_hyperparameter_overrides(
+    model_name: str, prompt: Optional[str], params: Dict[str, Any]
+) -> Dict[str, Any]:
+    if not prompt:
+        return dict(params)
+
+    updated = dict(params)
+    prompt_text = prompt.lower()
+    speed_hint = any(
+        token in prompt_text for token in ["faster", "speed", "latency", "quick"]
+    )
+    regularization_hint = any(
+        token in prompt_text
+        for token in ["overfit", "regularization", "generalization", "stability"]
+    )
+    quality_hint = any(
+        token in prompt_text
+        for token in ["improve", "better", "accuracy", "performance", "quality"]
+    )
+
+    if model_name == "RandomForestRegressor":
+        if speed_hint:
+            updated["n_estimators"] = min(int(updated.get("n_estimators", 150)), 120)
+            updated["max_depth"] = min(int(updated.get("max_depth", 10)), 8)
+        if regularization_hint:
+            updated["min_samples_split"] = max(
+                int(updated.get("min_samples_split", 2)), 4
+            )
+            updated["min_samples_leaf"] = max(
+                int(updated.get("min_samples_leaf", 1)), 2
+            )
+        if quality_hint:
+            updated["n_estimators"] = max(int(updated.get("n_estimators", 150)), 220)
+
+    if model_name == "XGBRegressor":
+        if speed_hint:
+            updated["n_estimators"] = min(int(updated.get("n_estimators", 250)), 200)
+            updated["learning_rate"] = max(
+                float(updated.get("learning_rate", 0.05)), 0.08
+            )
+        if regularization_hint:
+            updated["max_depth"] = min(int(updated.get("max_depth", 6)), 5)
+            updated["subsample"] = min(float(updated.get("subsample", 1.0)), 0.85)
+        if quality_hint:
+            updated["n_estimators"] = max(int(updated.get("n_estimators", 250)), 300)
+
+    if model_name in {"Ridge", "Lasso", "ElasticNet"} and regularization_hint:
+        updated["alpha"] = max(float(updated.get("alpha", 1.0)), 1.0)
+    if model_name in {"Ridge", "Lasso", "ElasticNet"} and quality_hint:
+        updated["alpha"] = min(float(updated.get("alpha", 0.1)), 0.5)
+    if model_name in {"Lasso", "ElasticNet"}:
+        updated["max_iter"] = max(int(updated.get("max_iter", 5000)), 5000)
+
+    return updated
+
+
+def _derive_fine_tune_hyperparameters(
+    canonical_model_name: str,
+    llm_provider: str,
+    baseline_metrics: Dict[str, float],
+    prompt: Optional[str],
+) -> Dict[str, Any]:
+    llm_response = get_hyperparameter_suggestions(
+        canonical_model_name, baseline_metrics, llm_provider
+    )
+    suggested = (
+        llm_response.get("hyperparameters") if isinstance(llm_response, dict) else {}
+    )
+    if not isinstance(suggested, dict):
+        suggested = {}
+    prompt_adjusted = _apply_prompt_hyperparameter_overrides(
+        canonical_model_name, prompt, suggested
+    )
+    return validate_hyperparameters(canonical_model_name, prompt_adjusted)
+
+
+def _build_fine_tune_sandbox_script(
+    target_column: str, model_name: str, hyperparameters: Dict[str, Any]
+) -> str:
+    model_initializers = {
+        "LinearRegression": "LinearRegression()",
+        "Ridge": "Ridge(**HYPERPARAMETERS)",
+        "Lasso": "Lasso(**HYPERPARAMETERS)",
+        "ElasticNet": "ElasticNet(**HYPERPARAMETERS)",
+        "RandomForestRegressor": "RandomForestRegressor(random_state=42, **HYPERPARAMETERS)",
+        "XGBRegressor": "XGBRegressor(random_state=42, verbosity=0, **HYPERPARAMETERS)",
+    }
+    if model_name not in model_initializers:
+        raise ValueError(f"Unsupported model for fine-tune sandbox run: {model_name}")
+
+    return f"""import json
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+TARGET_COLUMN = {target_column!r}
+HYPERPARAMETERS = {repr(hyperparameters)}
+
+df = pd.read_csv("/app/dataset.csv")
+if TARGET_COLUMN not in df.columns:
+    raise ValueError(f"Target column '{{TARGET_COLUMN}}' not found in dataset")
+
+X = df.drop(columns=[TARGET_COLUMN])
+y = df[TARGET_COLUMN]
+if not pd.api.types.is_numeric_dtype(y):
+    raise ValueError("Target column must be numeric for regression")
+
+X = pd.get_dummies(X, drop_first=True)
+X = X.replace([float("inf"), float("-inf")], float("nan")).fillna(0.0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+model = {model_initializers[model_name]}
+model.fit(X_train, y_train)
+preds = model.predict(X_test)
+
+rmse_holdout = float(np.sqrt(mean_squared_error(y_test, preds)))
+mae = float(mean_absolute_error(y_test, preds))
+r2 = float(r2_score(y_test, preds))
+
+result_json = {{
+    "rmse": rmse_holdout,
+    "rmse_holdout": rmse_holdout,
+    "rmse_cv": rmse_holdout,
+    "mae": mae,
+    "r2": r2,
+    "model_name": {model_name!r},
+    "hyperparameters": HYPERPARAMETERS,
+}}
+print(json.dumps({{"result_json": result_json}}))
+"""
+
+
+def _poll_sandbox_job_for_fine_tune(
+    job_id: uuid.UUID, timeout_seconds: int
+) -> Dict[str, Any]:
+    started_at = time.time()
+    last_status: Optional[str] = None
+    last_progress_at = started_at
+
+    while True:
+        now = time.time()
+        if now - started_at > timeout_seconds:
+            raise RuntimeError(
+                f"Fine-tune sandbox polling timed out after {timeout_seconds}s"
+            )
+
+        db = SessionLocal()
+        try:
+            job = db.query(SandboxJob).filter(SandboxJob.id == job_id).first()
+        finally:
+            db.close()
+
+        if job is None:
+            raise RuntimeError("Fine-tune sandbox job not found")
+
+        if job.status != last_status:
+            last_status = job.status
+            last_progress_at = now
+
+        if job.status in {"queued", "running"}:
+            if now - last_progress_at > FINE_TUNE_SANDBOX_INACTIVITY_TIMEOUT_SECONDS:
+                raise RuntimeError(
+                    "Fine-tune sandbox job made no status progress and appears stalled. "
+                    "Ensure backend/sandbox_worker.py is running."
+                )
+
+            if not _is_sandbox_worker_running() and now - last_progress_at > 10:
+                raise RuntimeError(
+                    "Sandbox worker appears offline while fine-tune job is waiting. "
+                    "Start backend/sandbox_worker.py and retry."
+                )
+
+            time.sleep(2)
+            continue
+        if job.status == "timeout":
+            raise RuntimeError("Fine-tune sandbox execution timeout")
+        if job.status != "completed":
+            raise RuntimeError(job.error_log or "Fine-tune sandbox execution failed")
+
+        parsed = job.result_json
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Fine-tune sandbox result_json is invalid")
+
+        result_json = parsed.get("result_json")
+        if not isinstance(result_json, dict):
+            raise RuntimeError("Fine-tune sandbox result missing result_json payload")
+        return result_json
+
+
+def fine_tune_best_model(
+    file_path: Path,
+    target_column: str,
+    best_model_name: str,
+    llm_provider: str,
+    hyperparameters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Fine-tune the best model with improved hyperparameters.
+
+    Args:
+        file_path: Path to the CSV file
+        target_column: Name of the target column
+        best_model_name: Name of the best model to fine-tune
+        llm_provider: LLM provider for hyperparameter suggestions
+        hyperparameters: Optional pre-derived hyperparameters to use
+
+    Returns:
+        Dictionary containing model metrics
+    """
+    # Load dataset
+    df = pd.read_csv(file_path)
+    validate_dataset_limits(df)
+
+    # Validate target column exists
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in dataset.")
+
+    # Validate target is numeric
+    if not pd.api.types.is_numeric_dtype(df[target_column]):
+        raise ValueError("Target column must be numeric for regression.")
+
+    # Split features and target
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    # Handle categorical columns with one-hot encoding
+    X = pd.get_dummies(X, drop_first=True)
+
+    # Split into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    normalized_model_name = re.sub(r"[^a-z0-9]", "", str(best_model_name).lower())
+    hp = hyperparameters or {}
+
+    # Create model with improved hyperparameters based on model name
+    if normalized_model_name in {"linearregression", "linear"}:
+        model = LinearRegression(**{k: v for k, v in hp.items() if k in []})
+    elif normalized_model_name == "ridge":
+        alpha_val = hp.get("alpha", 10)
+        model = Ridge(alpha=alpha_val)
+    elif normalized_model_name == "lasso":
+        alpha_val = hp.get("alpha", 0.01)
+        max_iter_val = hp.get("max_iter", 5000)
+        model = Lasso(alpha=alpha_val, max_iter=max_iter_val)
+    elif normalized_model_name in {"elasticnet", "elastic"}:
+        alpha_val = hp.get("alpha", 0.01)
+        l1_ratio_val = hp.get("l1_ratio", 0.5)
+        max_iter_val = hp.get("max_iter", 5000)
+        model = ElasticNet(
+            alpha=alpha_val, l1_ratio=l1_ratio_val, max_iter=max_iter_val
+        )
+    elif normalized_model_name in {"randomforestregressor", "randomforest", "rf"}:
+        n_estimators_val = hp.get("n_estimators", 200)
+        max_depth_val = hp.get("max_depth", 10)
+        min_samples_split_val = hp.get("min_samples_split", 2)
+        min_samples_leaf_val = hp.get("min_samples_leaf", 1)
+        model = RandomForestRegressor(
+            n_estimators=n_estimators_val,
+            max_depth=max_depth_val,
+            min_samples_split=min_samples_split_val,
+            min_samples_leaf=min_samples_leaf_val,
+            random_state=42,
+        )
+    elif normalized_model_name in {"xgbregressor", "xgboost", "xgb"}:
+        n_estimators_val = hp.get("n_estimators", 300)
+        learning_rate_val = hp.get("learning_rate", 0.05)
+        max_depth_val = hp.get("max_depth", 6)
+        subsample_val = hp.get("subsample", 1.0)
+        model = XGBRegressor(
+            n_estimators=n_estimators_val,
+            learning_rate=learning_rate_val,
+            max_depth=max_depth_val,
+            subsample=subsample_val,
+            random_state=42,
+            verbosity=0,
+        )
+    else:
+        raise ValueError(f"Unknown model type: {best_model_name}")
+
+    # Train the model
+    model.fit(X_train, y_train)
+
+    # Make predictions
+    y_pred = model.predict(X_test)
+
+    # Calculate metrics
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    return {
+        "name": best_model_name,
+        "rmse": float(rmse),
+        "mae": float(mae),
+        "r2": float(r2),
+    }
+
+
+@app.post("/training/fine-tune")
+async def fine_tune_model(request: FineTuneRequest):
+    """
+    Fine-tune the best model from the latest training version.
+
+    Improves the best model with better hyperparameters and creates a new version.
+    """
+    try:
+        # Validate llm_provider
+        allowed_providers = ["openai", "claude", "gemini", "mistral", "groq"]
+        if request.llm_provider not in allowed_providers:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid llm_provider '{request.llm_provider}'. Allowed values: {', '.join(allowed_providers)}",
+            )
+
+        # Check if training history exists for this file
+        if (
+            request.file_id not in TRAINING_HISTORY
+            or len(TRAINING_HISTORY[request.file_id]) == 0
+        ):
+            db = SessionLocal()
+            try:
+                project = (
+                    db.query(Project).filter(Project.file_id == request.file_id).first()
+                )
+                if project is not None:
+                    training_runs = (
+                        db.query(TrainingRun)
+                        .filter(TrainingRun.project_id == project.id)
+                        .order_by(TrainingRun.version_number.asc())
+                        .all()
+                    )
+
+                    rebuilt_versions: List[Dict[str, Any]] = []
+                    for run in training_runs:
+                        model_versions = (
+                            db.query(ModelVersion)
+                            .filter(ModelVersion.training_run_id == run.id)
+                            .order_by(
+                                ModelVersion.rank_position.asc(),
+                                ModelVersion.created_at.asc(),
+                            )
+                            .all()
+                        )
+
+                        models_payload: List[Dict[str, Any]] = []
+                        for mv in model_versions:
+                            models_payload.append(
+                                {
+                                    "name": mv.model_name,
+                                    "model_name": mv.model_name,
+                                    "rmse": mv.rmse,
+                                    "mae": mv.mae,
+                                    "r2": mv.r2,
+                                    "hyperparameters": mv.hyperparameters,
+                                }
+                            )
+
+                        best_model_payload: Dict[str, Any] = {
+                            "name": run.best_model_name,
+                            "model_name": run.best_model_name,
+                            "rmse": run.rmse,
+                            "mae": run.mae,
+                            "r2": run.r2,
+                        }
+
+                        rebuilt_versions.append(
+                            {
+                                "version": int(run.version_number),
+                                "models": models_payload,
+                                "best_model": best_model_payload,
+                            }
+                        )
+
+                    if rebuilt_versions:
+                        TRAINING_HISTORY[request.file_id] = rebuilt_versions
+            finally:
+                db.close()
+
+        if (
+            request.file_id not in TRAINING_HISTORY
+            or len(TRAINING_HISTORY[request.file_id]) == 0
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail=f"No training history found for file '{request.file_id}'. Please run initial training first.",
+            )
+
+        # Construct file path
+        file_path = UPLOAD_DIR / request.file_id
+
+        # Check if file exists
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"File '{request.file_id}' not found. Please upload a CSV file first.",
+            )
+
+        # Get latest usable version (skip malformed/empty version records)
+        history_versions = TRAINING_HISTORY[request.file_id]
+        latest_version_data = history_versions[-1]
+        for candidate in reversed(history_versions):
+            if not isinstance(candidate, dict):
+                continue
+            has_models = (
+                isinstance(candidate.get("models"), list)
+                and len(candidate.get("models")) > 0
+            )
+            has_best = isinstance(candidate.get("best_model"), dict) and bool(
+                candidate.get("best_model", {}).get("name")
+            )
+            if has_models or has_best:
+                latest_version_data = candidate
+                break
+
+        previous_version = latest_version_data.get("version", len(history_versions))
+        best_model_before = latest_version_data.get("best_model") or {}
+
+        selected_model_name = (
+            request.model_name.strip() if isinstance(request.model_name, str) else None
+        )
+        if selected_model_name:
+            candidate_models = latest_version_data.get("models", [])
+            matched_model = None
+            if isinstance(candidate_models, list):
+                for model_entry in candidate_models:
+                    if not isinstance(model_entry, dict):
+                        continue
+                    model_entry_name = model_entry.get("name") or model_entry.get(
+                        "model_name"
+                    )
+                    if model_entry_name == selected_model_name:
+                        matched_model = model_entry
+                        break
+
+            if matched_model is None:
+                # Fallback: search prior versions for the requested model
+                for version_entry in reversed(history_versions):
+                    if not isinstance(version_entry, dict):
+                        continue
+                    version_models = version_entry.get("models", [])
+                    if not isinstance(version_models, list):
+                        continue
+                    for model_entry in version_models:
+                        if not isinstance(model_entry, dict):
+                            continue
+                        model_entry_name = model_entry.get("name") or model_entry.get(
+                            "model_name"
+                        )
+                        if model_entry_name == selected_model_name:
+                            matched_model = model_entry
+                            break
+                    if matched_model is not None:
+                        break
+
+            if matched_model is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected model '{selected_model_name}' not found in latest version.",
+                )
+
+            best_model_before = {
+                "name": matched_model.get("name") or matched_model.get("model_name"),
+                "rmse": matched_model.get("rmse"),
+                "mae": matched_model.get("mae"),
+                "r2": matched_model.get("r2"),
+            }
+
+        # Fine-tune the best model
+        try:
+            selected_model = best_model_before.get("name")
+            if not isinstance(selected_model, str) or not selected_model.strip():
+                raise HTTPException(
+                    status_code=400, detail="No valid model selected for fine-tuning."
+                )
+
+            canonical_model_name = _canonical_regression_model_name(selected_model)
+            baseline_rmse = (
+                float(best_model_before.get("rmse"))
+                if best_model_before.get("rmse") is not None
+                else 0.0
+            )
+            baseline_mae = (
+                float(best_model_before.get("mae"))
+                if best_model_before.get("mae") is not None
+                else 0.0
+            )
+            baseline_r2 = (
+                float(best_model_before.get("r2"))
+                if best_model_before.get("r2") is not None
+                else 0.0
+            )
+
+            new_version = len(TRAINING_HISTORY[request.file_id]) + 1
+            persisted_training_run_id: Optional[str] = None
+            fine_tuned_metrics: Dict[str, Any]
+            tuned_hyperparameters: Dict[str, Any] = {}
+
+            if FINE_TUNE_USE_SANDBOX:
+                _ensure_sandbox_worker_running()
+
+                sandbox_job_id: Optional[uuid.UUID] = None
+                fine_tuned_run_id: Optional[uuid.UUID] = None
+
+                db = SessionLocal()
+                try:
+                    project = (
+                        db.query(Project)
+                        .filter(Project.file_id == request.file_id)
+                        .first()
+                    )
+                    if project is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Project not found for file '{request.file_id}'.",
+                        )
+
+                    latest_db_version = (
+                        db.query(func.max(TrainingRun.version_number))
+                        .filter(TrainingRun.project_id == project.id)
+                        .scalar()
+                    )
+                    new_version = int(latest_db_version or 0) + 1
+
+                    latest_agent_run = (
+                        db.query(AgentRun)
+                        .filter(AgentRun.project_id == project.id)
+                        .order_by(AgentRun.created_at.desc())
+                        .first()
+                    )
+
+                    if latest_agent_run is None:
+                        now_utc = datetime.utcnow()
+                        latest_agent_run = AgentRun(
+                            project_id=project.id,
+                            status="completed",
+                            current_iteration=1,
+                            max_iterations=1,
+                            improvement_threshold=0.0,
+                            started_at=now_utc,
+                            completed_at=now_utc,
+                        )
+                        db.add(latest_agent_run)
+                        db.flush()
+
+                    tuned_hyperparameters = _derive_fine_tune_hyperparameters(
+                        canonical_model_name,
+                        request.llm_provider,
+                        {
+                            "rmse": baseline_rmse,
+                            "mae": baseline_mae,
+                            "r2": baseline_r2,
+                            "improvement": 0.0,
+                        },
+                        request.prompt,
+                    )
+
+                    sandbox_script = _build_fine_tune_sandbox_script(
+                        target_column=request.target_column,
+                        model_name=canonical_model_name,
+                        hyperparameters=tuned_hyperparameters,
+                    )
+
+                    fine_tuned_run = TrainingRun(
+                        project_id=project.id,
+                        agent_run_id=latest_agent_run.id,  # Link to agent for code download
+                        version_number=new_version,
+                        status="running",
+                        stage="fine_tuning",
+                        progress=30,
+                        started_at=datetime.utcnow(),
+                    )
+                    db.add(fine_tuned_run)
+                    db.flush()
+
+                    sandbox_job = SandboxJob(
+                        agent_id=latest_agent_run.id,
+                        project_id=project.id,
+                        iteration_number=new_version,
+                        script_content=sandbox_script,
+                        status="queued",
+                        timeout_seconds=FINE_TUNE_SANDBOX_TIMEOUT_SECONDS,
+                    )
+                    db.add(sandbox_job)
+                    db.commit()
+
+                    sandbox_job_id = sandbox_job.id
+                    fine_tuned_run_id = fine_tuned_run.id
+                    persisted_training_run_id = str(fine_tuned_run.id)
+                except HTTPException:
+                    db.rollback()
+                    raise
+                except Exception as init_exc:
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to initialize fine-tune sandbox run: {init_exc}",
+                    )
+                finally:
+                    db.close()
+
+                if sandbox_job_id is None or fine_tuned_run_id is None:
+                    raise HTTPException(
+                        status_code=500, detail="Failed to queue fine-tune sandbox job."
+                    )
+
+                try:
+                    sandbox_metrics = _poll_sandbox_job_for_fine_tune(
+                        sandbox_job_id,
+                        timeout_seconds=FINE_TUNE_SANDBOX_TIMEOUT_SECONDS + 120,
+                    )
+
+                    fine_tuned_metrics = {
+                        "name": canonical_model_name,
+                        "rmse": float(sandbox_metrics.get("rmse")),
+                        "mae": float(sandbox_metrics.get("mae")),
+                        "r2": float(sandbox_metrics.get("r2")),
+                    }
+
+                    finalize_db = SessionLocal()
+                    try:
+                        run_row = (
+                            finalize_db.query(TrainingRun)
+                            .filter(TrainingRun.id == fine_tuned_run_id)
+                            .first()
+                        )
+                        if run_row is None:
+                            raise RuntimeError(
+                                "Fine-tune training run not found during finalize"
+                            )
+
+                        run_row.status = "completed"
+                        run_row.stage = "fine_tuned"
+                        run_row.progress = 100
+                        run_row.best_model_name = fine_tuned_metrics["name"]
+                        run_row.rmse = fine_tuned_metrics["rmse"]
+                        run_row.mae = fine_tuned_metrics["mae"]
+                        run_row.r2 = fine_tuned_metrics["r2"]
+                        run_row.completed_at = datetime.utcnow()
+
+                        finalize_db.add(
+                            ModelVersion(
+                                training_run_id=run_row.id,
+                                model_name=fine_tuned_metrics["name"],
+                                rmse=fine_tuned_metrics["rmse"],
+                                mae=fine_tuned_metrics["mae"],
+                                r2=fine_tuned_metrics["r2"],
+                                hyperparameters=tuned_hyperparameters,
+                                rank_position=1,
+                            )
+                        )
+                        finalize_db.commit()
+                    except Exception as finalize_exc:
+                        finalize_db.rollback()
+                        raise RuntimeError(f"Fine-tune finalize failed: {finalize_exc}")
+                    finally:
+                        finalize_db.close()
+                except Exception as sandbox_exc:
+                    failure_db = SessionLocal()
+                    try:
+                        run_row = (
+                            failure_db.query(TrainingRun)
+                            .filter(TrainingRun.id == fine_tuned_run_id)
+                            .first()
+                        )
+                        if run_row is not None:
+                            run_row.status = "failed"
+                            run_row.stage = "fine_tuned"
+                            run_row.progress = 100
+                            run_row.error_message = str(sandbox_exc)
+                            run_row.completed_at = datetime.utcnow()
+                            failure_db.commit()
+                    except Exception:
+                        failure_db.rollback()
+                    finally:
+                        failure_db.close()
+
+                    raise HTTPException(status_code=500, detail=str(sandbox_exc))
+            else:
+                # Non-sandbox path: derive hyperparameters and run training
+                tuned_hyperparameters = _derive_fine_tune_hyperparameters(
+                    canonical_model_name,
+                    request.llm_provider,
+                    {
+                        "rmse": baseline_rmse,
+                        "mae": baseline_mae,
+                        "r2": baseline_r2,
+                        "improvement": 0.0,
+                    },
+                    request.prompt,
+                )
+
+                # Capture tuned_hyperparameters in closure
+                hp_copy = dict(tuned_hyperparameters)
+                fine_tuned_metrics = execute_training_with_timeout(
+                    lambda: fine_tune_best_model(
+                        file_path,
+                        request.target_column,
+                        canonical_model_name,
+                        request.llm_provider,
+                        hp_copy,
+                    )
+                )
+
+                db = SessionLocal()
+                try:
+                    project = (
+                        db.query(Project)
+                        .filter(Project.file_id == request.file_id)
+                        .first()
+                    )
+                    if project is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Project not found for file '{request.file_id}'.",
+                        )
+
+                    latest_db_version = (
+                        db.query(func.max(TrainingRun.version_number))
+                        .filter(TrainingRun.project_id == project.id)
+                        .scalar()
+                    )
+                    new_version = int(latest_db_version or 0) + 1
+
+                    now_utc = datetime.utcnow()
+                    fine_tuned_run = TrainingRun(
+                        project_id=project.id,
+                        version_number=new_version,
+                        status="completed",
+                        stage="fine_tuned",
+                        progress=100,
+                        best_model_name=fine_tuned_metrics["name"],
+                        rmse=float(fine_tuned_metrics["rmse"]),
+                        mae=float(fine_tuned_metrics["mae"]),
+                        r2=float(fine_tuned_metrics["r2"]),
+                        started_at=now_utc,
+                        completed_at=now_utc,
+                    )
+                    db.add(fine_tuned_run)
+                    db.flush()
+
+                    db.add(
+                        ModelVersion(
+                            training_run_id=fine_tuned_run.id,
+                            model_name=fine_tuned_metrics["name"],
+                            rmse=float(fine_tuned_metrics["rmse"]),
+                            mae=float(fine_tuned_metrics["mae"]),
+                            r2=float(fine_tuned_metrics["r2"]),
+                            hyperparameters=tuned_hyperparameters,
+                            rank_position=1,
+                        )
+                    )
+                    db.commit()
+                    persisted_training_run_id = str(fine_tuned_run.id)
+                except HTTPException:
+                    db.rollback()
+                    raise
+                except Exception as persist_exc:
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to persist fine-tuned version: {persist_exc}",
+                    )
+                finally:
+                    db.close()
+
+            # Create version entry with only the fine-tuned model
+            fine_tuned_metrics["hyperparameters"] = tuned_hyperparameters
+            version_entry = {
+                "version": new_version,
+                "models": [fine_tuned_metrics],
+                "best_model": fine_tuned_metrics,
+                "training_run_id": persisted_training_run_id,
+            }
+
+            # Store in history
+            TRAINING_HISTORY[request.file_id].append(version_entry)
+
+            # Calculate improvements
+            rmse_change = fine_tuned_metrics["rmse"] - baseline_rmse
+            r2_change = fine_tuned_metrics["r2"] - baseline_r2
+
+            # Return comparison response
+            response = {
+                "previous_version": previous_version,
+                "new_version": new_version,
+                "before": {
+                    "name": canonical_model_name,
+                    "rmse": baseline_rmse,
+                    "mae": baseline_mae,
+                    "r2": baseline_r2,
+                },
+                "after": {
+                    "name": fine_tuned_metrics["name"],
+                    "rmse": fine_tuned_metrics["rmse"],
+                    "mae": fine_tuned_metrics["mae"],
+                    "r2": fine_tuned_metrics["r2"],
+                },
+                "improvement": {
+                    "rmse_change": float(rmse_change),
+                    "r2_change": float(r2_change),
+                },
+                "training_run_id": persisted_training_run_id,
+            }
+
+            return JSONResponse(status_code=200, content=response)
+
+        except HTTPException:
+            raise
+        except ValueError as e:
+            # Validation errors
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            # Model training errors
+            raise HTTPException(
+                status_code=500, detail=f"Fine-tune execution failed: {e}"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fine-tune request failed: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATA TRANSFORM — Copilot-style prompt-driven dataset transformation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TransformPromptRequest(BaseModel):
+    session_id: str
+    prompt: str
+
+
+class TransformAcceptRequest(BaseModel):
+    session_id: str
+    step_index: int
+
+
+class TransformUndoRequest(BaseModel):
+    session_id: str
+    step_index: int
+
+
+class TransformRevertRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/transform/start/{file_id}")
+async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
+    """Start a new transform session for a dataset. Returns the session_id and
+    initial dataframe preview (first 200 rows), plus an AI-generated data analysis."""
+    project = db.query(Project).filter(Project.file_id == file_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    csv_path = UPLOAD_DIR / file_id
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset file not found on disk")
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {exc}")
+
+    session_id = str(uuid.uuid4())
+    initial_quality = _compute_quality_score(df)
+    TRANSFORM_SESSIONS[session_id] = {
+        "file_id": file_id,
+        "project_id": str(project.id),
+        "original_df": df.copy(),
+        "current_df": df.copy(),
+        "steps": [],  # list of {prompt, code, summary, diff, accepted}
+        "created_at": time.time(),
+        "quality_history": [{"label": "Session start", "score": initial_quality}],
+    }
+
+    preview = _df_to_preview(df)
+    return {
+        "session_id": session_id,
+        "rows": len(df),
+        "columns": len(df.columns),
+        "column_names": list(df.columns),
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
+        "preview": preview,
+        "null_counts": {col: int(df[col].isnull().sum()) for col in df.columns},
+    }
+
+
+@app.post("/transform/analyze/{session_id}")
+async def transform_analyze_dataset(session_id: str):
+    """AI-powered dataset analysis — acts like a pro data engineer to inspect
+    the data quality, patterns, and suggest concrete transformation steps."""
+    session = TRANSFORM_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    df: pd.DataFrame = session["current_df"]
+
+    # Build a rich dataset profile for the LLM
+    profile = _build_dataset_profile_for_analysis(df)
+
+    # Build the analysis prompt
+    system_prompt = (
+        "You are a senior data engineer analyzing a dataset for ML readiness. "
+        "You think step by step and provide actionable insights.\n\n"
+        "Your analysis MUST include these sections:\n"
+        "1. DATA QUALITY ASSESSMENT — issues found (nulls, duplicates, outliers, type mismatches)\n"
+        "2. COLUMN ANALYSIS — what each column represents, its quality score\n"
+        "3. RECOMMENDED TRANSFORMATIONS — ordered list of specific actions to take\n"
+        "4. PRIORITY — which transformations are critical vs nice-to-have\n\n"
+        "Be concise but specific. Use actual column names and numbers from the data.\n"
+        "Return your analysis as a JSON object with this structure:\n"
+        '{"quality_score": 0-100, "issues": [...], "column_insights": [...], '
+        '"recommended_transforms": [{"action": "...", "reason": "...", "priority": "high|medium|low", "prompt": "exact prompt to execute this"}], '
+        '"summary": "one paragraph overall assessment"}'
+    )
+
+    user_prompt = (
+        f"Analyze this dataset:\n\n{profile}\n\n"
+        "Provide your analysis as the specified JSON structure."
+    )
+
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
+
+    if not provider:
+        raise HTTPException(status_code=500, detail="No LLM provider configured.")
+
+    try:
+        if provider == "gemini":
+            raw_response = _call_gemini_text_standalone(
+                system_prompt,
+                user_prompt,
+                temperature=0.3,
+                max_tokens=2048,
+                model_override=model,
+            )
+        else:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=2048,
+            )
+            raw_response = resp.choices[0].message.content.strip()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM analysis failed: {exc}")
+
+    # Parse the response
+    analysis = _parse_analysis_response(raw_response)
+    return analysis
+
+
+@app.post("/transform/think")
+async def transform_think_before_acting(req: TransformPromptRequest):
+    """AI thinks about the prompt before generating code — shows reasoning,
+    validates against actual data state, and plans the execution."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    current_df: pd.DataFrame = session["current_df"]
+    before_shape = current_df.shape
+    before_nulls = int(current_df.isnull().sum().sum())
+
+    # Detect "do everything" style prompts — skip overly cautious thinking
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+    ]
+    is_batch_request = any(kw in req.prompt.lower() for kw in batch_keywords)
+
+    if is_batch_request:
+        # For batch requests, build a concrete plan from data state
+        null_cols = {
+            col: int(current_df[col].isnull().sum())
+            for col in current_df.columns
+            if current_df[col].isnull().sum() > 0
+        }
+        cat_cols = [
+            col for col in current_df.columns if current_df[col].dtype == "object"
+        ]
+        num_cols = [
+            col
+            for col in current_df.columns
+            if current_df[col].dtype in ["float64", "int64", "float32", "int32"]
+        ]
+        dup_count = int(current_df.duplicated().sum())
+
+        plan_steps = []
+        if null_cols:
+            plan_steps.append(
+                f"Fill {sum(null_cols.values())} null values across {len(null_cols)} column(s) with median/mode"
+            )
+        if dup_count > 0:
+            plan_steps.append(f"Remove {dup_count} duplicate rows")
+        if cat_cols:
+            plan_steps.append(
+                f"Encode {len(cat_cols)} categorical column(s): {', '.join(cat_cols[:5])}"
+            )
+        if num_cols:
+            plan_steps.append(f"Normalize {len(num_cols)} numeric column(s)")
+        if not plan_steps:
+            plan_steps.append("Data looks clean — no major transforms needed")
+
+        return {
+            "thinking": f"Batch transform requested. Will apply {len(plan_steps)} operations: fill nulls, remove duplicates, encode categoricals, and normalize numerics.",
+            "is_valid": True,
+            "validation_issues": [],
+            "plan": plan_steps,
+            "estimated_impact": {
+                "rows_affected": before_shape[0],
+                "cols_affected": before_shape[1],
+            },
+            "confidence": "high",
+            "warnings": [
+                "This will modify the entire dataset. You can undo each step individually."
+            ],
+        }
+
+    # Build context
+    col_info = ", ".join(
+        f"{col} ({current_df[col].dtype})" for col in current_df.columns
+    )
+    null_cols = {
+        col: int(current_df[col].isnull().sum())
+        for col in current_df.columns
+        if current_df[col].isnull().sum() > 0
+    }
+
+    system_prompt = (
+        "You are a senior data engineer planning a data transformation. "
+        "Think step by step about what the user wants to do.\n\n"
+        "IMPORTANT RULES:\n"
+        "- If the request is clear enough to execute, set is_valid=true and confidence=high\n"
+        "- Only set is_valid=false if the request literally makes no sense or references columns that don't exist\n"
+        "- Be action-oriented. Users want results, not interrogation.\n"
+        "- Common requests like 'remove nulls', 'normalize', 'drop duplicates' are always valid\n\n"
+        "You MUST:\n"
+        "1. Validate column names exist in the data\n"
+        "2. Plan the exact operations needed\n"
+        "3. Estimate the impact (rows/cols affected)\n\n"
+        "Return a JSON object:\n"
+        '{"thinking": "your concise reasoning (1-2 sentences)", '
+        '"is_valid": true, '
+        '"validation_issues": [], '
+        '"plan": ["step 1", "step 2", ...], '
+        '"estimated_impact": {"rows_affected": N, "cols_affected": N}, '
+        '"confidence": "high|medium|low", '
+        '"warnings": ["only if truly important"]}'
+    )
+
+    user_prompt = (
+        f"DataFrame state:\n"
+        f"- Shape: {before_shape[0]} rows × {before_shape[1]} columns\n"
+        f"- Columns: {col_info}\n"
+        f"- Null values: {json.dumps(null_cols) if null_cols else 'None'}\n"
+        f"- Total nulls: {before_nulls}\n"
+        f"- Sample values per column: {json.dumps({col: current_df[col].dropna().head(3).tolist() for col in current_df.columns[:10]}, default=str)}\n\n"
+        f'User request: "{req.prompt}"\n\n'
+        f"Think about this request and plan the execution. Be action-oriented — if the request makes sense, approve it."
+    )
+
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception:
+        return {
+            "thinking": "Ready to execute",
+            "is_valid": True,
+            "plan": ["Execute directly"],
+            "confidence": "high",
+            "validation_issues": [],
+            "estimated_impact": {},
+            "warnings": [],
+        }
+
+    if not provider:
+        return {
+            "thinking": "No LLM configured",
+            "is_valid": True,
+            "plan": ["Execute directly"],
+            "confidence": "high",
+            "validation_issues": [],
+            "estimated_impact": {},
+            "warnings": [],
+        }
+
+    try:
+        if provider == "gemini":
+            raw = _call_gemini_text_standalone(
+                system_prompt,
+                user_prompt,
+                temperature=0.2,
+                max_tokens=1024,
+                model_override=model,
+            )
+        else:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            raw = resp.choices[0].message.content.strip()
+    except Exception:
+        return {
+            "thinking": "Could not reach LLM for planning",
+            "is_valid": True,
+            "plan": ["Execute directly"],
+            "confidence": "medium",
+            "validation_issues": [],
+            "estimated_impact": {},
+            "warnings": [],
+        }
+
+    result = _parse_thinking_response(raw)
+
+    # Safety net: never block execution for common transform operations
+    common_ops = [
+        "remove",
+        "drop",
+        "fill",
+        "impute",
+        "normalize",
+        "scale",
+        "encode",
+        "clean",
+        "convert",
+        "rename",
+        "replace",
+    ]
+    if not result["is_valid"] and any(op in req.prompt.lower() for op in common_ops):
+        result["is_valid"] = True
+        result["validation_issues"] = []
+        result["confidence"] = "medium"
+
+    return result
+
+
+@app.post("/transform/execute-tools")
+async def transform_execute_with_tools(req: TransformPromptRequest):
+    """Execute a transform using MCP tool-calling.
+    The LLM selects which tools to call with what parameters.
+    Falls back to code generation if tool-calling fails."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    current_df: pd.DataFrame = session["current_df"].copy()
+    before_shape = current_df.shape
+    before_nulls = int(current_df.isnull().sum().sum())
+
+    # Handle batch requests
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+    ]
+    expanded_prompt = req.prompt
+    if any(kw in req.prompt.lower() for kw in batch_keywords):
+        actions = []
+        null_cols = [
+            col for col in current_df.columns if current_df[col].isnull().sum() > 0
+        ]
+        if null_cols:
+            for col in null_cols:
+                if current_df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                    actions.append(
+                        f"fill null values in column '{col}' with the median"
+                    )
+                else:
+                    actions.append(f"fill null values in column '{col}' with the mode")
+        if int(current_df.duplicated().sum()) > 0:
+            actions.append("drop duplicate rows")
+        if not actions:
+            actions.append("data is already clean")
+        expanded_prompt = ". ".join(actions)
+
+    # Build context for tool selection
+    col_info = ", ".join(
+        f"{col} ({current_df[col].dtype})" for col in current_df.columns
+    )
+    null_info = {
+        col: int(current_df[col].isnull().sum())
+        for col in current_df.columns
+        if current_df[col].isnull().sum() > 0
+    }
+
+    system_prompt = (
+        "You are a data transformation agent. You have access to tools to transform a pandas DataFrame.\n"
+        f"DataFrame info: {before_shape[0]} rows × {before_shape[1]} columns.\n"
+        f"Columns: {col_info}\n"
+        f"Null values: {json.dumps(null_info) if null_info else 'None'}\n\n"
+        "Call the appropriate tool(s) to fulfill the user's request.\n\n"
+        "IMPORTANT RULES:\n"
+        "- NEVER use drop_rows_with_nulls unless the user EXPLICITLY asks to drop/remove rows\n"
+        "- For null values, ALWAYS prefer fill_nulls with strategy 'median' for numeric columns and 'mode' for text columns\n"
+        "- Preserve as many rows as possible — data loss is bad\n"
+        "- If multiple operations are needed, call them in sequence\n"
+        "- For 'do it all' type requests: FIRST convert_dtype columns that should be numeric, THEN fill_nulls, then encode categoricals, then normalize numerics\n"
+        "- IMPORTANT ORDER: convert_dtype MUST come BEFORE fill_nulls so that invalid values become NaN first, then get filled"
+    )
+
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
+
+    if not provider or provider == "gemini":
+        # Gemini doesn't support tool calling well — fall back to standard prompt
+        raise HTTPException(
+            status_code=501, detail="Tool calling requires Groq or OpenAI provider"
+        )
+
+    tools_schema = get_mcp_tools_schema()
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": expanded_prompt},
+            ],
+            tools=tools_schema,
+            tool_choice="auto",
+            temperature=0.1,
+            max_tokens=1024,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM tool call failed: {exc}")
+
+    # Process tool calls
+    message = resp.choices[0].message
+    tool_calls = getattr(message, "tool_calls", None) or []
+    tools_executed = []
+    result_df = current_df.copy()
+
+    if not tool_calls:
+        # No tool calls — LLM gave a text response, fall back to code gen
+        raise HTTPException(
+            status_code=422,
+            detail="LLM did not select any tools. Try being more specific.",
+        )
+
+    for tc in tool_calls:
+        tool_name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments)
+        except json.JSONDecodeError:
+            continue
+
+        try:
+            result_df = execute_mcp_tool(tool_name, result_df, args)
+            tools_executed.append(
+                {"tool": tool_name, "args": args, "status": "success"}
+            )
+        except Exception as exc:
+            tools_executed.append(
+                {"tool": tool_name, "args": args, "status": "error", "error": str(exc)}
+            )
+
+    # Compute diff
+    after_shape = result_df.shape
+    after_nulls = int(result_df.isnull().sum().sum())
+    diff = {
+        "rows_before": before_shape[0],
+        "rows_after": after_shape[0],
+        "cols_before": before_shape[1],
+        "cols_after": after_shape[1],
+        "nulls_before": before_nulls,
+        "nulls_after": after_nulls,
+        "rows_changed": abs(before_shape[0] - after_shape[0]),
+        "cols_changed": abs(before_shape[1] - after_shape[1]),
+        "nulls_removed": max(0, before_nulls - after_nulls),
+    }
+
+    # Build code representation from tool calls
+    code_lines = ["# 📝 MCP Tools Executed:"]
+    for t in tools_executed:
+        if t["status"] == "success":
+            code_lines.append(f"# ✅ {t['tool']}({json.dumps(t['args'], indent=2)})")
+        else:
+            code_lines.append(f"# ❌ {t['tool']} — Error: {t.get('error', 'unknown')}")
+    generated_code = "\n".join(code_lines)
+
+    summary = _build_transform_summary(req.prompt, diff, result_df, current_df, session)
+    # Prepend tool info
+    successful_tools = [t["tool"] for t in tools_executed if t["status"] == "success"]
+    if successful_tools:
+        tool_line = f"🛠️ Tools: {', '.join(successful_tools)}\n"
+        summary = tool_line + summary
+
+    # Store step
+    step = {
+        "prompt": req.prompt,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "accepted": False,
+        "result_df": result_df,
+        "tools_executed": tools_executed,
+    }
+    session["steps"].append(step)
+    step_index = len(session["steps"]) - 1
+
+    preview = _df_to_preview(result_df)
+
+    return {
+        "step_index": step_index,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "preview": preview,
+        "rows": diff["rows_after"],
+        "columns": diff["cols_after"],
+        "column_names": list(result_df.columns),
+        "dtypes": {col: str(result_df[col].dtype) for col in result_df.columns},
+        "null_counts": {
+            col: int(result_df[col].isnull().sum()) for col in result_df.columns
+        },
+        "tools_executed": tools_executed,
+    }
+
+
+@app.get("/transform/tools")
+async def list_transform_tools():
+    """List all available MCP transform tools and their schemas."""
+    tools = []
+    for name, tool_def in TRANSFORM_TOOLS.items():
+        tools.append(
+            {
+                "name": tool_def["name"],
+                "description": tool_def["description"],
+                "parameters": tool_def["parameters"],
+            }
+        )
+    return {"tools": tools, "count": len(tools)}
+
+
+@app.post("/transform/prompt")
+async def transform_prompt(req: TransformPromptRequest):
+    """User sends a natural-language prompt. The LLM generates pandas code,
+    we execute it in-process on a copy of the df, compute a diff, and return
+    the result as a *pending* step (not yet accepted)."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    current_df: pd.DataFrame = session["current_df"].copy()
+    before_shape = current_df.shape
+    before_nulls = int(current_df.isnull().sum().sum())
+
+    # Skip LLM calls for non-actionable chat-style prompts.
+    if _is_non_actionable_transform_prompt(req.prompt):
+        # Instead of rejecting, generate a helpful chat response
+        chat_response = _generate_chat_response(req.prompt, current_df)
+        preview = _df_to_preview(current_df)
+        return {
+            "step_index": -1,
+            "code": "",
+            "summary": chat_response,
+            "diff": {
+                "rows_before": before_shape[0],
+                "rows_after": before_shape[0],
+                "cols_before": before_shape[1],
+                "cols_after": before_shape[1],
+                "nulls_before": before_nulls,
+                "nulls_after": before_nulls,
+                "rows_changed": 0,
+                "cols_changed": 0,
+                "nulls_removed": 0,
+            },
+            "preview": preview,
+            "rows": before_shape[0],
+            "columns": before_shape[1],
+            "column_names": list(current_df.columns),
+            "dtypes": {col: str(current_df[col].dtype) for col in current_df.columns},
+            "null_counts": {
+                col: int(current_df[col].isnull().sum()) for col in current_df.columns
+            },
+        }
+
+    # Handle "do it all" batch requests by expanding to a concrete prompt
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+    ]
+    expanded_prompt = req.prompt
+    if any(kw in req.prompt.lower() for kw in batch_keywords):
+        actions = []
+        null_cols = [
+            col for col in current_df.columns if current_df[col].isnull().sum() > 0
+        ]
+        if null_cols:
+            for col in null_cols:
+                if current_df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                    actions.append(
+                        f"fill null values in column '{col}' with the median"
+                    )
+                else:
+                    actions.append(
+                        f"fill null values in column '{col}' with the mode (most frequent value)"
+                    )
+        if int(current_df.duplicated().sum()) > 0:
+            actions.append("drop duplicate rows")
+        if not actions:
+            actions.append("no cleanup needed — data is already clean")
+        expanded_prompt = ". ".join(actions)
+
+    constraints = _extract_transform_constraints(expanded_prompt)
+
+    # Build the LLM prompt
+    col_info = ", ".join(
+        f"{col} ({current_df[col].dtype})" for col in current_df.columns
+    )
+    sample_json = current_df.head(3).to_json(orient="records", default_handler=str)
+
+    system_prompt = (
+        "You are a data-transformation assistant. The user has a pandas DataFrame "
+        "called `df`. Write ONLY valid Python code using pandas to transform `df` "
+        "in-place (or reassign to `df`). Do NOT import anything — pandas is already "
+        "imported as `pd` and numpy as `np`. Do NOT print or return anything. "
+        "The code must be safe: no file I/O, no subprocess, no exec/eval, no network "
+        "calls. Output ONLY the Python code, no markdown fences, no explanation."
+    )
+    user_prompt = (
+        f"DataFrame info:\n"
+        f"- Shape: {before_shape[0]} rows × {before_shape[1]} columns\n"
+        f"- Columns: {col_info}\n"
+        f"- Sample (first 3 rows): {sample_json}\n"
+        f"- Total null values: {before_nulls}\n\n"
+        f"User request: {expanded_prompt}\n\n"
+        f"Write the pandas code to accomplish this."
+    )
+
+    # Call LLM
+    try:
+        client, model, provider = _resolve_llm_client_standalone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
+
+    if not provider:
+        raise HTTPException(
+            status_code=500,
+            detail="No LLM provider configured. Set GROQ_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.",
+        )
+
+    # Generate code, execute, and auto-retry up to 2 times on failure
+    MAX_RETRIES = 2
+    last_error = None
+    retry_prompt = user_prompt
+    result_df: Optional[pd.DataFrame] = None
+    diff: Optional[Dict[str, int]] = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            if provider == "gemini":
+                generated_code = _call_gemini_text_standalone(
+                    system_prompt,
+                    retry_prompt,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    model_override=model,
+                )
+            else:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": retry_prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=1024,
+                )
+                generated_code = resp.choices[0].message.content.strip()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"LLM call failed: {exc}")
+
+        # Strip markdown fences if present
+        generated_code = _strip_code_fences(generated_code)
+
+        # LLMs may still include imports; strip them because pd/np are injected.
+        generated_code = _strip_transform_import_lines(generated_code)
+
+        if not generated_code:
+            last_error = "Generated code was empty after removing unsupported imports"
+            if attempt < MAX_RETRIES:
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous output was invalid:\n"
+                    f"  {last_error}\n\n"
+                    "Return only pandas DataFrame transformation statements against `df`. "
+                    "Do not include any import lines."
+                )
+                continue
+            raise HTTPException(status_code=422, detail=last_error)
+
+        # Security validation — block dangerous patterns
+        try:
+            _validate_transform_code(generated_code)
+        except HTTPException as exc:
+            last_error = str(exc.detail)
+            if attempt < MAX_RETRIES:
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous code violated a safety rule:\n"
+                    f"  {last_error}\n\n"
+                    "Rewrite the code without forbidden patterns. "
+                    "Do not include imports, file/network access, or dynamic execution."
+                )
+                continue
+            raise
+
+        # Execute on a copy
+        sandbox_df = current_df.copy()
+        exec_globals = {"pd": pd, "np": __import__("numpy"), "df": sandbox_df}
+        try:
+            exec(generated_code, exec_globals)  # noqa: S102
+            candidate_df: pd.DataFrame = exec_globals.get("df", sandbox_df)
+            if not isinstance(candidate_df, pd.DataFrame):
+                raise ValueError("Code did not produce a valid DataFrame")
+
+            candidate_shape = candidate_df.shape
+            candidate_nulls = int(candidate_df.isnull().sum().sum())
+            candidate_diff = {
+                "rows_before": before_shape[0],
+                "rows_after": candidate_shape[0],
+                "cols_before": before_shape[1],
+                "cols_after": candidate_shape[1],
+                "nulls_before": before_nulls,
+                "nulls_after": candidate_nulls,
+                "rows_changed": abs(before_shape[0] - candidate_shape[0]),
+                "cols_changed": abs(before_shape[1] - candidate_shape[1]),
+                "nulls_removed": max(0, before_nulls - candidate_nulls),
+            }
+
+            constraint_violations = _validate_transform_constraints(
+                constraints, candidate_diff
+            )
+            if constraint_violations:
+                last_error = "; ".join(constraint_violations)
+                if attempt < MAX_RETRIES:
+                    retry_prompt = (
+                        f"{user_prompt}\n\n"
+                        "IMPORTANT: Your previous code violated user constraints:\n"
+                        f"  {last_error}\n\n"
+                        "Regenerate code that satisfies ALL explicit constraints from the user prompt."
+                    )
+                    continue
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Generated code violated prompt constraints: {last_error}",
+                )
+
+            result_df = candidate_df
+            diff = candidate_diff
+            last_error = None
+            break  # success
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                # Feed the error back so the LLM can fix its code
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous code failed with this error:\n"
+                    f"  {last_error}\n\n"
+                    f"Fix the code to handle this. Be defensive with type conversions — "
+                    f"use errors='coerce' for pd.to_numeric, strip non-numeric "
+                    f"characters before converting, etc."
+                )
+
+    if last_error:
+        raise HTTPException(
+            status_code=422, detail=f"Generated code failed: {last_error}"
+        )
+
+    if result_df is None or diff is None:
+        raise HTTPException(
+            status_code=422, detail="No valid transform result produced"
+        )
+
+    summary = _build_transform_summary(req.prompt, diff, result_df, current_df, session)
+
+    step = {
+        "prompt": req.prompt,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "accepted": False,
+        "result_df": result_df,
+    }
+    session["steps"].append(step)
+    step_index = len(session["steps"]) - 1
+
+    preview = _df_to_preview(result_df)
+
+    return {
+        "step_index": step_index,
+        "code": generated_code,
+        "summary": summary,
+        "diff": diff,
+        "preview": preview,
+        "rows": diff["rows_after"],
+        "columns": diff["cols_after"],
+        "column_names": list(result_df.columns),
+        "dtypes": {col: str(result_df[col].dtype) for col in result_df.columns},
+        "null_counts": {
+            col: int(result_df[col].isnull().sum()) for col in result_df.columns
+        },
+    }
+
+
+@app.post("/transform/accept")
+async def transform_accept(req: TransformAcceptRequest):
+    """Accept a pending step — applies it to the session's current dataframe."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+    if req.step_index < 0 or req.step_index >= len(session["steps"]):
+        raise HTTPException(status_code=400, detail="Invalid step index")
+
+    step = session["steps"][req.step_index]
+    if step["accepted"]:
+        return {"status": "already_accepted"}
+
+    step["accepted"] = True
+    session["current_df"] = step["result_df"].copy()
+
+    return {"status": "accepted", "step_index": req.step_index}
+
+
+@app.post("/transform/undo")
+async def transform_undo(req: TransformUndoRequest):
+    """Undo a specific step — revert to the state before it. Also removes all
+    later steps."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+    if req.step_index < 0 or req.step_index >= len(session["steps"]):
+        raise HTTPException(status_code=400, detail="Invalid step index")
+
+    # Remove this step and all after it
+    session["steps"] = session["steps"][: req.step_index]
+
+    # Replay accepted steps to rebuild current_df
+    df = session["original_df"].copy()
+    for s in session["steps"]:
+        if s["accepted"]:
+            df = s["result_df"].copy()
+    session["current_df"] = df
+
+    preview = _df_to_preview(df)
+    return {
+        "status": "undone",
+        "rows": len(df),
+        "columns": len(df.columns),
+        "preview": preview,
+        "steps_remaining": len(session["steps"]),
+    }
+
+
+@app.post("/transform/revert")
+async def transform_revert(req: TransformRevertRequest):
+    """Revert the entire session back to the original dataset."""
+    session = TRANSFORM_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+
+    session["steps"] = []
+    session["current_df"] = session["original_df"].copy()
+
+    df = session["current_df"]
+    preview = _df_to_preview(df)
+    return {
+        "status": "reverted",
+        "rows": len(df),
+        "columns": len(df.columns),
+        "preview": preview,
+    }
+
+
+@app.post("/transform/save/{file_id}")
+async def transform_save(
+    file_id: str, session_id: str = Form(...), db: Session = Depends(get_db)
+):
+    """Save the transformed dataset — overwrites the original CSV so training
+    uses the cleaned version."""
+    session = TRANSFORM_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Transform session not found")
+    if session["file_id"] != file_id:
+        raise HTTPException(status_code=400, detail="Session file_id mismatch")
+
+    project = db.query(Project).filter(Project.file_id == file_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    df = session["current_df"]
+    csv_path = UPLOAD_DIR / file_id
+    df.to_csv(csv_path, index=False)
+
+    # Update dataset profile
+    project.rows = len(df)
+    project.columns = len(df.columns)
+    db.commit()
+
+    # Cleanup session
+    del TRANSFORM_SESSIONS[session_id]
+
+    return {
+        "status": "saved",
+        "rows": len(df),
+        "columns": len(df.columns),
+    }
+
+
+def _df_to_preview(df: pd.DataFrame, max_rows: int = 200) -> list:
+    """Return first N rows as list-of-dicts for JSON serialization."""
+    subset = df.head(max_rows)
+    return json.loads(subset.to_json(orient="records", default_handler=str))
+
+
+def _strip_code_fences(code: str) -> str:
+    """Remove markdown code fences from LLM output."""
+    code = code.strip()
+    if code.startswith("```"):
+        lines = code.split("\n")
+        # Remove first line (```python or ```)
+        lines = lines[1:]
+        # Remove last line if it's ```
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        code = "\n".join(lines)
+    return code.strip()
+
+
+def _strip_transform_import_lines(code: str) -> str:
+    """Remove import lines from generated transform snippets.
+
+    The transform runtime already injects pandas as pd and numpy as np.
+    """
+    cleaned_lines = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _is_non_actionable_transform_prompt(prompt: str) -> bool:
+    """Detect chat-like prompts that don't request a concrete data change."""
+    text = (prompt or "").strip().lower()
+    if not text:
+        return True
+
+    # Batch/execute-all commands are always actionable
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+        "fix all",
+        "clean all",
+    ]
+    if any(kw in text for kw in batch_keywords):
+        return False
+
+    transform_verbs = [
+        "remove",
+        "drop",
+        "delete",
+        "filter",
+        "keep",
+        "retain",
+        "fill",
+        "impute",
+        "replace",
+        "rename",
+        "convert",
+        "cast",
+        "normalize",
+        "standardize",
+        "scale",
+        "encode",
+        "clean",
+        "strip",
+        "trim",
+        "split",
+        "merge",
+        "aggregate",
+        "group",
+        "sort",
+        "deduplicate",
+        "duplicate",
+        "round",
+        "clip",
+        "bin",
+        "outlier",
+        "all",
+        "everything",
+        "fix",
+    ]
+    if any(verb in text for verb in transform_verbs):
+        return False
+
+    # Analysis requests — let them through as chat, not transforms
+    analysis_keywords = [
+        "analyze",
+        "analyse",
+        "examine",
+        "inspect",
+        "show",
+        "describe",
+        "statistics",
+        "summary",
+        "profile",
+        "overview",
+        "again",
+        "correct",
+        "quality",
+        "tell me",
+        "how much",
+        "find null",
+        "show null",
+        "check null",
+        "missing values",
+        "find missing",
+        "show missing",
+        "scan null",
+        "null values",
+    ]
+    if any(kw in text for kw in analysis_keywords):
+        return True
+
+    small_talk = [
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "test",
+        "testing",
+        "ok",
+        "okay",
+        "cool",
+        "nice",
+        "yo",
+        "sup",
+        "hola",
+        "bonjour",
+        "what",
+        "how",
+        "why",
+        "who",
+    ]
+    if text.rstrip("!?.") in small_talk or (
+        len(text.split()) >= 1 and text.split()[0] in small_talk
+    ):
+        return True
+
+    # Questions are chat, not transforms
+    if text.startswith(
+        ("what", "how", "why", "which", "can", "is", "are", "do", "does", "tell")
+    ):
+        return True
+
+    if len(text.split()) <= 2 and not any(verb in text for verb in transform_verbs):
+        return True
+
+    return False
+
+
+def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
+    """Generate a copilot-style response — short, sharp, actionable."""
+    text = (prompt or "").strip().lower()
+
+    # Null value scan
+    null_keywords = [
+        "find null",
+        "null values",
+        "show null",
+        "check null",
+        "missing values",
+        "find missing",
+        "show missing",
+        "scan null",
+    ]
+    if any(kw in text for kw in null_keywords):
+        return _build_null_scan_response(df)
+
+    # Analysis/quality check
+    analysis_keywords = [
+        "analyze",
+        "analyse",
+        "examine",
+        "inspect",
+        "describe",
+        "statistics",
+        "summary",
+        "profile",
+        "overview",
+        "again",
+        "correct",
+        "quality",
+        "good",
+        "tell me",
+    ]
+    if any(kw in text for kw in analysis_keywords):
+        nulls = int(df.isnull().sum().sum())
+        dups = int(df.duplicated().sum())
+        num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        total_cells = df.shape[0] * df.shape[1]
+        completeness = round((1 - nulls / max(total_cells, 1)) * 100, 1)
+        quality_score = min(
+            100, max(0, int(completeness - (dups / max(df.shape[0], 1)) * 10))
+        )
+
+        response = f"🔍 DATASET ANALYSIS\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        response += f"📊 Overview\n"
+        response += f"• Rows: {df.shape[0]} | Columns: {df.shape[1]} | Nulls: {nulls} ({round(100 - completeness, 1)}%)\n"
+        response += f"• Quality Score: {quality_score}/100\n"
+
+        # Categorize issues by severity
+        critical_issues = []
+        medium_issues = []
+        low_issues = []
+
+        # Check nulls per column
+        for col in df.columns:
+            col_nulls = int(df[col].isnull().sum())
+            if col_nulls == 0:
+                continue
+            pct = round(col_nulls / df.shape[0] * 100, 0)
+            if pct >= 30:
+                if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                    critical_issues.append(
+                        f"{col}: {col_nulls} nulls ({pct}%) → fill with median"
+                    )
+                else:
+                    critical_issues.append(
+                        f"{col}: {col_nulls} nulls ({pct}%) → fill with mode"
+                    )
+            elif pct >= 10:
+                medium_issues.append(
+                    f"{col}: {col_nulls} nulls ({pct}%) → fill missing values"
+                )
+            else:
+                low_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill or ignore")
+
+        # Check type mismatches
+        for col in df.columns:
+            if df[col].dtype == "object":
+                numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+                if numeric_count > len(df) * 0.5:
+                    critical_issues.append(
+                        f"{col}: stored as text but looks numeric → convert to number"
+                    )
+
+        # Duplicates
+        if dups > 0:
+            if dups > df.shape[0] * 0.1:
+                critical_issues.append(
+                    f"Dataset: {dups} duplicate rows ({round(dups/df.shape[0]*100,0)}%) → drop duplicates"
+                )
+            else:
+                medium_issues.append(
+                    f"Dataset: {dups} duplicate rows → drop duplicates"
+                )
+
+        if critical_issues:
+            response += f"\n🚨 Critical Issues (fix first)\n"
+            for i, issue in enumerate(critical_issues[:4], 1):
+                response += f"{i}. {issue}\n"
+
+        if medium_issues:
+            response += f"\n⚠️ Medium Issues\n"
+            for i, issue in enumerate(medium_issues[:4], len(critical_issues) + 1):
+                response += f"{i}. {issue}\n"
+
+        if low_issues:
+            response += f"\nℹ️ Low Priority\n"
+            for i, issue in enumerate(
+                low_issues[:3], len(critical_issues) + len(medium_issues) + 1
+            ):
+                response += f"{i}. {issue}\n"
+
+        if not critical_issues and not medium_issues and not low_issues:
+            response += "\n✅ No issues found. Data is clean!\n"
+
+        if critical_issues or medium_issues:
+            response += f"\n🎯 Auto-fix all issues? Type 'do it all' or click a suggested transform above."
+        else:
+            response += f"\n🎯 Ready for ML training! Go Back to Training to start."
+
+        return response
+
+    # Greetings
+    greetings = ["hi", "hello", "hey", "hola", "bonjour", "yo", "sup"]
+    if text.rstrip("!?.") in greetings:
+        nulls = int(df.isnull().sum().sum())
+        response = f"👋 PyrunAI Data Engineer ready.\n\n"
+        response += f"📊 {df.shape[0]} rows × {df.shape[1]} cols"
+        if nulls > 0:
+            response += f" | ⚠️ {nulls} nulls"
+        response += "\n\nI execute immediately:\n"
+        response += "• 'do it all' — auto-fix everything\n"
+        response += "• 'fill nulls' — fill missing values\n"
+        response += "• 'analyse' — show data health\n"
+        response += "• 'normalize' — scale features"
+        return response
+
+    # Questions
+    if text.startswith(
+        ("what", "how", "why", "which", "can", "is", "are", "does", "tell")
+    ):
+        return (
+            f"I execute, not explain. 📊 {df.shape[0]}×{df.shape[1]}\n\n"
+            f"Actions: fill nulls | drop cols | normalize | encode | remove outliers | filter | rename\n\n"
+            f"Say it → I do it. Try 'do it all'."
+        )
+
+    # Default
+    return f"📊 {df.shape[0]}×{df.shape[1]} | Say what to do → I execute.\nTry: 'do it all', 'fill nulls', 'analyse'"
+
+
+def _extract_transform_constraints(prompt: str) -> Dict[str, bool]:
+    """Extract strict user constraints from transform prompt text."""
+    text = (prompt or "").lower()
+
+    no_row_removal = bool(
+        re.search(
+            r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(row|rows)", text
+        )
+        or re.search(r"(keep|retain).{0,30}(all\s+)?rows", text)
+        or "without data loss" in text
+    )
+    no_row_change = bool(
+        "same number of rows" in text
+        or "do not change rows" in text
+        or "don't change rows" in text
+    )
+    no_col_removal = bool(
+        re.search(
+            r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(column|columns|col|cols)",
+            text,
+        )
+        or re.search(r"(keep|retain).{0,30}(all\s+)?(columns|cols)", text)
+        or "without data loss" in text
+    )
+    no_col_change = bool(
+        "same number of columns" in text
+        or "do not change columns" in text
+        or "don't change columns" in text
+    )
+
+    return {
+        "no_row_removal": no_row_removal,
+        "no_row_change": no_row_change,
+        "no_col_removal": no_col_removal,
+        "no_col_change": no_col_change,
+    }
+
+
+def _validate_transform_constraints(
+    constraints: Dict[str, bool], diff: Dict[str, int]
+) -> List[str]:
+    """Return violations when generated transform breaks explicit prompt constraints."""
+    violations: List[str] = []
+
+    if constraints.get("no_row_change") and diff["rows_after"] != diff["rows_before"]:
+        violations.append("Prompt requires the same number of rows")
+    elif constraints.get("no_row_removal") and diff["rows_after"] < diff["rows_before"]:
+        violations.append("Prompt says not to remove rows")
+
+    if constraints.get("no_col_change") and diff["cols_after"] != diff["cols_before"]:
+        violations.append("Prompt requires the same number of columns")
+    elif constraints.get("no_col_removal") and diff["cols_after"] < diff["cols_before"]:
+        violations.append("Prompt says not to remove columns")
+
+    return violations
+
+
+def _validate_transform_code(code: str) -> None:
+    """Block dangerous patterns in generated transform code."""
+    forbidden = [
+        "import ",
+        "from ",
+        "__import__",
+        "subprocess",
+        "os.system",
+        "os.popen",
+        "eval(",
+        "exec(",
+        "compile(",
+        "open(",
+        "shutil",
+        "pathlib",
+        "requests.",
+        "urllib",
+        "socket",
+        "http.client",
+        "globals(",
+        "locals(",
+        "getattr(",
+        "setattr(",
+        "delattr(",
+        "__builtins__",
+        "__class__",
+        "__subclasses__",
+    ]
+    code_lower = code.lower()
+    for pattern in forbidden:
+        if pattern.lower() in code_lower:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Generated code contains forbidden pattern: {pattern.strip()}",
+            )
+
+
+def _build_transform_summary(
+    prompt: str,
+    diff: dict,
+    result_df: "pd.DataFrame | None" = None,
+    before_df: "pd.DataFrame | None" = None,
+    session: "dict | None" = None,
+) -> str:
+    """Build execution result in the copilot format with proactive next-action suggestions."""
+    lines = []
+    lines.append(f"⚡ Executed: {prompt[:60]}")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("")
+
+    # AI Decision block (only for meaningful transforms)
+    if (
+        before_df is not None
+        and result_df is not None
+        and (
+            diff["nulls_removed"] > 0
+            or diff["rows_changed"] > 0
+            or diff["cols_changed"] > 0
+        )
+    ):
+        decision_block = _build_decision_block(prompt, diff, before_df, result_df)
+        if decision_block:
+            lines.append(decision_block)
+            lines.append("")
+
+    lines.append("📊 Result:")
+    lines.append(
+        f"  Before: {diff['rows_before']} rows, {diff['cols_before']} cols, {diff['nulls_before']} nulls"
+    )
+    lines.append(
+        f"  After:  {diff['rows_after']} rows, {diff['cols_after']} cols, {diff['nulls_after']} nulls"
+    )
+    lines.append("")
+
+    changes = []
+    if diff["rows_changed"] > 0:
+        direction = "removed" if diff["rows_after"] < diff["rows_before"] else "added"
+        changes.append(f"✅ {diff['rows_changed']} rows {direction}")
+    if diff["cols_changed"] > 0:
+        direction = "removed" if diff["cols_after"] < diff["cols_before"] else "added"
+        changes.append(f"✅ {diff['cols_changed']} columns {direction}")
+    if diff["nulls_removed"] > 0:
+        changes.append(f"✅ {diff['nulls_removed']} null values fixed")
+    if not changes:
+        changes.append("✅ Data modified (same shape)")
+
+    lines.extend(changes)
+
+    # Quality progress bar
+    if result_df is not None and session is not None:
+        current_score = _compute_quality_score(result_df)
+        quality_history = session.get("quality_history", [])
+        # Record this step
+        short_label = prompt[:18] + "..." if len(prompt) > 18 else prompt
+        quality_history.append(
+            {"label": f"After: {short_label}", "score": current_score}
+        )
+        session["quality_history"] = quality_history
+        lines.append("")
+        lines.append(_build_quality_progress_bar(quality_history[:-1], current_score))
+
+    # Proactive next-action suggestion based on data state
+    lines.append("")
+    suggestion = _get_proactive_suggestion(prompt, diff, result_df)
+    lines.append(suggestion)
+
+    return "\n".join(lines)
+
+
+def _build_decision_block(
+    prompt: str, diff: dict, before_df: "pd.DataFrame", result_df: "pd.DataFrame"
+) -> str:
+    """Build the AI Decision confidence block showing WHY a particular approach was chosen."""
+    prompt_lower = (prompt or "").lower()
+    lines = []
+
+    # Null filling decisions
+    if (
+        "fill" in prompt_lower
+        or "null" in prompt_lower
+        or "impute" in prompt_lower
+        or diff["nulls_removed"] > 0
+    ):
+        # Find which columns had nulls filled
+        filled_cols = []
+        for col in before_df.columns:
+            if col not in result_df.columns:
+                continue
+            before_nulls = int(before_df[col].isnull().sum())
+            after_nulls = (
+                int(result_df[col].isnull().sum()) if col in result_df.columns else 0
+            )
+            if before_nulls > 0 and after_nulls < before_nulls:
+                filled_cols.append(
+                    (col, before_nulls - after_nulls, before_df[col].dtype)
+                )
+
+        if filled_cols:
+            lines.append("🧠 AI Decision")
+            lines.append("━━━━━━━━━━━━")
+            # Show decision for the top column
+            top_col, top_fixed, top_dtype = filled_cols[0]
+            if top_dtype in ["float64", "int64", "float32", "int32"]:
+                col_data = before_df[top_col].dropna()
+                if len(col_data) > 0:
+                    median_val = col_data.median()
+                    mean_val = col_data.mean()
+                    skew = col_data.skew()
+                    # Determine confidence based on skewness
+                    if abs(skew) > 1:
+                        confidence = 94
+                        strategy = "median"
+                        reason = f"Distribution is skewed ({skew:.1f}). Median is more robust than mean."
+                        alternative = f"Mean ({mean_val:.1f}) — rejected: skew would bias imputation"
+                    elif abs(skew) > 0.5:
+                        confidence = 85
+                        strategy = "median"
+                        reason = f"Moderate skew ({skew:.1f}). Median preferred for robustness."
+                        alternative = (
+                            f"Mean ({mean_val:.1f}) — acceptable but less robust"
+                        )
+                    else:
+                        confidence = 88
+                        strategy = "median"
+                        reason = f"Symmetric distribution. Median ≈ Mean, using median for safety."
+                        alternative = f"Mean ({mean_val:.1f}) — equally valid here"
+
+                    lines.append(
+                        f"Decision: Fill '{top_col}' nulls with {strategy} ({median_val:.1f})"
+                    )
+                    lines.append(f"Confidence: {confidence}%")
+                    lines.append(f"Reason: {reason}")
+                    lines.append(f"Alternative: {alternative}")
+            else:
+                col_data = before_df[top_col].dropna()
+                if len(col_data) > 0:
+                    mode_val = (
+                        col_data.mode().iloc[0]
+                        if not col_data.mode().empty
+                        else "Unknown"
+                    )
+                    mode_freq = int((col_data == mode_val).sum())
+                    mode_pct = round(mode_freq / len(col_data) * 100, 0)
+                    confidence = min(95, max(60, int(mode_pct)))
+                    lines.append(
+                        f"Decision: Fill '{top_col}' nulls with mode ('{mode_val}')"
+                    )
+                    lines.append(f"Confidence: {confidence}%")
+                    lines.append(
+                        f"Reason: Mode appears in {mode_pct}% of non-null values — strong majority."
+                    )
+                    lines.append(
+                        f"Alternative: 'Unknown' — use if mode dominance < 50%"
+                    )
+
+            if len(filled_cols) > 1:
+                others = ", ".join(f"'{c}'" for c, _, _ in filled_cols[1:4])
+                lines.append(
+                    f"Also fixed: {others} ({len(filled_cols)-1} more columns)"
+                )
+
+    # Outlier removal decisions
+    elif "outlier" in prompt_lower:
+        if diff["rows_changed"] > 0:
+            lines.append("🧠 AI Decision")
+            lines.append("━━━━━━━━━━━━")
+            lines.append(
+                f"Decision: Remove {diff['rows_changed']} outlier rows using IQR method (1.5×)"
+            )
+            lines.append("Confidence: 87%")
+            lines.append(
+                "Reason: IQR is standard for unknown distributions. Removes extreme values only."
+            )
+            lines.append(
+                "Alternative: Z-score (3σ) — more lenient, keeps borderline cases"
+            )
+
+    # Encoding decisions
+    elif "encode" in prompt_lower:
+        if diff["cols_changed"] > 0:
+            lines.append("🧠 AI Decision")
+            lines.append("━━━━━━━━━━━━")
+            lines.append(f"Decision: Label encoding (categories → integers)")
+            lines.append("Confidence: 82%")
+            lines.append(
+                "Reason: Preserves column count. Tree models handle label encoding well."
+            )
+            lines.append(
+                "Alternative: One-hot encoding — better for linear models, adds columns"
+            )
+
+    # Normalization decisions
+    elif "normalize" in prompt_lower or "scale" in prompt_lower:
+        lines.append("🧠 AI Decision")
+        lines.append("━━━━━━━━━━━━")
+        lines.append(f"Decision: Min-Max normalization (scale to 0-1)")
+        lines.append("Confidence: 80%")
+        lines.append("Reason: Preserves distribution shape. Works for most ML models.")
+        lines.append(
+            "Alternative: Z-score standardization — better if data has outliers"
+        )
+
+    return "\n".join(lines) if lines else ""
+
+
+def _get_proactive_suggestion(
+    prompt: str, diff: dict, result_df: "pd.DataFrame | None" = None
+) -> str:
+    """Generate a smart proactive suggestion based on what was just done."""
+    prompt_lower = (prompt or "").lower()
+
+    if result_df is None:
+        if diff["nulls_after"] > 0:
+            return f"💡 I noticed {diff['nulls_after']} nulls still remain. Want me to fill them all?\n🔜 Type: 'fill all null values'"
+        return "🔜 Next: Try 'normalize numeric columns' or go Back to Training."
+
+    nulls_remaining = int(result_df.isnull().sum().sum())
+    dups = int(result_df.duplicated().sum())
+    num_cols = result_df.select_dtypes(include=["number"]).columns.tolist()
+    cat_cols = result_df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+    # After fixing nulls
+    if "null" in prompt_lower or "fill" in prompt_lower or "impute" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 {nulls_remaining} nulls still remain in other columns. Want me to fix those too?\n🔜 Type: 'fill all null values'"
+        elif cat_cols:
+            return f"💡 Nulls are gone! I see {len(cat_cols)} categorical column(s) ({', '.join(cat_cols[:3])}). Want me to encode them for ML?\n🔜 Type: 'encode categorical columns'"
+        elif num_cols:
+            # Check for outliers
+            outlier_count = 0
+            for col in num_cols[:5]:
+                q1, q3 = result_df[col].quantile(0.25), result_df[col].quantile(0.75)
+                iqr = q3 - q1
+                outliers = (
+                    (result_df[col] < q1 - 1.5 * iqr)
+                    | (result_df[col] > q3 + 1.5 * iqr)
+                ).sum()
+                outlier_count += int(outliers)
+            if outlier_count > 0:
+                return f"💡 Numeric columns are clean. I found {outlier_count} potential outliers. Want me to remove them?\n🔜 Type: 'remove outliers'"
+            return f"💡 Data looks great! Want me to normalize the {len(num_cols)} numeric columns for ML?\n🔜 Type: 'normalize numeric columns'"
+        else:
+            return "✅ Data is ML-ready! Go Back to Training to start model training."
+
+    # After encoding
+    if "encode" in prompt_lower or "categorical" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Encoding done. Still {nulls_remaining} nulls to fix first.\n🔜 Type: 'fill all null values'"
+        total_cells = result_df.shape[0] * result_df.shape[1]
+        quality = min(
+            100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
+        )
+        return f"💡 Categorical columns encoded. Quality: {quality}/100. Want me to normalize numeric features?\n🔜 Type: 'normalize numeric columns'"
+
+    # After normalizing
+    if (
+        "normalize" in prompt_lower
+        or "scale" in prompt_lower
+        or "standardize" in prompt_lower
+    ):
+        total_cells = result_df.shape[0] * result_df.shape[1]
+        quality = min(
+            100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
+        )
+        if cat_cols:
+            return f"💡 Normalized! Quality: {quality}/100. {len(cat_cols)} text column(s) remain. Want me to encode them?\n🔜 Type: 'encode categorical columns'"
+        return f"✅ Dataset quality: {quality}/100. Data is ML-ready! Go Back to Training to start."
+
+    # After removing outliers
+    if "outlier" in prompt_lower:
+        if cat_cols:
+            return f"💡 Outliers removed. Want me to encode {len(cat_cols)} categorical column(s) for ML?\n🔜 Type: 'encode categorical columns'"
+        return f"💡 Outliers removed. Data is clean. Want me to normalize numeric columns?\n🔜 Type: 'normalize numeric columns'"
+
+    # After dropping columns
+    if "drop" in prompt_lower and "col" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Column(s) dropped. {nulls_remaining} nulls remain. Want me to fix them?\n🔜 Type: 'fill all null values'"
+        return "💡 Columns cleaned up. Data looks good!\n🔜 Type: 'analyse' to check quality score."
+
+    # After dropping duplicates
+    if "duplicate" in prompt_lower:
+        if nulls_remaining > 0:
+            return f"💡 Duplicates gone! But {nulls_remaining} nulls remain. Want me to fix them?\n🔜 Type: 'fill all null values'"
+        return "💡 No duplicates. Data is cleaner now!\n🔜 Type: 'analyse' to see quality score."
+
+    # After converting types
+    if (
+        "convert" in prompt_lower
+        or "dtype" in prompt_lower
+        or "numeric" in prompt_lower
+    ):
+        if nulls_remaining > 0:
+            return f"💡 Types converted. Conversion may have created {nulls_remaining} new nulls (invalid values → NaN). Want me to fill them?\n🔜 Type: 'fill all null values'"
+        return "💡 Types fixed! Data is in better shape now.\n🔜 Type: 'analyse' to check progress."
+
+    # Generic: base on data state
+    if nulls_remaining > 0:
+        return f"💡 {nulls_remaining} nulls remaining. Want me to fix them?\n🔜 Type: 'fill all null values'"
+    elif dups > 0:
+        return f"💡 {dups} duplicate rows found. Want me to remove them?\n🔜 Type: 'drop duplicates'"
+    elif cat_cols:
+        return f"💡 Data is clean! {len(cat_cols)} categorical column(s) could be encoded for ML.\n🔜 Type: 'encode categorical columns'"
+    else:
+        total_cells = result_df.shape[0] * result_df.shape[1]
+        quality = min(
+            100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
+        )
+        return f"✅ Dataset quality: {quality}/100. ML-ready! Go Back to Training."
+
+
+def _compute_quality_score(df: pd.DataFrame) -> int:
+    """Compute a 0-100 quality score for a DataFrame."""
+    if df.shape[0] == 0:
+        return 0
+    total_cells = df.shape[0] * df.shape[1]
+    nulls = int(df.isnull().sum().sum())
+    dups = int(df.duplicated().sum())
+
+    # Completeness (0-50 points)
+    completeness_ratio = 1 - (nulls / max(total_cells, 1))
+    completeness_score = int(completeness_ratio * 50)
+
+    # No duplicates (0-15 points)
+    dup_ratio = dups / max(df.shape[0], 1)
+    dup_score = int((1 - min(dup_ratio * 5, 1)) * 15)
+
+    # Type correctness (0-20 points) — object columns that look numeric lose points
+    type_penalty = 0
+    for col in df.select_dtypes(include=["object"]).columns:
+        numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+        if numeric_count > df.shape[0] * 0.5:
+            type_penalty += 5
+    type_score = max(0, 20 - type_penalty)
+
+    # Column utility (0-15 points) — constant or near-constant columns lose points
+    constant_penalty = 0
+    for col in df.columns:
+        if df[col].nunique() <= 1:
+            constant_penalty += 5
+    utility_score = max(0, 15 - constant_penalty)
+
+    return min(100, max(0, completeness_score + dup_score + type_score + utility_score))
+
+
+def _build_quality_progress_bar(quality_history: list, current_score: int) -> str:
+    """Build a visual quality progress bar showing improvement over the session."""
+    ML_READY_THRESHOLD = 80
+    lines = []
+    lines.append("📈 Dataset Health")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    for entry in quality_history:
+        score = entry["score"]
+        label = entry["label"]
+        bar = _score_to_bar(score)
+        lines.append(f"  {label:<22} {score:>3}/100 {bar}")
+
+    # Current
+    bar = _score_to_bar(current_score)
+    lines.append(f"  {'Current':<22} {current_score:>3}/100 {bar}")
+
+    # ML Ready threshold line
+    lines.append(f"  {'ML Ready threshold':<22} {ML_READY_THRESHOLD:>3}/100 {'─' * 20}")
+
+    if current_score >= ML_READY_THRESHOLD:
+        lines.append("\n✅ Your dataset is now ML-ready!")
+    else:
+        gap = ML_READY_THRESHOLD - current_score
+        lines.append(f"\n⚡ {gap} points to ML-ready. Keep cleaning!")
+
+    return "\n".join(lines)
+
+
+def _score_to_bar(score: int) -> str:
+    """Convert a 0-100 score to a visual bar."""
+    filled = score // 5  # 20 chars max
+    empty = 20 - filled
+    return "█" * filled + "░" * empty
+
+
+def _build_null_scan_response(df: pd.DataFrame) -> str:
+    """Build structured null value scan response in copilot format."""
+    null_cols = []
+    for col in df.columns:
+        col_nulls = int(df[col].isnull().sum())
+        if col_nulls > 0:
+            pct = round(col_nulls / df.shape[0] * 100, 0)
+            # Determine suggested fix
+            if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                median_val = df[col].median()
+                fix = (
+                    f"Fill with median ({median_val:.0f})"
+                    if not pd.isna(median_val)
+                    else "Fill with 0"
+                )
+            elif df[col].dtype == "object":
+                mode_val = df[col].mode()
+                if not mode_val.empty:
+                    fix = f"Fill with mode ('{mode_val.iloc[0]}')"
+                else:
+                    fix = "Fill with 'Unknown'"
+            else:
+                fix = "Fill with forward fill"
+            null_cols.append((col, col_nulls, int(pct), fix))
+
+    if not null_cols:
+        return "✅ No null values found! Dataset is complete.\n\n🔜 Next: Try 'normalize numeric columns' or 'remove outliers'"
+
+    # Sort by null count descending
+    null_cols.sort(key=lambda x: x[1], reverse=True)
+    total_nulls = sum(n for _, n, _, _ in null_cols)
+
+    response = "🔍 Null Value Scan Complete\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Table header
+    max_col_len = max(len(col) for col, _, _, _ in null_cols)
+    col_width = max(max_col_len, 10)
+    response += f"{'Column':<{col_width}}  Nulls    %     Suggested Fix\n"
+    response += "─" * (col_width + 40) + "\n"
+
+    for col, nulls, pct, fix in null_cols:
+        response += f"{col:<{col_width}}  {nulls:<6}  {pct:>3}%   → {fix}\n"
+
+    response += f"\nTotal: {total_nulls} nulls across {len(null_cols)} columns\n\n"
+    response += "🎯 Type 'fill all null values' to fix everything automatically."
+
+    return response
+
+
+def _build_dataset_profile_for_analysis(df: pd.DataFrame) -> str:
+    """Build a rich text profile of the dataset for the AI analyzer."""
+    lines = []
+    lines.append(f"Shape: {df.shape[0]} rows × {df.shape[1]} columns")
+    lines.append(f"Total null values: {int(df.isnull().sum().sum())}")
+    lines.append(f"Duplicate rows: {int(df.duplicated().sum())}")
+    lines.append(f"Memory usage: {df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+    lines.append("")
+    lines.append("COLUMNS:")
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        nulls = int(df[col].isnull().sum())
+        null_pct = f"{(nulls / len(df)) * 100:.1f}%" if len(df) > 0 else "0%"
+        unique = df[col].nunique()
+        sample = df[col].dropna().head(3).tolist()
+
+        line = f"  - {col} ({dtype}): {unique} unique, {nulls} nulls ({null_pct})"
+        if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+            line += (
+                f", range=[{df[col].min()}, {df[col].max()}], mean={df[col].mean():.2f}"
+            )
+        else:
+            line += f", sample={sample[:3]}"
+        lines.append(line)
+
+    # Check for potential issues
+    lines.append("")
+    lines.append("DETECTED ISSUES:")
+    issues_found = False
+
+    # High null columns
+    high_null_cols = [
+        (col, int(df[col].isnull().sum()))
+        for col in df.columns
+        if df[col].isnull().sum() > len(df) * 0.1
+    ]
+    if high_null_cols:
+        issues_found = True
+        for col, count in high_null_cols:
+            lines.append(
+                f"  ⚠ Column '{col}' has {count} nulls ({count/len(df)*100:.0f}%)"
+            )
+
+    # Duplicate rows
+    dup_count = int(df.duplicated().sum())
+    if dup_count > 0:
+        issues_found = True
+        lines.append(f"  ⚠ {dup_count} duplicate rows found")
+
+    # Constant columns
+    for col in df.columns:
+        if df[col].nunique() <= 1:
+            issues_found = True
+            lines.append(f"  ⚠ Column '{col}' has only 1 unique value (constant)")
+
+    # Potential type mismatches (object columns that might be numeric)
+    for col in df.columns:
+        if df[col].dtype == "object":
+            numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+            if numeric_count > len(df) * 0.8:
+                issues_found = True
+                lines.append(
+                    f"  ⚠ Column '{col}' is stored as text but appears numeric ({numeric_count}/{len(df)} values)"
+                )
+
+    if not issues_found:
+        lines.append("  ✓ No major issues detected")
+
+    return "\n".join(lines)
+
+
+def _parse_analysis_response(raw: Optional[str]) -> dict:
+    """Parse the LLM analysis response into structured format."""
+    fallback = {
+        "quality_score": 50,
+        "issues": [],
+        "column_insights": [],
+        "recommended_transforms": [],
+        "summary": "Could not generate analysis. Try transforming your data manually.",
+    }
+
+    if not raw:
+        return fallback
+
+    # Try to extract JSON
+    text = raw.strip()
+    text = _strip_code_fences(text)
+
+    # Find JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        # Try to salvage a text response
+        return {
+            "quality_score": 60,
+            "issues": [],
+            "column_insights": [],
+            "recommended_transforms": [],
+            "summary": text[:500],
+        }
+
+    try:
+        parsed = json.loads(text[start : end + 1])
+        if not isinstance(parsed, dict):
+            return fallback
+
+        # Ensure required fields
+        return {
+            "quality_score": parsed.get("quality_score", 50),
+            "issues": parsed.get("issues", []),
+            "column_insights": parsed.get("column_insights", []),
+            "recommended_transforms": parsed.get("recommended_transforms", []),
+            "summary": parsed.get("summary", "Analysis complete."),
+        }
+    except json.JSONDecodeError:
+        return {
+            "quality_score": 60,
+            "issues": [],
+            "column_insights": [],
+            "recommended_transforms": [],
+            "summary": text[:500],
+        }
+
+
+def _parse_thinking_response(raw: Optional[str]) -> dict:
+    """Parse the LLM thinking/planning response."""
+    fallback = {
+        "thinking": "Ready to execute",
+        "is_valid": True,
+        "validation_issues": [],
+        "plan": ["Execute transformation"],
+        "estimated_impact": {},
+        "confidence": "medium",
+        "warnings": [],
+    }
+
+    if not raw:
+        return fallback
+
+    text = raw.strip()
+    text = _strip_code_fences(text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return fallback
+
+    try:
+        parsed = json.loads(text[start : end + 1])
+        if not isinstance(parsed, dict):
+            return fallback
+        return {
+            "thinking": parsed.get("thinking", "Ready to execute"),
+            "is_valid": parsed.get("is_valid", True),
+            "validation_issues": parsed.get("validation_issues", []),
+            "plan": parsed.get("plan", ["Execute transformation"]),
+            "estimated_impact": parsed.get("estimated_impact", {}),
+            "confidence": parsed.get("confidence", "medium"),
+            "warnings": parsed.get("warnings", []),
+        }
+    except json.JSONDecodeError:
+        return fallback
