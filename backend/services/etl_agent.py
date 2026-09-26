@@ -1051,143 +1051,97 @@ def _grain_guard(
     named: Dict[str, tuple],
     dedupe_on: Optional[List[str]],
 ) -> Optional[str]:
-    """Refuse an aggregation that would over-count a repeated measure."""
+    """Refuse an aggregation that would over-count a repeated measure.
+
+    Returns a refusal reason, or None when the aggregation is safe.
+
+    The rule: if a measure's source table has its rows repeated by a
+    one-to-many join (multiplied_tables), then SUM/MEAN/COUNT over the flat
+    frame counts each of its rows once per child row. De-fanning on that
+    table's natural key first is the fix, and dedupe_on is how it is requested.
+    """
     multiplied = set(session.grain.get("multiplied_tables") or [])
     if not multiplied:
         return None
 
-    natural_keys: Dict[str, List[str]] = (
-        session.grain.get("natural_key_aliases") or {}
-    )
+    natural_keys: Dict[str, List[str]] = session.grain.get("natural_key_aliases") or {}
     at_risk: Dict[str, List[str]] = {}
 
     for new_name, (column, function) in named.items():
         if function not in FANOUT_SENSITIVE_FUNCTIONS:
             continue
-
         table = _source_table_of(session, column)
         if table and table in multiplied:
-            at_risk.setdefault(table, []).append(
-                f"{column} ({function})"
-            )
+            at_risk.setdefault(table, []).append(f"{column} ({function})")
 
     if not at_risk:
         return None
 
-    # Measures from two different repeated tables cannot both be
-    # safely de-fanned by one dedupe operation.
-    if len(at_risk) > 1:
-        return (
-            "This aggregation mixes measures from more than one repeated "
-            "table "
-            f"({', '.join(sorted(at_risk))}), which cannot be de-fanned "
-            "in a single step. Aggregate one table's measures at a time."
-        )
 
-    table = next(iter(at_risk))
-
-    natural_key_columns = [
-        str(k)
-        for k in natural_keys.get(table, [])
-        if k in session.df.columns
-    ]
-
-    keys_for_table = [
-        k for k in natural_key_columns
-        if k not in keys
-    ]
-
-    if not keys_for_table:
-        declared = (
-            (session.grain.get("primary_keys_by_table") or {}).get(table)
-            or []
-        )
-
-        if len(declared) > 1:
-            return (
-                f"'{table}' has a composite primary key "
-                f"({', '.join(declared)}), which this version cannot "
-                "de-fan safely. Aggregate that table separately, or "
-                "build the dataset without the table that multiplies "
-                "its rows."
-            )
-
-        return (
-            f"Rows of '{table}' are repeated by a one-to-many join, so "
-            f"{', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
-            f"would be over-counted - but no usable natural key for "
-            f"'{table}' is present in the dataset, so it cannot be "
-            "de-fanned. Rebuild the dataset including that table's "
-            "primary key, or leave out the table that multiplies it."
-        )
-
-    # No dedupe key was provided.
     if not dedupe_on:
+        suggestions = [
+            f"{table}: dedupe_on={aliases}"
+            for table, aliases in natural_keys.items()
+            if table in at_risk and aliases
+        ]
+        
         return (
-            f"Refused: rows of '{table}' are repeated by a one-to-many "
-            f"join, so "
-            f"{', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
-            f"would be over-counted. Pass dedupe_on={keys_for_table} "
-            "to collapse the source table back to one row per record "
-            "BEFORE aggregating. Do not use drop_duplicates on "
-            f"{', '.join(keys)} instead - that deletes real rows."
+            "Refused: the dataset contains fan-out and the aggregation uses a "
+            "fan-out-sensitive function. You must de-fan using the natural key "
+            "of the source table before aggregation."
+            + (f" Suggested: {', '.join(suggestions)}" if suggestions else "")
         )
 
-    requested = {str(c) for c in dedupe_on}
-    grouping_keys = {str(k) for k in keys}
-
-    # Never dedupe on the final grouping grain.
-    overlap = requested & grouping_keys
-    if overlap:
-        return (
-            f"Refused: dedupe_on={sorted(requested)} overlaps the "
-            f"grouping columns {sorted(grouping_keys)}. De-duplicating "
-            "on the grain you are aggregating TO keeps one row per "
-            "group and deletes the rest - it is data loss, not "
-            "de-fanning."
-        )
-
-    base_table = session.grain.get("base_table")
-    if table == base_table:
-        return (
-            f"Refused: '{table}' is the base table, so its key defines "
-            "the output grain and cannot be used to de-fan. De-fan on "
-            "the child table's key instead."
-        )
-
-    # The supplied key must be exactly the natural key of the
-    # table whose measure is being aggregated.
-    expected = set(natural_key_columns)
-
-    if requested != expected:
-        owner = next(
-            (
-                t
-                for t, aliases in natural_keys.items()
-                if requested == {str(x) for x in aliases}
-            ),
-            None,
-        )
-
-        hint = (
-            f" {sorted(requested)} is the natural key of '{owner}', "
-            f"not of '{table}'."
-            if owner
-            else ""
-        )
-
-        return (
-            f"Refused: "
-            f"{', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
-            f"comes from '{table}', whose rows are repeated by a "
-            "one-to-many join. It must be de-fanned on that table's "
-            f"own natural key {sorted(expected)}, not on "
-            f"{sorted(requested)}.{hint}"
-        )
-
-    # Everything is valid.
+    if dedupe_on:
+        requested = {str(c) for c in dedupe_on}
+        base_table = session.grain.get("base_table")
+        
+        overlap = requested & {str(k) for k in keys}
+        if overlap:
+            return (
+                f"Refused: dedupe_on={sorted(requested)} overlaps the grouping "
+                f"columns {sorted(keys)}. De-duplicating on the grain you are "
+                f"aggregating TO keeps one row per group and deletes the rest - "
+                f"it is data loss, not de-fanning. dedupe_on must be the natural "
+                f"key of the table whose measure is being aggregated."
+            )
+        
+        for table in at_risk:
+            expected = {
+                str(a)
+                for a in natural_keys.get(table, [])
+                if a in session.df.columns
+            }
+            
+            if not expected:
+                break
+            
+            if requested != expected:
+                owner = next(
+                    (
+                        t for t, a in natural_keys.items()
+                        if requested == {str(x) for x in a}
+                    ),
+                    None,
+                )
+                hint = (
+                    f" {sorted(requested)} is the natural key of '{owner}', not of "
+                    f"'{table}'." if owner else ""
+                )
+                return (
+                    f"Refused: {', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
+                    f"comes from '{table}', whose rows are repeated by a one-to-many "
+                    f"join, so it must be de-fanned on '{table}'s own natural key "
+                    f"{sorted(expected)} - not on {sorted(requested)}.{hint}"
+                )
+            
+            if table == base_table:
+                return (
+                    f"Refused: '{table}' is the base table, so its key defines the "
+                    f"output grain and cannot be used to de-fan. De-fan on the child "
+                    f"table's key instead."
+                )
     return None
-
 
     # Measures from two different repeated tables cannot both be de-fanned by
     # one dedupe. Refuse rather than return a number that is right for one.
@@ -2381,12 +2335,15 @@ def execute_tool(
     if refusal:
         return {"ok": False, "error": refusal, "tool": tool_name}
 
+    refusal = _redundant_after_clean_validation(session, tool_name)
+    if refusal:
+        return {"ok": False, "error": refusal, "tool": tool_name}
+
     _protected = _protect_grain_keys(session, tool_name, arguments)
 
     # Fingerprint before the call, so a tool that really changes the dataset
     # clears the clean-validation flag no matter which branch executes it.
     fingerprint_before = session.dataset_fingerprint()
-        
 
     # Names the MODEL chose are safe to show back to it. Registering them here
     # keeps the boundary from placeholdering a rename or an aggregate the model
