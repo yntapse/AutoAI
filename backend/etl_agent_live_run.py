@@ -35,9 +35,9 @@ import urllib.request
 
 sys.path.insert(0, ".")
 
-CUSTOMERS = "MLTest_Customers"
-ORDERS = "MLTest_Orders"
-ITEMS = "MLTest_OrderItems"
+CUSTOMERS = "MLTest_LargeCustomers"
+ORDERS = "MLTest_LargeOrders"
+ITEMS = "MLTest_LargeOrderItems"
 
 USER_REQUEST = (
     "Build a customer-level dataset I can use to predict each customer's total "

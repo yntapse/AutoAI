@@ -146,6 +146,12 @@ class ETLSession:
         self.grain: Dict[str, Any] = {}
         self.internal_columns: set = set()  # kept for grain, dropped before the CSV
 
+        # Set to the dataset's fingerprint when validate_dataset reports a
+        # clean bill of health. Cleared the moment the dataset actually
+        # changes. While it is set, a redundant cleanup or validation call is
+        # not executed - see _redundant_after_clean_validation.
+        self.clean_validation: Optional[str] = None
+
         self.result: Optional[Dict[str, Any]] = None   # set by finish_etl
 
         # --- the privacy boundary's state -------------------------------
@@ -162,6 +168,24 @@ class ETLSession:
 
     def has_dataset(self) -> bool:
         return self.df is not None
+
+    def dataset_fingerprint(self) -> Optional[str]:
+        """A cheap identity for the current dataset's CONTENT.
+
+        Shape and column names alone are not enough: fill_nulls changes values
+        without changing either, and that has to count as a real change. The
+        row hash catches it. Never raises - an exotic dtype degrades to a
+        shape-only fingerprint rather than breaking the guard.
+        """
+        if self.df is None:
+            return None
+        shape = f"{self.df.shape}:{tuple(str(c) for c in self.df.columns)}"
+        try:
+            from pandas.util import hash_pandas_object  # noqa: PLC0415
+
+            return f"{shape}:{int(hash_pandas_object(self.df, index=False).sum())}"
+        except Exception:  # noqa: BLE001
+            return shape
 
     # -- name safety ------------------------------------------------------
 
@@ -1027,31 +1051,143 @@ def _grain_guard(
     named: Dict[str, tuple],
     dedupe_on: Optional[List[str]],
 ) -> Optional[str]:
-    """Refuse an aggregation that would over-count a repeated measure.
-
-    Returns a refusal reason, or None when the aggregation is safe.
-
-    The rule: if a measure's source table has its rows repeated by a
-    one-to-many join (multiplied_tables), then SUM/MEAN/COUNT over the flat
-    frame counts each of its rows once per child row. De-fanning on that
-    table's natural key first is the fix, and dedupe_on is how it is requested.
-    """
+    """Refuse an aggregation that would over-count a repeated measure."""
     multiplied = set(session.grain.get("multiplied_tables") or [])
-    if not multiplied or dedupe_on:
+    if not multiplied:
         return None
 
-    natural_keys: Dict[str, List[str]] = session.grain.get("natural_key_aliases") or {}
+    natural_keys: Dict[str, List[str]] = (
+        session.grain.get("natural_key_aliases") or {}
+    )
     at_risk: Dict[str, List[str]] = {}
 
     for new_name, (column, function) in named.items():
         if function not in FANOUT_SENSITIVE_FUNCTIONS:
             continue
+
         table = _source_table_of(session, column)
         if table and table in multiplied:
-            at_risk.setdefault(table, []).append(f"{column} ({function})")
+            at_risk.setdefault(table, []).append(
+                f"{column} ({function})"
+            )
 
     if not at_risk:
         return None
+
+    # Measures from two different repeated tables cannot both be
+    # safely de-fanned by one dedupe operation.
+    if len(at_risk) > 1:
+        return (
+            "This aggregation mixes measures from more than one repeated "
+            "table "
+            f"({', '.join(sorted(at_risk))}), which cannot be de-fanned "
+            "in a single step. Aggregate one table's measures at a time."
+        )
+
+    table = next(iter(at_risk))
+
+    natural_key_columns = [
+        str(k)
+        for k in natural_keys.get(table, [])
+        if k in session.df.columns
+    ]
+
+    keys_for_table = [
+        k for k in natural_key_columns
+        if k not in keys
+    ]
+
+    if not keys_for_table:
+        declared = (
+            (session.grain.get("primary_keys_by_table") or {}).get(table)
+            or []
+        )
+
+        if len(declared) > 1:
+            return (
+                f"'{table}' has a composite primary key "
+                f"({', '.join(declared)}), which this version cannot "
+                "de-fan safely. Aggregate that table separately, or "
+                "build the dataset without the table that multiplies "
+                "its rows."
+            )
+
+        return (
+            f"Rows of '{table}' are repeated by a one-to-many join, so "
+            f"{', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
+            f"would be over-counted - but no usable natural key for "
+            f"'{table}' is present in the dataset, so it cannot be "
+            "de-fanned. Rebuild the dataset including that table's "
+            "primary key, or leave out the table that multiplies it."
+        )
+
+    # No dedupe key was provided.
+    if not dedupe_on:
+        return (
+            f"Refused: rows of '{table}' are repeated by a one-to-many "
+            f"join, so "
+            f"{', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
+            f"would be over-counted. Pass dedupe_on={keys_for_table} "
+            "to collapse the source table back to one row per record "
+            "BEFORE aggregating. Do not use drop_duplicates on "
+            f"{', '.join(keys)} instead - that deletes real rows."
+        )
+
+    requested = {str(c) for c in dedupe_on}
+    grouping_keys = {str(k) for k in keys}
+
+    # Never dedupe on the final grouping grain.
+    overlap = requested & grouping_keys
+    if overlap:
+        return (
+            f"Refused: dedupe_on={sorted(requested)} overlaps the "
+            f"grouping columns {sorted(grouping_keys)}. De-duplicating "
+            "on the grain you are aggregating TO keeps one row per "
+            "group and deletes the rest - it is data loss, not "
+            "de-fanning."
+        )
+
+    base_table = session.grain.get("base_table")
+    if table == base_table:
+        return (
+            f"Refused: '{table}' is the base table, so its key defines "
+            "the output grain and cannot be used to de-fan. De-fan on "
+            "the child table's key instead."
+        )
+
+    # The supplied key must be exactly the natural key of the
+    # table whose measure is being aggregated.
+    expected = set(natural_key_columns)
+
+    if requested != expected:
+        owner = next(
+            (
+                t
+                for t, aliases in natural_keys.items()
+                if requested == {str(x) for x in aliases}
+            ),
+            None,
+        )
+
+        hint = (
+            f" {sorted(requested)} is the natural key of '{owner}', "
+            f"not of '{table}'."
+            if owner
+            else ""
+        )
+
+        return (
+            f"Refused: "
+            f"{', '.join(sorted(v for vs in at_risk.values() for v in vs))} "
+            f"comes from '{table}', whose rows are repeated by a "
+            "one-to-many join. It must be de-fanned on that table's "
+            f"own natural key {sorted(expected)}, not on "
+            f"{sorted(requested)}.{hint}"
+        )
+
+    # Everything is valid.
+    return None
+
 
     # Measures from two different repeated tables cannot both be de-fanned by
     # one dedupe. Refuse rather than return a number that is right for one.
@@ -1596,6 +1732,12 @@ def _validate_dataset(
         logger.info("Readiness check unavailable: %s", exc)
         readiness = {"ready": None, "reason": "Readiness check unavailable."}
 
+    # A row shortage is a real issue and must be reported: otherwise the model
+    # is told "no issues found" while the platform considers the dataset
+    # untrainable, and it keeps calling cleanup tools to fix a phantom.
+    if readiness.get("ready") is False and readiness.get("reason"):
+        problems.append(str(readiness["reason"]))
+
     target_report: Optional[Dict[str, Any]] = None
     if target_column:
         name = str(target_column)
@@ -1620,12 +1762,42 @@ def _validate_dataset(
             if nulls:
                 problems.append(f"Target '{name}' has {nulls} null value(s).")
 
+    # A clean bill of health: nothing to fix, and a usable target. Record the
+    # dataset's fingerprint so a later cleanup call can be recognised as
+    # redundant. Anything less clears it - a validation that found problems is
+    # not a licence to stop.
+    # Only what the CLEANUP tools could actually fix may hold the guard open.
+    # Everything else is reported to the model but must not keep the flag off,
+    # or the agent loops forever trying to clean its way out of a problem that
+    # cleanup cannot touch.
+    #
+    # This is exactly the live 5-row failure: the dataset was below
+    # MIN_TRAINING_ROWS so readiness.ready was False, so the flag was never
+    # set - and no amount of drop_rows_with_nulls can add a row.
+    fixable = [
+        issue
+        for issue in problems
+        if "duplicate row" in issue or issue.startswith(("Entirely null column", "Target"))
+    ]
+
+    if (
+        not fixable
+        and target_report is not None
+        and target_report.get("numeric")
+        and not target_report.get("null_count")
+    ):
+        session.clean_validation = session.dataset_fingerprint()
+    else:
+        session.clean_validation = None
+
     return {
         "ok": True,
         "dataset": summary,
         "target": target_report,
         "training_readiness": readiness,
         "problems": problems,
+        "fixable_problems": fixable,
+        "validated_clean": bool(session.clean_validation),
         "summary": (
             f"{summary['rows']} rows x {summary['columns']} columns; "
             + (f"{len(problems)} issue(s): " + " ".join(problems) if problems else "no issues found.")
@@ -1780,6 +1952,7 @@ _NAME_KEYS = {
 
 _TEXT_KEYS = {
     "summary", "error", "headline", "reasons", "problems", "reason",
+    "fixable_problems",
     "warnings", "message", "note",
 }
 
@@ -1800,7 +1973,7 @@ _NAME_KEYED_DICTS = {"tables", "column_sources", "natural_key_columns"}
 _CONTAINER_KEYS = {
     "dataset", "column_details", "columns", "tables", "relationships",
     "profile", "recommendation", "target", "training_readiness", "problems",
-    "reasons", "warnings", "join_order", "column_names",
+    "reasons", "warnings", "join_order", "column_names", "fixable_problems",
     "candidate_key_columns", "join_keys_used_internally", "group_by",
 }
 
@@ -1820,6 +1993,7 @@ _NUMERIC_KEYS = {
 _BOOL_KEYS = {
     "ok", "terminal", "nullable", "primary_key", "looks_like_key", "numeric",
     "ready", "base_key_unique", "related_key_unique", "row_multiplication",
+    "validated_clean",
 }
 
 ALLOWED_KEYS = (
@@ -1928,6 +2102,16 @@ def get_tools_schema(session: Optional[ETLSession] = None) -> List[Dict[str, Any
     """
     has_dataset = bool(session and session.has_dataset())
 
+    # Once the dataset has cleanly validated and has not changed since, the
+    # cleanup and validation tools are withheld ENTIRELY. Refusing them at
+    # execution time still burned a step each; not offering them means the
+    # model cannot spend a step on one at all. finish_etl and the reshaping
+    # tools stay available, so a genuine further change is still possible -
+    # and making one clears the flag, bringing these back.
+    withheld: set = set()
+    if has_dataset and _validation_still_clean(session):
+        withheld = set(REDUNDANT_AFTER_VALIDATION) - {TERMINAL_TOOL}
+
     tools = [
         {
             "type": "function",
@@ -1938,11 +2122,16 @@ def get_tools_schema(session: Optional[ETLSession] = None) -> List[Dict[str, Any
             },
         }
         for spec in ETL_TOOLS.values()
-        if has_dataset or not spec["requires_dataset"]
+        if (has_dataset or not spec["requires_dataset"])
+        and spec["name"] not in withheld
     ]
 
     if has_dataset:
-        tools.extend(_restricted_transform_schema())
+        tools.extend(
+            tool
+            for tool in _restricted_transform_schema()
+            if tool.get("function", {}).get("name") not in withheld
+        )
 
     return tools
 
@@ -2059,6 +2248,109 @@ def _unsafe_dedupe(session: ETLSession, tool_name: str, arguments: Dict[str, Any
     )
 
 
+# Tools whose only purpose is to remove problems that validation reports. Once
+# validation says there are none, calling one of these again cannot change
+# anything - which is exactly the loop observed against the live model:
+# validate -> drop_rows_with_nulls (no change) -> validate -> ... to MAX_STEPS.
+CLEANUP_TOOLS = {
+    "drop_rows_with_nulls",
+    "fill_nulls",
+    "drop_duplicates",
+    "remove_outliers",
+    "strip_whitespace",
+    "lowercase_columns",
+}
+
+# Guarded after a clean validation. Deliberately NOT the reshaping tools
+# (select_columns, drop_columns, rename_columns, convert_dtype, aggregate_rows,
+# add_calculated_column, filter_rows, ...): the model must stay free to make a
+# genuine change, and doing so clears the flag and re-opens validation.
+# finish_etl is never guarded.
+REDUNDANT_AFTER_VALIDATION = CLEANUP_TOOLS | {"validate_dataset"}
+
+ALREADY_VALIDATED_MESSAGE = (
+    "The dataset has already passed validation with no issues. Call finish_etl "
+    "now unless you have made a new transformation."
+)
+
+
+def _protect_grain_keys(session, tool_name, arguments) -> List[str]:
+    if tool_name not in {"select_columns", "drop_columns"}:
+        return []
+
+    columns = arguments.get("columns")
+    if not isinstance(columns, list) or columns == ["*"]:
+        return []
+
+    multiplied = set(session.grain.get("multiplied_tables") or [])
+    if not multiplied or session.df is None:
+        return []
+
+    natural_keys = session.grain.get("natural_key_aliases") or {}
+
+    protected = {
+        alias
+        for table, aliases in natural_keys.items()
+        if table in multiplied
+        for alias in aliases
+        if alias in session.internal_columns and alias in session.df.columns
+    }
+
+    if not protected:
+        return []
+
+    named = {str(c) for c in columns}
+
+    if tool_name == "select_columns":
+        missing = sorted(protected - named)
+        arguments["columns"] = [str(c) for c in columns] + missing
+        return missing
+
+    removed = sorted(protected & named)
+    arguments["columns"] = [str(c) for c in columns if str(c) not in protected]
+    return removed
+
+
+def _validation_still_clean(session: ETLSession) -> bool:
+    """True when validation passed AND the dataset has not changed since.
+
+    A single source of truth for both the schema filter and the execution
+    guard, so the two can never disagree about whether the run is finished.
+    """
+    if not session.clean_validation:
+        return False
+    if session.dataset_fingerprint() != session.clean_validation:
+        # Changed without the flag being cleared: treat it as changed.
+        session.clean_validation = None
+        return False
+    return True
+
+
+def _redundant_after_clean_validation(
+    session: ETLSession, tool_name: str
+) -> Optional[str]:
+    """Block a cleanup or validation call that cannot change anything.
+
+    Fires only when validate_dataset reported no problems AND the dataset has
+    not changed since. A real transformation moves the fingerprint, which
+    clears the flag in execute_tool, so normal processing resumes by itself.
+
+    finish_etl is never blocked, and nothing is ever called on the model's
+    behalf - this only declines to run a no-op and says what to do instead.
+    """
+    if tool_name == TERMINAL_TOOL or tool_name not in REDUNDANT_AFTER_VALIDATION:
+        return None
+    if not _validation_still_clean(session):
+        return None
+
+    return (
+        f"{ALREADY_VALIDATED_MESSAGE} '{tool_name}' was not executed, because "
+        f"the dataset is unchanged since that validation and this call cannot "
+        f"alter it. If you genuinely need a further change, make that "
+        f"transformation first."
+    )
+
+
 def _allowed_values(tool_name: str, argument: str) -> set:
     spec = transform_mcp_server.TRANSFORM_TOOLS.get(tool_name, {})
     properties = (spec.get("parameters") or {}).get("properties") or {}
@@ -2089,6 +2381,13 @@ def execute_tool(
     if refusal:
         return {"ok": False, "error": refusal, "tool": tool_name}
 
+    _protected = _protect_grain_keys(session, tool_name, arguments)
+
+    # Fingerprint before the call, so a tool that really changes the dataset
+    # clears the clean-validation flag no matter which branch executes it.
+    fingerprint_before = session.dataset_fingerprint()
+        
+
     # Names the MODEL chose are safe to show back to it. Registering them here
     # keeps the boundary from placeholdering a rename or an aggregate the model
     # asked for by name.
@@ -2103,6 +2402,17 @@ def execute_tool(
                 f"{aggregation.get('column')}_{aggregation.get('function')}",
             )
 
+    def _note_dataset_change() -> None:
+        """Clear the clean-validation flag if the dataset actually moved.
+
+        validate_dataset is exempt: it is what SETS the flag, and it never
+        mutates the dataset.
+        """
+        if tool_name == "validate_dataset":
+            return
+        if session.dataset_fingerprint() != fingerprint_before:
+            session.clean_validation = None
+
     spec = ETL_TOOLS.get(tool_name)
 
     if spec is not None:
@@ -2115,7 +2425,9 @@ def execute_tool(
                 "tool": tool_name,
             }
         try:
-            return spec["function"](session, **arguments)
+            outcome = spec["function"](session, **arguments)
+            _note_dataset_change()
+            return outcome
         except ToolFailure as exc:
             return {"ok": False, "error": str(exc), "tool": tool_name}
         except TypeError as exc:
@@ -2162,6 +2474,8 @@ def execute_tool(
                 ),
                 "tool": tool_name,
             }
+
+        _note_dataset_change()
 
         after = session.df.shape
         session.transform_log.append(
@@ -2252,7 +2566,13 @@ Work in this order:
    fill or drop nulls, remove duplicates, convert types, and aggregate a
    one-to-many side with aggregate_rows so the grain stays correct.
 5. VALIDATE. Call validate_dataset with the target column. Fix what it reports.
-6. FINISH. Call finish_etl once.
+   If validate_dataset returns "no issues found", the target is valid, and the
+   dataset is ready for saving, do NOT perform another cleanup or validation
+   call. Proceed directly to finish_etl.
+6. FINISH. When validation reports no issues and the target is valid, call
+   finish_etl immediately. Do not call drop_rows_with_nulls, validate_dataset,
+   or another transformation again unless you have made a new transformation
+   after the previous validation.
 
 Rules:
 - At most {max_steps} rounds. You may issue up to {max_calls} tool calls in one
