@@ -1,0 +1,234 @@
+from enum import Enum
+from typing import Any, List, Optional
+
+from pydantic import BaseModel, Field, root_validator
+
+
+class AggFunction(str, Enum):
+    SUM = "SUM"
+    AVG = "AVG"
+    MIN = "MIN"
+    MAX = "MAX"
+    COUNT = "COUNT"
+    COUNT_DISTINCT = "COUNT_DISTINCT"
+    MEDIAN = "MEDIAN"
+    STDDEV = "STDDEV"
+
+
+FANOUT_SAFE = {
+    AggFunction.MIN,
+    AggFunction.MAX,
+    AggFunction.COUNT_DISTINCT,
+}
+
+ZERO_WHEN_ABSENT = {
+    AggFunction.SUM,
+    AggFunction.COUNT,
+    AggFunction.COUNT_DISTINCT,
+}
+
+DECOMPOSABLE = {
+    AggFunction.SUM,
+    AggFunction.MIN,
+    AggFunction.MAX,
+    AggFunction.COUNT,
+}
+
+SECOND_LEVEL = {
+    AggFunction.SUM: AggFunction.SUM,
+    AggFunction.MIN: AggFunction.MIN,
+    AggFunction.MAX: AggFunction.MAX,
+    AggFunction.COUNT: AggFunction.SUM,
+}
+
+
+class AttributeSpec(BaseModel):
+    source_table: str
+    source_column: str
+    name: Optional[str] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class FilterSpec(BaseModel):
+    source_table: Optional[str] = None
+    column: str
+    operator: str
+    value: Any
+    value_type: Optional[str] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class MeasureSpec(BaseModel):
+    name: str = Field(alias="measure_name")
+    source_table: str
+    source_column: Optional[str] = Field(default=None, alias="column")
+    aggregation: AggFunction
+    distinct_key: List[str] = []
+    zero_when_absent: Optional[bool] = None
+    filters: List[FilterSpec] = []
+    time_column: Optional[str] = None
+    window: Optional[str] = None
+    as_of: Optional[str] = None
+    description: str = ""
+
+    class Config:
+        extra = "forbid"
+        allow_population_by_field_name = True
+
+    @root_validator
+    def set_defaults(cls, values):
+        aggregation = values.get("aggregation")
+
+        if values.get("zero_when_absent") is None:
+            values["zero_when_absent"] = aggregation in ZERO_WHEN_ABSENT
+
+        return values
+
+    @root_validator(pre=True)
+    def accept_legacy_column_name(cls, values):
+        if isinstance(values, dict):
+            if "source_column" not in values and "column" in values:
+                values["source_column"] = values["column"]
+        return values
+
+
+class JoinHop(BaseModel):
+    left_table: str
+    left_column: str
+    right_table: str
+    right_column: str
+    join_type: str = "left"
+
+    cardinality: Optional[str] = None
+    match_rate: Optional[float] = None
+    row_multiplication: Optional[bool] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class JoinSpec(BaseModel):
+    """
+    Temporary compatibility model.
+
+    The final architecture replaces JoinSpec with JoinPath / JoinHop.
+    This remains only so the current discovery/test code continues to run
+    while the join layer is migrated.
+    """
+
+    left_table: str
+    left_column: str
+    right_table: str
+    right_column: str
+    join_type: str = "left"
+    verified: bool = False
+
+    class Config:
+        extra = "forbid"
+
+
+class JoinPath(BaseModel):
+    entity_table: str
+    source_table: str
+    hops: List[JoinHop] = []
+
+    verified: bool = False
+    discovered_via: str = "foreign_key"
+    alternatives_considered: int = 1
+
+    class Config:
+        extra = "forbid"
+
+    @property
+    def requires_nested_aggregation(self) -> bool:
+        return len(self.hops) > 1
+
+
+class ColumnInfo(BaseModel):
+    name: str
+    type: str
+    nullable: bool = True
+    primary_key: bool = False
+
+    class Config:
+        extra = "forbid"
+
+
+class TableInfo(BaseModel):
+    name: str
+    columns: List[ColumnInfo]
+
+    class Config:
+        extra = "forbid"
+
+
+class Catalog(BaseModel):
+    db_type: str
+    schema_name: Optional[str] = None
+    tables: List[TableInfo]
+    relationships: List[JoinSpec] = []
+
+    class Config:
+        extra = "forbid"
+
+
+class DatasetSpec(BaseModel):
+    spec_version: int = 1
+
+    entity_table: str
+    entity_key: List[str]
+
+    attributes: List[AttributeSpec] = []
+    measures: List[MeasureSpec] = []
+    filters: List[FilterSpec] = []
+
+    # Temporary compatibility field.
+    # Final architecture will use join_paths as the execution contract.
+    joins: List[JoinSpec] = []
+
+    join_paths: List[JoinPath] = []
+
+    target_column: Optional[str] = None
+    target_type: Optional[str] = None
+
+    db_type: Optional[str] = None
+    schema_name: Optional[str] = None
+    source_kind: str = "database"
+
+    class Config:
+        extra = "forbid"
+
+    @root_validator(pre=True)
+    def normalize_legacy_shapes(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        # Old code supplied entity_key as a string.
+        entity_key = values.get("entity_key")
+        if isinstance(entity_key, str):
+            values["entity_key"] = [entity_key]
+
+        # Old OpenAI output supplied attributes as strings.
+        raw_attributes = values.get("attributes", [])
+        entity_table = values.get("entity_table")
+
+        if raw_attributes and all(isinstance(item, str) for item in raw_attributes):
+            values["attributes"] = [
+                {
+                    "source_table": entity_table,
+                    "source_column": item,
+                    "name": item,
+                }
+                for item in raw_attributes
+            ]
+
+        return values
+
+
+# Compatibility aliases for the existing code.
+Measure = MeasureSpec
+Filter = FilterSpec

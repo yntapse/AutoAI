@@ -490,20 +490,22 @@ def _plan_join_order(
 def _assert_extract_safe(sql: str) -> str:
     """Guarantee the statement survives db_connector._validate_query().
 
-    That function rejects anything not starting with SELECT/WITH and anything
-    containing a semicolon. Failing here - rather than in the connector - gives
-    a clear error naming this module as the cause.
+    SELECT and WITH statements are allowed. Semicolons are still forbidden.
     """
     if ";" in sql:
         raise SqlBuildError(
             "The generated SQL contains a semicolon and would be rejected. "
             "This is a bug in the query builder."
         )
-    if not sql.lstrip().upper().startswith("SELECT"):
+
+    stripped = sql.lstrip().upper()
+
+    if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):
         raise SqlBuildError(
-            "The generated SQL does not start with SELECT. "
+            "The generated SQL does not start with SELECT or WITH. "
             "This is a bug in the query builder."
         )
+
     return sql
 
 
@@ -644,6 +646,204 @@ def build_select(
         table_aliases=table_aliases,
         join_order=join_order,
     )
+
+
+def build_aggregate_select(
+    db_type: str,
+    table: str,
+    group_by: Sequence[str],
+    aggregates: Sequence[Tuple[str, str, str]],
+    filters: Optional[Sequence[Tuple[str, str, Any]]] = None,
+    schema: Optional[str] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Build one safe aggregate SELECT statement.
+
+    Args:
+        db_type:
+            "mssql" or "postgresql".
+
+        table:
+            Source table.
+
+        group_by:
+            Columns to group by.
+
+        aggregates:
+            Tuples of:
+                (output_alias, aggregate_function, source_column)
+
+            Example:
+                ("total_sales", "SUM", "OrderAmount")
+
+        filters:
+            Optional tuples of:
+                (column, operator, value)
+
+            Values are returned separately as bound parameters.
+
+        schema:
+            Optional database schema.
+
+    Returns:
+        (sql, parameters)
+
+    Example SQL:
+        SELECT
+            [CustomerID] AS [CustomerID],
+            SUM([OrderAmount]) AS [total_sales]
+        FROM [dbo].[Orders]
+        GROUP BY [CustomerID]
+    """
+
+    db_type = _check_db_type(db_type)
+    resolved_schema = schema if schema is not None else DEFAULT_SCHEMA[db_type]
+
+    _assert_safe_identifier(table, "table name")
+
+    allowed_aggregates = {
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "COUNT",
+        "COUNT_DISTINCT",
+    }
+
+    if not group_by and not aggregates:
+        raise SqlBuildError(
+            "An aggregate query requires at least one group-by column " "or aggregate."
+        )
+
+    # ---------------------------------------------------------------
+    # GROUP BY columns
+    # ---------------------------------------------------------------
+
+    group_parts: List[str] = []
+
+    for column in group_by:
+        _assert_safe_identifier(column, "column name")
+
+        group_parts.append(_quote(db_type, column, "column name"))
+
+    # ---------------------------------------------------------------
+    # Aggregate expressions
+    # ---------------------------------------------------------------
+
+    select_parts: List[str] = []
+
+    for item in aggregates:
+        if len(item) != 3:
+            raise SqlBuildError(
+                "Each aggregate must contain "
+                "(output_alias, function, source_column)."
+            )
+
+        output_alias, function_name, source_column = item
+
+        _assert_safe_identifier(output_alias, "column alias")
+
+        function_name = str(function_name).strip().upper()
+
+        if function_name not in allowed_aggregates:
+            raise SqlBuildError(
+                f"Unsupported aggregate function '{function_name}'. "
+                f"Supported: {', '.join(sorted(allowed_aggregates))}."
+            )
+
+        if source_column == "*":
+            if function_name != "COUNT":
+                raise SqlBuildError("Only COUNT can aggregate over '*'.")
+
+            expression = "COUNT(*)"
+
+        elif function_name == "COUNT_DISTINCT":
+            _assert_safe_identifier(source_column, "column name")
+
+            expression = (
+                f"COUNT(DISTINCT " f"{_quote(db_type, source_column, 'column name')})"
+            )
+
+        else:
+            _assert_safe_identifier(source_column, "column name")
+
+            expression = (
+                f"{function_name}("
+                f"{_quote(db_type, source_column, 'column name')}"
+                f")"
+            )
+
+        select_parts.append(
+            f"{expression} AS " f"{_quote(db_type, output_alias, 'column alias')}"
+        )
+
+    if not select_parts and not group_parts:
+        raise SqlBuildError("The generated aggregate query would select no columns.")
+
+    # ---------------------------------------------------------------
+    # SELECT projection
+    # ---------------------------------------------------------------
+
+    projection = group_parts + select_parts
+
+    # ---------------------------------------------------------------
+    # WHERE filters
+    # ---------------------------------------------------------------
+
+    parameters: Dict[str, Any] = {}
+    where_parts: List[str] = []
+
+    allowed_operators = {
+        "=",
+        "!=",
+        "<>",
+        ">",
+        ">=",
+        "<",
+        "<=",
+        "LIKE",
+    }
+
+    for index, item in enumerate(filters or []):
+        if len(item) != 3:
+            raise SqlBuildError(
+                "Each filter must contain " "(column, operator, value)."
+            )
+
+        column, operator, value = item
+
+        _assert_safe_identifier(column, "column name")
+
+        operator = str(operator).strip().upper()
+
+        if operator not in allowed_operators:
+            raise SqlBuildError(f"Unsupported filter operator '{operator}'.")
+
+        parameter_name = f"p{index}"
+
+        where_parts.append(
+            f"{_quote(db_type, column, 'column name')} " f"{operator} :{parameter_name}"
+        )
+
+        parameters[parameter_name] = value
+
+    # ---------------------------------------------------------------
+    # Final SQL
+    # ---------------------------------------------------------------
+
+    lines = [
+        "SELECT " + ", ".join(projection),
+        f"FROM {_quote_table(db_type, resolved_schema, table)}",
+    ]
+
+    if where_parts:
+        lines.append("WHERE " + " AND ".join(where_parts))
+
+    if group_parts:
+        lines.append("GROUP BY " + ", ".join(group_parts))
+
+    sql = _assert_extract_safe("\n".join(lines))
+
+    return sql, parameters
 
 
 def build_count_select(
