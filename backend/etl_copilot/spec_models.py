@@ -170,7 +170,7 @@ class Catalog(BaseModel):
     db_type: str
     schema_name: Optional[str] = None
     tables: List[TableInfo]
-    relationships: List[JoinSpec] = []
+    relationships: List[JoinHop] = []
 
     class Config:
         extra = "forbid"
@@ -227,6 +227,78 @@ class DatasetSpec(BaseModel):
             ]
 
         return values
+
+
+class ValidationIssue(BaseModel):
+    """One problem found in a spec. Never raised - always returned in a list."""
+
+    severity: str  # "error" | "warning"
+    code: str
+    message: str
+    field: Optional[str] = None
+    suggestion: Optional[str] = None
+
+    class Config:
+        extra = "forbid"
+
+    @property
+    def is_error(self) -> bool:
+        return self.severity == "error"
+
+
+class SubqueryPlan(BaseModel):
+    """One CTE emitted by the compiler."""
+
+    name: str
+    sql: str
+    source_table: str
+    measure_names: List[str] = []
+    level: int = 1
+
+    class Config:
+        extra = "forbid"
+
+
+class ReconQuery(BaseModel):
+    """A control query the reconciler runs. Emitted by the compiler only."""
+
+    kind: str  # "measure_total" | "entity_count"
+    measure_name: Optional[str] = None
+    sql: str
+    params: dict = {}
+
+    class Config:
+        extra = "forbid"
+
+
+class MeasureLineage(BaseModel):
+    measure_name: str
+    source: str
+    aggregation: str
+    join_path: List[str] = []
+    path_verified: bool = False
+    cardinality_per_hop: List[str] = []
+    zero_when_absent: bool = False
+    nested_aggregation: bool = False
+    explanation: str = ""
+
+    class Config:
+        extra = "forbid"
+
+
+class CompiledPlan(BaseModel):
+    sql: str
+    params: dict = {}
+    output_columns: List[str] = []
+    declared_grain: List[str] = []
+    tables_referenced: List[str] = []
+    subqueries: List[SubqueryPlan] = []
+    reconciliation: List[ReconQuery] = []
+    lineage: List[MeasureLineage] = []
+    spec_version: int = 1
+
+    class Config:
+        extra = "forbid"
 
 
 # Compatibility aliases for the existing code.

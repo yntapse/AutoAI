@@ -11,7 +11,7 @@ from services.db_connector import (
 from etl_copilot.spec_models import (
     Catalog,
     ColumnInfo,
-    JoinSpec,
+    JoinHop,
     TableInfo,
 )
 
@@ -75,8 +75,13 @@ class SchemaReader:
                 )
             )
 
+        # Catalog relationships are CANDIDATE edges: declared foreign keys that
+        # have not yet been measured. They are JoinHop, not JoinSpec, because a
+        # candidate carries measurement slots (cardinality, match_rate,
+        # row_multiplication) and must NOT carry `verified` - only
+        # join_verifier may mark a path verified.
         relationships = [
-            JoinSpec(
+            JoinHop(
                 left_table=relationship["left_table"],
                 left_column=relationship["left_column"],
                 right_table=relationship["right_table"],

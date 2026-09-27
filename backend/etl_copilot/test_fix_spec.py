@@ -1,3 +1,10 @@
+import os
+import sys
+
+if not os.getenv("OPENAI_API_KEY"):
+    print("SKIP: OPENAI_API_KEY is not set (live LLM test).")
+    sys.exit(0)
+
 from etl_copilot.openai_spec_generator import OpenAISpecGenerator
 
 generator = OpenAISpecGenerator()
