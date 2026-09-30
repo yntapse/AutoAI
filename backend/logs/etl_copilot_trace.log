@@ -1,0 +1,187 @@
+2026-09-29T21:44:56.032 pid=18996 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-29T16:15:01.321 pid=10 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T16:14:24)
+2026-09-29T16:15:02.232 pid=10 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-29T16:15:02.246 pid=10 [ETL preview] 1/7 route entered
+2026-09-29T16:15:02.255 pid=10 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name='dbo' trusted=False user='automl' user_request='Show customers with total order value and order count'
+2026-09-29T16:15:02.265 pid=10 [ETL preview] 3/7 connection string built
+2026-09-29T16:15:02.273 pid=10 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-29T16:15:02.282 pid=10 [ETL preview] 5/7 copilot instance ready
+2026-09-29T16:15:02.290 pid=10 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T16:15:02.300 pid=10 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T16:15:02.308 pid=10 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T16:15:02.315 pid=10 [ETL preview trace] OUT status=200
+2026-09-29T21:49:43.709 pid=26796 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-29T21:52:17.320 pid=26796 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-29T21:52:17.325 pid=26796 [ETL preview] 1/7 route entered
+2026-09-29T21:52:17.327 pid=26796 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name='dbo' trusted=False user='automl' user_request='Show customers with total order value and order count'
+2026-09-29T21:52:17.331 pid=26796 [ETL preview] 3/7 connection string built
+2026-09-29T21:52:17.333 pid=26796 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-29T21:52:18.267 pid=26796 [ETL preview] 5/7 copilot instance ready
+2026-09-29T21:52:18.269 pid=26796 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T21:53:45.114 pid=26796 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T21:53:45.118 pid=26796 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T21:53:45.123 pid=26796 [ETL preview trace] OUT status=200
+2026-09-29T16:24:16.989 pid=17 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T16:14:24)
+2026-09-29T16:24:17.109 pid=17 [ETL preview] 1/7 route entered
+2026-09-29T16:24:17.124 pid=17 [ETL preview] 2/7 request parsed | db_type='postgresql' host='localhost' port=None database='fixture' schema_name=None trusted=False user='u' user_request='customers with total sales'
+2026-09-29T16:24:17.142 pid=17 [ETL preview] 3/7 connection string built
+2026-09-29T16:24:17.159 pid=17 [ETL preview] 4/7 schema resolved -> None
+2026-09-29T16:24:17.174 pid=17 [ETL preview] 5/7 copilot instance ready
+2026-09-29T16:24:17.192 pid=17 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T16:24:17.241 pid=17 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T16:24:17.259 pid=17 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T22:00:23.137 pid=13688 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-29T22:02:11.585 pid=13688 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-29T22:02:11.589 pid=13688 [ETL preview] 1/7 route entered
+2026-09-29T22:02:11.589 pid=13688 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name and total order amount'
+2026-09-29T22:02:11.589 pid=13688 [ETL preview] 3/7 connection string built
+2026-09-29T22:02:11.589 pid=13688 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-29T22:02:11.591 pid=13688 [ETL preview] 5/7 copilot instance ready
+2026-09-29T22:02:11.592 pid=13688 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T22:02:14.875 pid=13688 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T22:02:14.876 pid=13688 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T22:02:14.877 pid=13688 [ETL preview trace] OUT status=200
+2026-09-29T22:02:37.373 pid=13688 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-29T22:02:37.375 pid=13688 [ETL preview] 1/7 route entered
+2026-09-29T22:02:37.376 pid=13688 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show city wise total sales'
+2026-09-29T22:02:37.377 pid=13688 [ETL preview] 3/7 connection string built
+2026-09-29T22:02:37.378 pid=13688 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-29T22:02:37.378 pid=13688 [ETL preview] 5/7 copilot instance ready
+2026-09-29T22:02:37.380 pid=13688 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T22:02:40.179 pid=13688 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T22:02:40.180 pid=13688 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T22:02:40.183 pid=13688 [ETL preview trace] OUT status=200
+2026-09-29T22:02:47.222 pid=13688 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-29T22:02:47.225 pid=13688 [ETL preview] 1/7 route entered
+2026-09-29T22:02:47.225 pid=13688 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show top 10 customers by order value'
+2026-09-29T22:02:47.226 pid=13688 [ETL preview] 3/7 connection string built
+2026-09-29T22:02:47.226 pid=13688 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-29T22:02:47.228 pid=13688 [ETL preview] 5/7 copilot instance ready
+2026-09-29T22:02:47.229 pid=13688 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T22:02:49.155 pid=13688 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T22:02:49.157 pid=13688 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T22:02:49.158 pid=13688 [ETL preview trace] OUT status=200
+2026-09-29T22:02:59.062 pid=13688 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-29T22:02:59.064 pid=13688 [ETL preview] 1/7 route entered
+2026-09-29T22:02:59.065 pid=13688 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show total quantity sold by product'
+2026-09-29T22:02:59.067 pid=13688 [ETL preview] 3/7 connection string built
+2026-09-29T22:02:59.067 pid=13688 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-29T22:02:59.067 pid=13688 [ETL preview] 5/7 copilot instance ready
+2026-09-29T22:02:59.067 pid=13688 [ETL preview] 6/7 preview_plan STARTING
+2026-09-29T22:03:01.925 pid=13688 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-29T22:03:01.926 pid=13688 [ETL preview] 7/7 response serialized, returning 200
+2026-09-29T22:03:01.927 pid=13688 [ETL preview trace] OUT status=200
+2026-09-30T09:25:45.106 pid=19060 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-30T09:27:34.614 pid=19060 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T09:27:34.616 pid=19060 [ETL preview] 1/7 route entered
+2026-09-30T09:27:34.617 pid=19060 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name and total order amount'
+2026-09-30T09:27:34.618 pid=19060 [ETL preview] 3/7 connection string built
+2026-09-30T09:27:34.618 pid=19060 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T09:27:34.619 pid=19060 [ETL preview] 5/7 copilot instance ready
+2026-09-30T09:27:34.621 pid=19060 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T09:27:38.509 pid=19060 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T09:27:38.511 pid=19060 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T09:27:38.512 pid=19060 [ETL preview trace] OUT status=200
+2026-09-30T09:28:06.195 pid=19060 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T09:28:06.197 pid=19060 [ETL preview] 1/7 route entered
+2026-09-30T09:28:06.198 pid=19060 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show city wise total sales'
+2026-09-30T09:28:06.199 pid=19060 [ETL preview] 3/7 connection string built
+2026-09-30T09:28:06.201 pid=19060 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T09:28:06.203 pid=19060 [ETL preview] 5/7 copilot instance ready
+2026-09-30T09:28:06.204 pid=19060 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T09:28:09.055 pid=19060 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T09:28:09.057 pid=19060 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T09:28:09.059 pid=19060 [ETL preview trace] OUT status=200
+2026-09-30T09:28:36.515 pid=19060 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T09:28:36.518 pid=19060 [ETL preview] 1/7 route entered
+2026-09-30T09:28:36.519 pid=19060 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show top 10 customers by order value'
+2026-09-30T09:28:36.520 pid=19060 [ETL preview] 3/7 connection string built
+2026-09-30T09:28:36.520 pid=19060 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T09:28:36.521 pid=19060 [ETL preview] 5/7 copilot instance ready
+2026-09-30T09:28:36.523 pid=19060 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T09:28:38.904 pid=19060 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T09:28:38.906 pid=19060 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T09:28:38.908 pid=19060 [ETL preview trace] OUT status=200
+2026-09-30T09:29:03.012 pid=19060 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T09:29:03.016 pid=19060 [ETL preview] 1/7 route entered
+2026-09-30T09:29:03.017 pid=19060 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show total quantity sold by product'
+2026-09-30T09:29:03.018 pid=19060 [ETL preview] 3/7 connection string built
+2026-09-30T09:29:03.019 pid=19060 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T09:29:03.020 pid=19060 [ETL preview] 5/7 copilot instance ready
+2026-09-30T09:29:03.022 pid=19060 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T09:29:05.239 pid=19060 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T09:29:05.241 pid=19060 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T09:29:05.242 pid=19060 [ETL preview trace] OUT status=200
+2026-09-30T10:49:55.209 pid=3260 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-30T10:52:40.452 pid=3260 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T10:52:40.455 pid=3260 [ETL preview] 1/7 route entered
+2026-09-30T10:52:40.457 pid=3260 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name and total order amount'
+2026-09-30T10:52:40.458 pid=3260 [ETL preview] 3/7 connection string built
+2026-09-30T10:52:40.459 pid=3260 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T10:52:40.461 pid=3260 [ETL preview] 5/7 copilot instance ready
+2026-09-30T10:52:40.462 pid=3260 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T10:52:46.652 pid=3260 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T10:52:46.652 pid=3260 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T10:52:46.654 pid=3260 [ETL preview trace] OUT status=200
+2026-09-30T12:10:10.610 pid=3260 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T12:10:10.616 pid=3260 [ETL preview] 1/7 route entered
+2026-09-30T12:10:10.618 pid=3260 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name, city, total sales, and order count for each customer.\n'
+2026-09-30T12:10:10.618 pid=3260 [ETL preview] 3/7 connection string built
+2026-09-30T12:10:10.619 pid=3260 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T12:10:10.620 pid=3260 [ETL preview] 5/7 copilot instance ready
+2026-09-30T12:10:10.621 pid=3260 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T12:10:15.406 pid=3260 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T12:10:15.408 pid=3260 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T12:10:15.411 pid=3260 [ETL preview trace] OUT status=200
+2026-09-30T12:32:13.575 pid=3260 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T12:32:13.577 pid=3260 [ETL preview] 1/7 route entered
+2026-09-30T12:32:13.579 pid=3260 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name, city, total sales, and order count for each customer.\n'
+2026-09-30T12:32:13.579 pid=3260 [ETL preview] 3/7 connection string built
+2026-09-30T12:32:13.580 pid=3260 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T12:32:13.581 pid=3260 [ETL preview] 5/7 copilot instance ready
+2026-09-30T12:32:13.581 pid=3260 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T12:32:19.106 pid=3260 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T12:32:19.108 pid=3260 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T12:32:19.110 pid=3260 [ETL preview trace] OUT status=200
+2026-09-30T12:55:24.929 pid=9452 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-30T12:56:51.471 pid=9452 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T12:56:51.474 pid=9452 [ETL preview] 1/7 route entered
+2026-09-30T12:56:51.475 pid=9452 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name, city, total sales, and order count for each customer.\n'
+2026-09-30T12:56:51.476 pid=9452 [ETL preview] 3/7 connection string built
+2026-09-30T12:56:51.476 pid=9452 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T12:56:51.477 pid=9452 [ETL preview] 5/7 copilot instance ready
+2026-09-30T12:56:51.478 pid=9452 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T12:56:54.755 pid=9452 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T12:56:54.756 pid=9452 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T12:56:54.758 pid=9452 [ETL preview trace] OUT status=200
+2026-09-30T13:01:17.650 pid=9452 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T13:01:17.652 pid=9452 [ETL preview] 1/7 route entered
+2026-09-30T13:01:17.653 pid=9452 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name, city, total sales, and order count for each customer.\n'
+2026-09-30T13:01:17.653 pid=9452 [ETL preview] 3/7 connection string built
+2026-09-30T13:01:17.655 pid=9452 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T13:01:17.656 pid=9452 [ETL preview] 5/7 copilot instance ready
+2026-09-30T13:01:17.656 pid=9452 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T13:01:20.789 pid=9452 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T13:01:20.790 pid=9452 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T13:01:20.791 pid=9452 [ETL preview trace] OUT status=200
+2026-09-30T13:21:36.966 pid=9452 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T13:21:36.968 pid=9452 [ETL preview] 1/7 route entered
+2026-09-30T13:21:36.969 pid=9452 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name, city, total sales, and order count for each customer.\n'
+2026-09-30T13:21:36.969 pid=9452 [ETL preview] 3/7 connection string built
+2026-09-30T13:21:36.969 pid=9452 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T13:21:36.970 pid=9452 [ETL preview] 5/7 copilot instance ready
+2026-09-30T13:21:36.971 pid=9452 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T13:21:43.250 pid=9452 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T13:21:43.251 pid=9452 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T13:21:43.252 pid=9452 [ETL preview trace] OUT status=200
+2026-09-30T13:31:20.557 pid=3180 MODULE LOADED routers/etl_copilot.py (source saved 2026-09-29T21:44:24)
+2026-09-30T13:33:53.705 pid=3180 [ETL preview trace] IN POST /etl-copilot/preview
+2026-09-30T13:33:53.708 pid=3180 [ETL preview] 1/7 route entered
+2026-09-30T13:33:53.708 pid=3180 [ETL preview] 2/7 request parsed | db_type='mssql' host='localhost' port=53199 database='AutoMLDB' schema_name=None trusted=False user='automl' user_request='Show customer name, city, total sales, and order count for each customer.\n'
+2026-09-30T13:33:53.709 pid=3180 [ETL preview] 3/7 connection string built
+2026-09-30T13:33:53.709 pid=3180 [ETL preview] 4/7 schema resolved -> 'dbo'
+2026-09-30T13:33:53.710 pid=3180 [ETL preview] 5/7 copilot instance ready
+2026-09-30T13:33:53.711 pid=3180 [ETL preview] 6/7 preview_plan STARTING
+2026-09-30T13:33:57.375 pid=3180 [ETL preview] 6/7 preview_plan COMPLETED
+2026-09-30T13:33:57.376 pid=3180 [ETL preview] 7/7 response serialized, returning 200
+2026-09-30T13:33:57.379 pid=3180 [ETL preview trace] OUT status=200

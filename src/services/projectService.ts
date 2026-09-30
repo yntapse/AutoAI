@@ -1,4 +1,4 @@
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
 export async function createProject(
   projectName: string,
@@ -375,5 +375,211 @@ export async function analyzeRelationship(
   return unwrapDataModelResponse<RelationshipProfileResponse>(
     response,
     "Could not analyse this relationship.",
+  );
+}
+
+
+/**
+ * Unwrap an ETL Copilot response.
+ *
+ * unwrapDataModelResponse does String(payload.detail), which is correct only
+ * when detail is a string. The Copilot returns an OBJECT for a CopilotError
+ * ({message, issues[]}) and FastAPI returns an ARRAY for a 422 validation
+ * error. Both render as "[object Object]". This handles all three shapes.
+ */
+async function unwrapCopilotResponse<T>(
+  response: Response,
+  fallbackMessage: string,
+): Promise<T> {
+  const contentType = response.headers.get("content-type") ?? "";
+  const isJson = contentType.includes("application/json");
+  const payload = isJson ? await response.json() : await response.text();
+
+  if (!response.ok) {
+    let message = fallbackMessage;
+    const detail = (payload as { detail?: unknown })?.detail;
+
+    // Diagnostic 500 from /etl-copilot/preview: {error_type, error, traceback}.
+    // It has no `detail`, so surface it before the detail branches run.
+    const diag = payload as { error_type?: unknown; error?: unknown };
+    if (diag?.error_type || diag?.error) {
+      throw new Error(
+        [diag.error_type, diag.error].filter(Boolean).map(String).join(": "),
+      );
+    }
+
+    if (typeof detail === "string" && detail) {
+      message = detail;
+    } else if (Array.isArray(detail)) {
+      // FastAPI 422: [{loc, msg, type}, ...]
+      message = detail
+        .map((item) => String((item as { msg?: unknown })?.msg ?? item))
+        .join("; ");
+    } else if (detail && typeof detail === "object") {
+      const asObject = detail as {
+        message?: unknown;
+        error?: unknown;
+        hint?: unknown;
+        issues?: { message?: unknown }[];
+      };
+      const parts = [asObject.message, asObject.error, asObject.hint]
+        .filter(Boolean)
+        .map(String);
+      if (Array.isArray(asObject.issues) && asObject.issues.length > 0) {
+        parts.push(
+          asObject.issues.map((i) => String(i?.message ?? "")).join("; "),
+        );
+      }
+      if (parts.length > 0) message = parts.join(" - ");
+    } else if (typeof payload === "string" && payload) {
+      message = payload;
+    }
+
+    throw new Error(message);
+  }
+
+  return payload as T;
+}
+
+export interface EtlCopilotSchemaResponse {
+  db_type: string;
+  schema_name: string;
+  table_count: number;
+  relationship_count: number;
+  usable: boolean;
+  notice: string | null;
+}
+
+export interface EtlCopilotPreviewResponse {
+  blocking: boolean;
+  preview_rows: Record<string, unknown>[];
+  has_more: boolean;
+  sql: string;
+  explanation: string[];
+  columns: string[];
+  errors: unknown[];
+  warnings: unknown[];
+  spec: unknown;
+}
+
+export interface EtlCopilotBuildResponse {
+  job_id: string;
+  status: string;
+  poll: string;
+}
+
+export interface EtlCopilotBuildResult {
+  project_id: string;
+  file_id: string;
+  target_column: string;
+}
+
+export interface EtlCopilotJobStatusResponse {
+  status: string;
+  result?: EtlCopilotBuildResult | null;
+  error?: { detail?: string } | null;
+}
+
+
+export async function etlCopilotSchema(
+  params: DataModelConnectionParams,
+): Promise<EtlCopilotSchemaResponse> {
+  const response = await fetch(`${API_BASE}/etl-copilot/schema`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dataModelConnectionBody(params)),
+  });
+
+  return unwrapCopilotResponse<EtlCopilotSchemaResponse>(
+    response,
+    "Could not load ETL Copilot schema.",
+  );
+}
+
+
+export async function etlCopilotPreview(
+  params: DataModelConnectionParams & {
+    userRequest: string;
+  },
+): Promise<EtlCopilotPreviewResponse> {
+  const url = `${API_BASE}/etl-copilot/preview`;
+  const payload = {
+    ...dataModelConnectionBody(params),
+    user_request: params.userRequest,
+  };
+
+  console.info("[ETL preview trace] API_BASE:", API_BASE);
+  console.info("[ETL preview trace] POST URL:", url);
+  console.info("[ETL preview trace] payload:", {
+    ...payload,
+    password: payload.password ? "[REDACTED]" : payload.password,
+  });
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    console.error("[ETL preview trace] fetch rejected");
+    console.error("URL:", url);
+    console.error("Error object:", error);
+    const err = error as { name?: string; message?: string; stack?: string };
+    console.error("Error name:", err?.name);
+    console.error("Error message:", err?.message);
+    console.error("Error stack:", err?.stack);
+    throw error;
+  }
+
+  console.info("[ETL preview trace] response:", {
+    url: response.url,
+    status: response.status,
+    type: response.type,
+  });
+
+  return unwrapCopilotResponse<EtlCopilotPreviewResponse>(
+    response,
+    "Could not generate ETL Copilot preview.",
+  );
+}
+
+
+
+export async function etlCopilotBuild(
+  params: DataModelConnectionParams & {
+    projectName: string;
+    userRequest: string;
+  },
+): Promise<EtlCopilotBuildResponse> {
+  const response = await fetch(`${API_BASE}/etl-copilot/build`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...dataModelConnectionBody(params),
+      project_name: params.projectName,
+      user_request: params.userRequest,
+      background: true,
+    }),
+  });
+
+  return unwrapCopilotResponse<EtlCopilotBuildResponse>(
+    response,
+    "Could not build ETL Copilot dataset.",
+  );
+}
+
+
+export async function etlCopilotStatus(
+  jobId: string,
+): Promise<EtlCopilotJobStatusResponse> {
+  const response = await fetch(
+    `${API_BASE}/etl-copilot/status/${jobId}`,
+  );
+
+  return unwrapCopilotResponse<EtlCopilotJobStatusResponse>(
+    response,
+    "Could not load ETL Copilot job status.",
   );
 }

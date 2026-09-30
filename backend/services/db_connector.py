@@ -284,6 +284,7 @@ def extract_to_dataframe(
     connection_string: str,
     query: str,
     max_rows: int = MAX_ROWS,
+    params: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """Run one SELECT and return the result as a pandas DataFrame.
 
@@ -309,7 +310,10 @@ def extract_to_dataframe(
             connection = connection.execution_options(postgresql_readonly=True)
 
         with connection as conn:
-            result = conn.execute(text(safe_query))
+            # Bound parameters, never string interpolation. The ETL Copilot
+            # compiler emits :name placeholders for every filter value; a
+            # caller that passes none behaves exactly as before.
+            result = conn.execute(text(safe_query), params or {})
             columns = list(result.keys())
             # Fetch one row more than the cap, so we can tell "exactly at the
             # limit" apart from "over the limit".
@@ -350,6 +354,7 @@ def preview_to_dataframe(
     connection_string: str,
     query: str,
     limit: int = PREVIEW_ROWS,
+    params=None,
 ) -> Tuple[pd.DataFrame, bool]:
 
     safe_query = _validate_query(query)
@@ -367,7 +372,7 @@ def preview_to_dataframe(
             connection = connection.execution_options(postgresql_readonly=True)
 
         with connection as conn:
-            result = conn.execute(text(safe_query))
+            result = conn.execute(text(safe_query), params or {})
             columns = list(result.keys())
             rows = result.fetchmany(limit + 1)
 

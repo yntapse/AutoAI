@@ -13,6 +13,7 @@ import type {
   DataModelSpec,
 } from "@/services/projectService";
 import MultiTableBuilder from "@/components/MultiTableBuilder";
+import EtlCopilotPanel from "@/components/EtlCopilotPanel";
 
 interface CreateProjectResponse {
   file_id: string;
@@ -64,6 +65,10 @@ export default function NewProjectPage() {
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [connectionSuccess, setConnectionSuccess] = useState(false);
   const [connectionError, setConnectionError] = useState("");
+  const [pendingCopilotTraining, setPendingCopilotTraining] = useState<{
+    fileId: string;
+    targetColumn: string;
+  } | null>(null);
 
   // --- Database: table list (POST /datasource/tables) -----------------------
   const [isLoadingTables, setIsLoadingTables] = useState(false);
@@ -85,7 +90,9 @@ export default function NewProjectPage() {
   // --- Database: single-table vs multi-table mode (Sprint 1) ----------------
   // selectedTable belongs to the single-table flow only. The multi-table flow
   // signals "I have a dataset" through hasDbDataset instead.
-  const [dbMode, setDbMode] = useState<"single" | "multi">("single");
+  const [dbMode, setDbMode] = useState<
+  "single" | "multi" | "copilot"
+>("single");
   const [hasDbDataset, setHasDbDataset] = useState(false);
   const [dataModelSpec, setDataModelSpec] = useState<DataModelSpec | null>(
     null,
@@ -1016,6 +1023,21 @@ export default function NewProjectPage() {
                             >
                               Multiple tables
                             </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDbMode("copilot");
+                                setSelectedTable("");
+                                resetPreviewState();
+                              }}
+                              className={`rounded-lg px-3 py-1.5 text-[12px] font-medium ${
+                                dbMode === "copilot"
+                                  ? "bg-cyan-600 text-white"
+                                  : "bg-slate-800 text-slate-300"
+                              }`}
+                            >
+                              Copilot
+                            </button>
                           </div>
                         )}
 
@@ -1160,6 +1182,54 @@ export default function NewProjectPage() {
                             }}
                           />
                         )}
+
+                        {/* ETL Copilot */}
+                        {connectionSuccess && dbMode === "copilot" && (
+                          <EtlCopilotPanel
+                            dbType={dbType}
+                            host={host}
+                            port={Number(port)}
+                            database={database}
+                            username={username}
+                            password={password}
+                            availableTables={availableTables}
+                            onDatasetReady={(
+                              fileId: string,
+                              projectId: string,
+                              targetColumn: string,
+                            ) => {
+                              console.log(
+                                "Copilot dataset ready",
+                                fileId,
+                                projectId,
+                                targetColumn,
+                              );
+                              setPendingCopilotTraining({
+                                fileId,
+                                targetColumn,
+                              });
+                            }}
+                            onReset={() => {
+                              setHasDbDataset(false);
+                            }}
+                          />
+                        )}
+
+                        {connectionSuccess &&
+                          dbMode === "copilot" &&
+                          pendingCopilotTraining && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                router.push(
+                                  `/training/${encodeURIComponent(pendingCopilotTraining.fileId)}?target_column=${encodeURIComponent(pendingCopilotTraining.targetColumn)}`,
+                                )
+                              }
+                              className="rounded-xl bg-cyan-600 px-4 py-2.5 text-[13px] font-semibold text-white transition hover:bg-cyan-500"
+                            >
+                              Go To Training
+                            </button>
+                          )}
 
                         <button
                           type="button"

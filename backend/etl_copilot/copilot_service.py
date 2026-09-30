@@ -29,6 +29,7 @@ from etl_copilot.join_verifier import JoinVerifier
 from etl_copilot.lineage import explain_dataset
 from etl_copilot.openai_spec_generator import OpenAISpecGenerator
 from etl_copilot.schema_reader import SchemaReader
+from services.db_connector import DataSourceError, preview_to_dataframe
 from etl_copilot.spec_models import (
     Catalog,
     DatasetSpec,
@@ -98,7 +99,30 @@ class ETLCopilot:
                 invalid_spec=raw,
                 validation_errors=exc.errors(),
             )
-            return self._parse(repaired, catalog)
+
+            try:
+                return self._parse(repaired, catalog)
+            except ValidationError as repair_exc:
+                # The repair attempt is the last one. Surfacing a raw
+                # pydantic traceback here would hide which field the model
+                # got wrong, so the failure is reported as a CopilotError
+                # carrying one issue per rejected field.
+                issues = [
+                    ValidationIssue(
+                        severity="error",
+                        code="spec_shape_invalid",
+                        message="%s: %s"
+                        % (".".join(str(p) for p in error["loc"]), error["msg"]),
+                        field=".".join(str(p) for p in error["loc"]),
+                    )
+                    for error in repair_exc.errors()
+                ]
+                raise CopilotError(
+                    "The generated specification did not match DatasetSpec, "
+                    "and the repair attempt did not fix it:\n"
+                    + "\n".join("  - %s" % issue.message for issue in issues),
+                    issues,
+                )
 
     def _parse(self, raw: Dict[str, Any], catalog: Catalog) -> DatasetSpec:
         spec = DatasetSpec(**raw)
@@ -130,6 +154,78 @@ class ETLCopilot:
         spec.join_paths = verified
         return issues + verify_issues
 
+    def _llm_owned(self, spec: DatasetSpec) -> Dict[str, Any]:
+        """Only the fields the model actually wrote.
+
+        join_paths and joins are filled in by the resolver, not by the model.
+        Sending them back as "the spec you produced" would be misleading and
+        would spend tokens on internals the model must not touch.
+        """
+        return spec.dict(
+            include={
+                "entity_table",
+                "entity_key",
+                "attributes",
+                "measures",
+                "filters",
+            }
+        )
+
+    def generate_validated_spec(
+        self,
+        user_request: str,
+        connection_string: str,
+        catalog: Catalog,
+    ):
+        """Draft a spec, then repair it once if validation blocks it.
+
+        generate_spec() already repairs a spec that fails PYDANTIC parsing.
+        A spec can be perfectly shaped and still name a table or column that
+        does not exist - the commonest failure, because the model copies the
+        prompt example instead of the catalog. Those errors come back from
+        validate_spec(), which generate_spec() never sees, so without this
+        round the repair path that already exists is simply never reached.
+
+        Exactly one round. A model that cannot use the catalog on its second
+        try will not use it on its third, and each round costs a full schema
+        introspection and re-verification.
+        """
+
+        spec = self.generate_spec(user_request, catalog)
+        drafted = self._llm_owned(spec)
+
+        issues = self.resolve_and_verify(connection_string, catalog, spec)
+        issues += validate_spec(spec, catalog, spec.join_paths)
+        blocking = errors_only(issues)
+
+        if not blocking:
+            return spec, issues
+
+        try:
+            repaired_raw = self.generator.fix_spec(
+                user_request=user_request,
+                schema=catalog_for_llm(catalog),
+                invalid_spec=drafted,
+                validation_errors=[issue.dict() for issue in blocking],
+            )
+            repaired = self._parse(repaired_raw, catalog)
+        except ValidationError:
+            # The repair came back mis-shaped. The first draft's issues are
+            # the more useful report, so they are what the caller sees.
+            return spec, issues
+
+        repaired_issues = self.resolve_and_verify(
+            connection_string, catalog, repaired
+        )
+        repaired_issues += validate_spec(repaired, catalog, repaired.join_paths)
+
+        if errors_only(repaired_issues):
+            # Still wrong. Report the repaired attempt - it is the model's
+            # best effort and its errors are the ones worth showing.
+            return repaired, repaired_issues
+
+        return repaired, repaired_issues
+
     def compile_spec(self, spec: DatasetSpec):
         compiler = DatasetCompiler(
             db_type=spec.db_type or "postgresql",
@@ -149,10 +245,9 @@ class ETLCopilot:
     ) -> Dict[str, Any]:
 
         catalog = self.discover_schema(connection_string, schema=schema)
-        spec = self.generate_spec(user_request, catalog)
-
-        issues = self.resolve_and_verify(connection_string, catalog, spec)
-        issues += validate_spec(spec, catalog, spec.join_paths)
+        spec, issues = self.generate_validated_spec(
+            user_request, connection_string, catalog
+        )
 
         blocking = errors_only(issues)
         if blocking:
@@ -182,6 +277,7 @@ class ETLCopilot:
 
     # -- dry run (no execution) -----------------------------------------
 
+
     def preview_plan(
         self,
         user_request: str,
@@ -189,25 +285,50 @@ class ETLCopilot:
         schema: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Everything except execution, for review before Build."""
-
+        
         catalog = self.discover_schema(connection_string, schema=schema)
-        spec = self.generate_spec(user_request, catalog)
-
-        issues = self.resolve_and_verify(connection_string, catalog, spec)
-        issues += validate_spec(spec, catalog, spec.join_paths)
-
+        
+        spec, issues = self.generate_validated_spec(
+            user_request,
+            connection_string,
+            catalog,
+        )
+        
         blocking = errors_only(issues)
+        
         plan = None
         explanation: List[str] = []
-
+        preview_rows = []
+        has_more = False
+        
         if not blocking:
             plan = self.compile_spec(spec)
             explanation = explain_dataset(spec, plan)
-
+            
+            
+            # preview_to_dataframe raises DataSourceError when the result is
+            # empty. A plan that compiles correctly over a narrow filter is
+            # still a valid plan, so an empty SAMPLE must not fail the whole
+            # preview - the user needs to see the SQL and the explanation in
+            # order to widen the request.
+            try:
+                preview_df, has_more = preview_to_dataframe(
+                    connection_string=connection_string,
+                    query=plan.sql,
+                    limit=10,
+                    params=plan.params,
+                )
+                preview_rows = preview_df.to_dict(orient="records")
+            except DataSourceError:
+                preview_rows = []
+                has_more = False
+            
         return {
             "spec": spec.dict(),
             "sql": plan.sql if plan else None,
             "issues": [i.dict() for i in issues],
             "blocking": bool(blocking),
             "explanation": explanation,
+            "preview_rows": preview_rows,
+            "has_more": has_more,
         }

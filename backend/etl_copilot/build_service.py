@@ -9,6 +9,7 @@ Order of operations is fixed and not negotiable:
 An unreconciled plan is never persisted and never reaches AutoML.
 """
 
+import hashlib
 import os
 from typing import Any, Dict, Optional
 
@@ -24,7 +25,17 @@ class BuildError(Exception):
 
 
 class BuildService:
-    def __init__(self, output_dir: Optional[str] = None, reconciler=None):
+    def __init__(
+        self,
+        output_dir: Optional[str] = None,
+        reconciler=None,
+        max_rows: Optional[int] = None,
+    ):
+        # Defaults to the platform cap in services.db_connector. It is
+        # overridable because one row per entity means a wide entity table
+        # can exceed 50,000 rows legitimately, and the cap then stops a
+        # correct dataset. Nothing changes unless a caller passes a value.
+        self.max_rows = max_rows or MAX_ROWS
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "generated_datasets",
@@ -41,10 +52,25 @@ class BuildService:
     ) -> Dict[str, Any]:
         # ---- 1. execute ----
         try:
+            # plan.params carries the bound value for every :name placeholder
+            # the compiler emitted. Dropping it would send SQL with unbound
+            # placeholders the moment the spec carries a single filter.
             frame = extract_to_dataframe(
-                connection_string, plan.sql, max_rows=MAX_ROWS
+                connection_string,
+                plan.sql,
+                max_rows=self.max_rows,
+                params=plan.params,
             )
         except DataSourceError as exc:
+            # An empty result is a legitimate outcome of a narrow filter, not
+            # a broken query. db_connector cannot tell the two apart, so the
+            # message is made specific here rather than left generic.
+            if "no rows" in str(exc).lower():
+                raise BuildError(
+                    "The dataset is empty - no rows matched. Check the "
+                    "filters in the request, or the join between %s and its "
+                    "source tables. (%s)" % (spec.entity_table, exc)
+                )
             raise BuildError("Dataset query failed: %s" % exc)
 
         # ---- 2. reconcile (HARD GATE) ----
@@ -64,12 +90,22 @@ class BuildService:
             if not os.path.isdir(self.output_dir):
                 os.makedirs(self.output_dir)
 
-            file_id = "%s_%d" % (dataset_name, abs(hash(plan.sql)) % (10 ** 10))
+            # hash() is salted per process (PYTHONHASHSEED), so the same SQL
+            # produced a different id on every run - whatever the id was for
+            # (dedup, cache, idempotence) it could not do. sha256 is stable.
+            digest = hashlib.sha256(plan.sql.encode("utf-8")).hexdigest()[:12]
+            file_id = "%s_%s" % (dataset_name, digest)
             file_path = os.path.join(self.output_dir, "%s.csv" % file_id)
             frame.to_csv(file_path, index=False)
 
         # ---- 4. lineage + handoff payload ----
         return {
+            # The DataFrame itself, so a caller that registers the dataset
+            # elsewhere (routers/etl_copilot.py hands it to AutoAI's
+            # _create_project_from_frame) does not have to re-execute the
+            # query or read the CSV back. It is the one non-JSON value in
+            # this dict: a caller that serialises the result pops it first.
+            "frame": frame,
             "file_id": file_id,
             "file_path": file_path,
             "row_count": len(frame),

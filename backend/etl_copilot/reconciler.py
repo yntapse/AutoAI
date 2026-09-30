@@ -70,8 +70,22 @@ class ReconciliationResult(object):
 class Reconciler:
     """Runs the compiler's control queries and compares them to the output."""
 
-    def __init__(self, tolerance: float = 0.01):
+    def __init__(self, tolerance: float = 0.01, relative_tolerance: float = 1e-9):
         self.tolerance = tolerance
+        # A fixed 0.01 is the right floor for small totals but is tighter
+        # than float64 can hold for large ones: summing a million FLOAT
+        # rows drifts by more than a hundredth well before the result is
+        # wrong. 1e-9 relative is still many orders of magnitude tighter
+        # than any double-count, which inflates a total by a whole factor,
+        # so the gate loses no power.
+        self.relative_tolerance = relative_tolerance
+
+    def _tolerance_for(self, expected) -> float:
+        try:
+            magnitude = abs(float(expected))
+        except (TypeError, ValueError):
+            return self.tolerance
+        return max(self.tolerance, magnitude * self.relative_tolerance)
 
     def reconcile(
         self,
@@ -88,7 +102,7 @@ class Reconciler:
         ]
 
         for query in entity_count_queries:
-            expected = self._scalar(connection_string, query.sql)
+            expected = self._scalar(connection_string, query.sql, query.params)
             result.record("entity_row_count", expected, len(frame))
 
         # ---- distinct entity keys in the output ----
@@ -107,7 +121,10 @@ class Reconciler:
             measure = measures_by_name.get(query.measure_name)
             if measure is None:
                 continue
-            if measure.aggregation is not AggFunction.SUM:
+            # SUM and COUNT are the two functions whose per-entity results add
+            # back to one source-grain total. The compiler emits control
+            # queries for exactly these two; anything else it skips.
+            if measure.aggregation not in (AggFunction.SUM, AggFunction.COUNT):
                 continue
             if query.measure_name not in frame.columns:
                 result.record(
@@ -115,14 +132,14 @@ class Reconciler:
                 )
                 continue
 
-            expected = self._scalar(connection_string, query.sql)
+            expected = self._scalar(connection_string, query.sql, query.params)
             actual = frame[query.measure_name].fillna(0).sum()
 
             result.record(
                 "source_grain_total:%s" % query.measure_name,
                 expected,
                 actual,
-                tolerance=self.tolerance,
+                tolerance=self._tolerance_for(expected),
             )
 
         return result
@@ -137,9 +154,14 @@ class Reconciler:
             % result.summary()
         )
 
-    def _scalar(self, connection_string: str, sql: str) -> Optional[Any]:
+    def _scalar(
+        self,
+        connection_string: str,
+        sql: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
         try:
-            frame = extract_to_dataframe(connection_string, sql)
+            frame = extract_to_dataframe(connection_string, sql, params=params)
         except DataSourceError as exc:
             raise ReconciliationError(
                 "Could not run a reconciliation query: %s" % exc

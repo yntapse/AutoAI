@@ -17,6 +17,9 @@ from typing import List, Dict, Any, Callable, Optional, Tuple
 from dotenv import load_dotenv
 from routers.datamodel import router as datamodel_router
 from routers.etl_agent import router as etl_agent_router
+from routers.etl_copilot import router as etl_copilot_router
+from routers.etl_copilot import _trace
+
 
 load_dotenv()
 
@@ -26,6 +29,7 @@ import pandas as pd
 from fastapi import (
     FastAPI,
     File,
+    Request,
     Form,
     UploadFile,
     HTTPException,
@@ -33,6 +37,7 @@ from fastapi import (
     BackgroundTasks,
     Depends,
 )
+import traceback
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
@@ -96,17 +101,134 @@ else:
         "http://127.0.0.1:3010",
     ]
 
+# Catch-all so an unhandled exception still returns a CORS-bearing JSON 500.
+#
+# Starlette runs ServerErrorMiddleware OUTSIDE CORSMiddleware, so an unhandled
+# exception produces a text/plain 500 with no access-control-allow-origin
+# header. The browser blocks it and fetch() rejects with "Failed to fetch",
+# hiding the real error from the UI permanently.
+#
+# @app.exception_handler(Exception) does NOT fix this - Starlette installs that
+# handler on ServerErrorMiddleware, which is still outside CORS (measured).
+# A plain http middleware registered BEFORE add_middleware(CORSMiddleware) ends
+# up INSIDE it, so its response travels back out through the CORS layer.
+# Registration order matters: the last middleware added is the outermost.
+@app.middleware("http")
+async def catch_unhandled_exceptions(request: Request, call_next):
+    # Everything that can raise is INSIDE the try, and nothing here writes to
+    # the console directly: a failing print() used to escape both middlewares
+    # and surface as a bare text/plain 500 with nothing logged.
+    trace_preview = request.url.path == "/etl-copilot/preview"
+    try:
+        if trace_preview:
+            _trace("[ETL preview trace] IN %s %s" % (request.method, request.url.path))
+        response = await call_next(request)
+        if trace_preview:
+            _trace("[ETL preview trace] OUT status=%s" % response.status_code)
+        return response
+    except Exception as exc:  # noqa: BLE001  (a 500 must not lose its CORS header)
+        _trace(
+            "[unhandled] %s %s -> %s: %s\n%s"
+            % (request.method, request.url.path, type(exc).__name__, exc,
+               traceback.format_exc())
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "message": "Internal server error.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "path": str(request.url.path),
+                }
+            },
+        )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
+    # Next.js moves to 3001/3002/... whenever 3000 is already taken, and an
+    # origin that is not on the list gets NO access-control-allow-origin
+    # header at all - which the browser reports as a CORS failure even on a
+    # 200. Any loopback dev port is allowed so a shifted port cannot cause it.
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# Outermost layer: added AFTER CORSMiddleware, so it wraps it. If anything
+# fails inside CORSMiddleware itself the response would otherwise leave the
+# app with no access-control-allow-origin header and the browser would hide
+# the real error behind "Failed to fetch". This guarantees the header.
+@app.middleware("http")
+async def guarantee_cors_header(request: Request, call_next):
+    origin = request.headers.get("origin")
+    try:
+        response = await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        _trace(
+            "[unhandled-outer] %s %s -> %s: %s\n%s"
+            % (request.method, request.url.path, type(exc).__name__, exc,
+               traceback.format_exc())
+        )
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "message": "Internal server error.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "path": str(request.url.path),
+                }
+            },
+        )
+
+    if origin and "access-control-allow-origin" not in response.headers:
+        response.headers["access-control-allow-origin"] = origin
+        response.headers["access-control-allow-credentials"] = "true"
+        response.headers["vary"] = "Origin"
+
+    return response
+
+
+# Which source is this process actually running? Open http://127.0.0.1:8000/__build
+# in a browser: if it 404s, the listening process started before these files
+# were last edited and is serving stale code - restart it.
+BUILD_STAMP = "etl-copilot-cors-fix-2"
+
+
+@app.get("/__build")
+def build_stamp():
+    import pathlib
+    import datetime
+
+    here = pathlib.Path(__file__).resolve().parent
+    watched = ["main.py", "routers/etl_copilot.py", "etl_copilot/copilot_service.py"]
+    files = {}
+    for name in watched:
+        f = here / name
+        files[name] = (
+            datetime.datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+            if f.exists()
+            else None
+        )
+
+    return {
+        "build_stamp": BUILD_STAMP,
+        "pid": os.getpid(),
+        "backend_dir": str(here),
+        "source_mtimes": files,
+        "etl_copilot_routes": sorted(
+            r.path for r in app.routes if getattr(r, "path", "").startswith("/etl-copilot")
+        ),
+    }
+
 app.include_router(datamodel_router)
 app.include_router(etl_agent_router)
-
+app.include_router(etl_copilot_router)
 try:
     Base.metadata.create_all(bind=engine)
 except OperationalError as exc:

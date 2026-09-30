@@ -192,6 +192,18 @@ class DatasetSpec(BaseModel):
 
     join_paths: List[JoinPath] = []
 
+    # Ordering. order_by names an OUTPUT column (the entity key, an attribute
+    # alias or a measure name), not a source column - the ORDER BY runs on the
+    # outer SELECT where only output names exist.
+    order_by: Optional[str] = None
+    order_direction: str = "desc"
+
+    # Accepted so a model that emits it gets a readable explanation instead of
+    # an opaque "extra fields not permitted". The validator rejects it: a row
+    # limit truncates the dataset, and reconciliation compares the output
+    # against source-grain totals, so a truncated output can never reconcile.
+    limit: Optional[int] = None
+
     target_column: Optional[str] = None
     target_type: Optional[str] = None
 
@@ -211,6 +223,18 @@ class DatasetSpec(BaseModel):
         entity_key = values.get("entity_key")
         if isinstance(entity_key, str):
             values["entity_key"] = [entity_key]
+
+        # A model asked to order by something writes SQL: "TotalSales DESC".
+        # order_by names an output COLUMN, so the direction is split off here
+        # rather than rejected. Same input normalisation as the legacy shapes
+        # above - it invents nothing the spec did not say.
+        order_by = values.get("order_by")
+        if isinstance(order_by, str):
+            parts = order_by.strip().split()
+            if len(parts) == 2 and parts[1].lower() in ("asc", "desc"):
+                values["order_by"] = parts[0]
+                if not values.get("order_direction"):
+                    values["order_direction"] = parts[1].lower()
 
         # Old OpenAI output supplied attributes as strings.
         raw_attributes = values.get("attributes", [])

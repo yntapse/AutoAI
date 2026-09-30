@@ -68,9 +68,70 @@ _OPERATORS = {
     "is_not_null": "IS NOT NULL",
 }
 
+# The canonical vocabulary above is what the spec contract declares. A
+# language model asked for a filter writes the symbol far more often than
+# the name, so the symbols are normalised to the canonical key here. This
+# is input normalisation, not a widening of what the compiler can emit:
+# every alias maps onto an operator that already existed.
+_OPERATOR_ALIASES = {
+    "=": "eq",
+    "==": "eq",
+    "!=": "ne",
+    "<>": "ne",
+    ">": "gt",
+    ">=": "gte",
+    "<": "lt",
+    "<=": "lte",
+    "equals": "eq",
+    "not_equals": "ne",
+    "greater_than": "gt",
+    "greater_than_or_equal": "gte",
+    "less_than": "lt",
+    "less_than_or_equal": "lte",
+    "is null": "is_null",
+    "isnull": "is_null",
+    "is not null": "is_not_null",
+    "isnotnull": "is_not_null",
+}
+
 
 class SpecCompileError(Exception):
     """A spec that cannot be compiled into correct SQL. Never swallowed."""
+
+
+def _cte_name(source_table: str, suffix: str, counter: int) -> str:
+    """A legal, collision-free CTE name derived from a table name.
+
+    _assert_safe_identifier only rejects control characters, so a table
+    called "Order Items" would otherwise produce the CTE name
+    "order items_agg1" - which is not parseable SQL. Every character
+    outside [A-Za-z0-9_] is folded to an underscore and a leading digit is
+    prefixed. The trailing counter keeps two tables that fold to the same
+    stem apart.
+    """
+    stem = "".join(
+        char if (char.isalnum() and char.isascii()) else "_"
+        for char in str(source_table).lower()
+    )
+    if not stem or not stem[0].isalpha():
+        stem = "t_%s" % stem
+    return "%s_%s%d" % (stem, suffix, counter)
+
+
+def _entity_join_column(path: JoinPath, entity_key: str) -> str:
+    """The column ON THE ENTITY TABLE that a path's aggregate joins back to.
+
+    Every CTE keys its aggregate on the FIRST hop's right_column - the column
+    on the far side of the first hop. The matching column on the near side is
+    that hop's left_column, which is NOT always the entity key: a foreign key
+    may sit on any column. Joining the aggregate back on the entity key
+    instead produced syntactically valid SQL that compared, say, CustomerID
+    against RegionID - wrong numbers, no error, and nothing downstream that
+    could notice.
+    """
+    if not path.hops:
+        return entity_key
+    return path.hops[0].left_column
 
 
 def _path_fingerprint(path: JoinPath) -> str:
@@ -168,6 +229,7 @@ class DatasetCompiler:
 
         for index, spec_filter in enumerate(filters or []):
             operator = str(spec_filter.operator).strip().lower()
+            operator = _OPERATOR_ALIASES.get(operator, operator)
 
             if operator not in _OPERATORS:
                 raise SpecCompileError(
@@ -451,46 +513,124 @@ class DatasetCompiler:
 
     # -- reconciliation queries -----------------------------------------
 
-    def _reconciliation(self, spec: DatasetSpec, params) -> List[ReconQuery]:
-        queries: List[ReconQuery] = []
+    def _recon_from(self, spec: DatasetSpec, path):
+        """FROM the entity table down the path's hops, aliased r0..rN.
 
+        The control query must cover exactly the rows the dataset aggregates:
+        reachable from the entity table, and restricted by the same filters.
+        The previous version was `SELECT SUM(col) FROM <source table>` with no
+        joins and no WHERE, so a filtered dataset compared a filtered output
+        against an unfiltered total and the hard gate failed correct work.
+        """
+
+        from_lines = ["FROM %s AS r0" % self._qt(spec.entity_table)]
+        aliases = {spec.entity_table: "r0"}
+
+        for index, hop in enumerate(path.hops if path else [], start=1):
+            alias = "r%d" % index
+            from_lines.append(
+                "JOIN %s AS %s ON %s.%s = %s.%s"
+                % (
+                    self._qt(hop.right_table),
+                    alias,
+                    aliases[hop.left_table],
+                    self._q(hop.left_column),
+                    alias,
+                    self._q(hop.right_column),
+                )
+            )
+            aliases[hop.right_table] = alias
+
+        source_alias = aliases.get(
+            path.source_table if path else spec.entity_table, "r0"
+        )
+        return from_lines, source_alias
+
+    def _reconciliation(self, spec: DatasetSpec) -> List[ReconQuery]:
+        """Control queries measured at the source grain.
+
+        Each carries its own bound parameters, because each applies the spec's
+        entity filters and the measure's own filters.
+        """
+
+        queries: List[ReconQuery] = []
         entity_key = spec.entity_key[0]
+
+        # ---- expected row count, under the same entity filters ----
+        count_params: Dict[str, Any] = {}
+        count_where = self._where(spec.filters, "r0", "rc", count_params)
+
+        count_lines = [
+            "SELECT COUNT(DISTINCT r0.%s) AS %s"
+            % (self._q(entity_key), self._q("expected_rows")),
+            "FROM %s AS r0" % self._qt(spec.entity_table),
+        ]
+        if count_where:
+            count_lines.append("WHERE %s" % " AND ".join(count_where))
+
         queries.append(
             ReconQuery(
                 kind="entity_count",
-                sql=_assert_extract_safe(
-                    "SELECT COUNT(DISTINCT %s) AS %s\nFROM %s"
-                    % (
-                        self._q(entity_key),
-                        self._q("expected_rows"),
-                        self._qt(spec.entity_table),
-                    )
-                ),
+                sql=_assert_extract_safe("\n".join(count_lines)),
+                params=count_params,
             )
         )
 
-        for measure in spec.measures:
-            if measure.aggregation is not AggFunction.SUM:
+        # ---- per-measure source-grain totals ----
+        by_source = {path.source_table: path for path in spec.join_paths}
+
+        for index, measure in enumerate(spec.measures):
+            # SUM and COUNT are the two functions whose per-entity results sum
+            # back to a single source-grain total. AVG, MEDIAN and STDDEV do
+            # not (an average of averages is not an average) and COUNT_DISTINCT
+            # does not (distinct counts do not add), so those are not checked -
+            # a limitation, stated rather than papered over.
+            if measure.aggregation not in (AggFunction.SUM, AggFunction.COUNT):
                 continue
+
+            path = by_source.get(measure.source_table)
+            if path is None:
+                continue
+
+            params: Dict[str, Any] = {}
+            from_lines, source_alias = self._recon_from(spec, path)
+
+            where = self._where(spec.filters, "r0", "re%d" % index, params)
+            where += self._where(
+                measure.filters, source_alias, "rm%d" % index, params
+            )
+
             if measure.source_column is None:
-                continue
+                if measure.aggregation is not AggFunction.COUNT:
+                    continue
+                expression = "COUNT(*)"
+            else:
+                _assert_safe_identifier(measure.source_column, "column name")
+                qualified = "%s.%s" % (
+                    source_alias,
+                    self._q(measure.source_column),
+                )
+                expression = "%s(%s)" % (measure.aggregation.value, qualified)
+
+            lines = [
+                "SELECT %s AS %s"
+                % (expression, self._q("expected_total"))
+            ] + from_lines
+
+            if where:
+                lines.append("WHERE %s" % " AND ".join(where))
 
             queries.append(
                 ReconQuery(
                     kind="measure_total",
                     measure_name=measure.name,
-                    sql=_assert_extract_safe(
-                        "SELECT SUM(%s) AS %s\nFROM %s"
-                        % (
-                            self._q(measure.source_column),
-                            self._q("expected_total"),
-                            self._qt(measure.source_table),
-                        )
-                    ),
+                    sql=_assert_extract_safe("\n".join(lines)),
+                    params=params,
                 )
             )
 
         return queries
+
 
     # -- lineage ---------------------------------------------------------
 
@@ -543,6 +683,16 @@ class DatasetCompiler:
         if not spec.entity_key:
             raise SpecCompileError("The spec has no entity_key.")
 
+        if len(spec.entity_key) > 1:
+            # entity_key[0] drives the grain, every join-back and the row
+            # count. Silently ignoring the rest produced a dataset at a
+            # different grain from the one the spec declared.
+            raise SpecCompileError(
+                "entity_key has %d columns (%s). Only a single-column entity "
+                "key is supported."
+                % (len(spec.entity_key), ", ".join(spec.entity_key))
+            )
+
         self.spec_entity_key = spec.entity_key[0]
         entity_key = self.spec_entity_key
         params: Dict[str, Any] = {}
@@ -552,13 +702,17 @@ class DatasetCompiler:
         subqueries: List[SubqueryPlan] = []
         join_lines: List[str] = []
         measure_selects: List[str] = []
+        # Measures are emitted in GROUP order, not spec order. Deriving
+        # output_columns from spec.measures therefore produced a column list
+        # in a different order from the SELECT it describes.
+        emitted_measures: List[str] = []
         tables_referenced = [spec.entity_table]
 
         counter = 0
 
         for (source_table, _fingerprint), (path, measures) in groups.items():
             counter += 1
-            cte_name = "%s_agg%d" % (source_table.lower(), counter)
+            cte_name = _cte_name(source_table, "agg", counter)
             alias = "a%d" % counter
 
             if not path.hops:
@@ -597,7 +751,7 @@ class DatasetCompiler:
                     )
 
                 if other:
-                    flat_name = "%s_flat%d" % (source_table.lower(), counter)
+                    flat_name = _cte_name(source_table, "flat", counter)
                     subqueries.append(
                         SubqueryPlan(
                             name=flat_name,
@@ -615,12 +769,13 @@ class DatasetCompiler:
                         % (
                             flat_name,
                             flat_alias,
-                            self._q(entity_key),
+                            self._q(_entity_join_column(path, entity_key)),
                             flat_alias,
                             self._q("entity_key"),
                         )
                     )
                     for measure in other:
+                        emitted_measures.append(measure.name)
                         measure_selects.append(
                             "%s AS %s"
                             % (
@@ -645,13 +800,14 @@ class DatasetCompiler:
                 % (
                     cte_name,
                     alias,
-                    self._q(entity_key),
+                    self._q(_entity_join_column(path, entity_key)),
                     alias,
                     self._q("entity_key"),
                 )
             )
 
             for measure in measures:
+                emitted_measures.append(measure.name)
                 measure_selects.append(
                     "%s AS %s"
                     % (
@@ -670,6 +826,12 @@ class DatasetCompiler:
         output_columns = [entity_key]
         entity_selects = ["t0.%s AS %s" % (self._q(entity_key), self._q(entity_key))]
 
+        # The entity key is already projected. An attribute claiming the same
+        # alias would emit the column twice, and pandas then hands back a
+        # DataFrame where the reconciler expects a Series (frame[key].nunique
+        # raises). Asking for "customer id and name" makes this common.
+        claimed_aliases = {entity_key}
+
         for attribute in spec.attributes:
             if attribute.source_table != spec.entity_table:
                 raise SpecCompileError(
@@ -678,14 +840,29 @@ class DatasetCompiler:
                 )
             alias_name = attribute.name or attribute.source_column
             _assert_safe_identifier(alias_name, "column alias")
+
+            if alias_name in claimed_aliases:
+                if (alias_name == entity_key
+                        and attribute.source_column == entity_key):
+                    # Character-for-character the projection already emitted.
+                    # Nothing is dropped: the column is in the output either
+                    # way, exactly once.
+                    continue
+                raise SpecCompileError(
+                    "Two different columns both want the output name '%s' "
+                    "('%s.%s' is the second). Give one of them a distinct "
+                    "name." % (alias_name, attribute.source_table,
+                               attribute.source_column)
+                )
+
+            claimed_aliases.add(alias_name)
             entity_selects.append(
                 "t0.%s AS %s"
                 % (self._q(attribute.source_column), self._q(alias_name))
             )
             output_columns.append(alias_name)
 
-        for measure in spec.measures:
-            output_columns.append(measure.name)
+        output_columns.extend(emitted_measures)
 
         lines = ["SELECT %s" % ", ".join(entity_selects + measure_selects)]
         lines.append("FROM %s AS t0" % self._qt(spec.entity_table))
@@ -694,6 +871,18 @@ class DatasetCompiler:
         entity_where = self._where(spec.filters, "t0", "entity", params)
         if entity_where:
             lines.append("WHERE %s" % " AND ".join(entity_where))
+
+        if spec.order_by:
+            # The outer SELECT is where output names exist, so ORDER BY runs
+            # on the alias. Ordering changes row order only - it selects no
+            # subset - so reconciliation is unaffected by it.
+            _assert_safe_identifier(spec.order_by, "order column")
+            direction = "DESC"
+            if str(spec.order_direction or "").strip().lower() == "asc":
+                direction = "ASC"
+            lines.append(
+                "ORDER BY %s %s" % (self._q(spec.order_by), direction)
+            )
 
         body = "\n".join(lines)
 
@@ -714,7 +903,7 @@ class DatasetCompiler:
             declared_grain=list(spec.entity_key),
             tables_referenced=tables_referenced,
             subqueries=subqueries,
-            reconciliation=self._reconciliation(spec, params),
+            reconciliation=self._reconciliation(spec),
             lineage=self._lineage(spec),
             spec_version=spec.spec_version,
         )

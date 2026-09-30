@@ -12,7 +12,11 @@ DESIGN RULES (from the architecture document):
     user. This module never picks one silently.
   * No path is a validation issue, not an exception.
   * More than MAX_HOPS hops is a validation issue.
-  * verified is ALWAYS False here. Only join_verifier may set it True.
+  * verified is False on every DISCOVERED path - only join_verifier may
+    set that True. The one exception is entity_table == source_table,
+    where there are no hops to measure and nothing a verifier could
+    check; join_verifier.verify_path() returns verified=True for the same
+    hopless case, so the two agree.
 """
 
 from collections import deque
@@ -127,8 +131,10 @@ def resolve_join_path(
 ) -> Tuple[Optional[JoinPath], List[ValidationIssue]]:
     """Resolve exactly one deterministic path, or explain why it cannot be.
 
-    Returns (path_or_None, issues). verified is always False on the returned
-    path - only join_verifier may set it True.
+    Returns (path_or_None, issues). verified is False on every path with
+    hops - only join_verifier may set that True. A hopless path (the
+    source IS the entity table) is verified on arrival: there is no join
+    to measure.
     """
 
     issues: List[ValidationIssue] = []

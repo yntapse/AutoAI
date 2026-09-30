@@ -1,0 +1,17 @@
+﻿==== kill_orphan_8000 2026-09-29T21:50:52 ====
+--- listeners on 8000 BEFORE ---
+  127.0.0.1:8000 owner=2180 owner_alive=True
+--- every python process ---
+  pid=26076 parent=24132 started=09/29/2026 18:12:38 cmd="C:\Users\Rishi\AppData\Local\Programs\Python\Python311\python.exe" "-c" "from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=24132, pipe_handle=608)" "--multiprocessing-fork"
+  pid=12600 parent=26836 started=09/29/2026 19:20:34 cmd=c:\Users\Rishi\Desktop\AutoML\AutoAI-main\venv\Scripts\python.exe c:\Users\Rishi\.vscode\extensions\ms-python.black-formatter-2026.6.0\bundled\tool\lsp_server.py
+  pid=2900 parent=12600 started=09/29/2026 19:20:34 cmd="C:\Users\Rishi\AppData\Local\Programs\Python\Python311\python.exe" c:\Users\Rishi\.vscode\extensions\ms-python.black-formatter-2026.6.0\bundled\tool\lsp_server.py
+  pid=10632 parent=10680 started=09/29/2026 21:49:39 cmd=C:\Users\Rishi\Desktop\AutoML\AutoAI-main\AutoAI-main\backend\..\..\venv\Scripts\python.exe  -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+  pid=2180 parent=10632 started=09/29/2026 21:49:39 cmd="C:\Users\Rishi\AppData\Local\Programs\Python\Python311\python.exe" -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+  pid=26796 parent=2180 started=09/29/2026 21:49:39 cmd="C:\Users\Rishi\AppData\Local\Programs\Python\Python311\python.exe" "-c" "from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=2180, pipe_handle=740)" "--multiprocessing-fork"
+--- dead owner 24132 : finding the process that inherited its socket ---
+  KILL orphan pid=26076 parent=24132 cmd="C:\Users\Rishi\AppData\Local\Programs\Python\Python311\python.exe" "-c" "from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=24132, pipe_handle=608)" "--multiprocessing-fork"
+--- listeners on 8000 AFTER ---
+  127.0.0.1:8000 owner=2180 owner_alive=True
+--- GET /__build ---
+{"build_stamp":"etl-copilot-cors-fix-2","pid":26796,"backend_dir":"C:\\Users\\Rishi\\Desktop\\AutoML\\AutoAI-main\\AutoAI-main\\backend","source_mtimes":{"main.py":"2026-09-29T21:44:40.583149","routers/etl_copilot.py":"2026-09-29T21:44:24.790577","etl_copilot/copilot_service.py":"2026-09-29T20:13:21.197752"},"etl_copilot_routes":["/etl-copilot/build","/etl-copilot/health","/etl-copilot/preview","/etl-copilot/schema","/etl-copilot/status/{job_id}"]}
+==== done ====

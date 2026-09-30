@@ -15,6 +15,14 @@ Pure module: no database connection, no pandas, no LLM.
 
 from typing import List, Optional
 
+# The compiler owns the operator vocabulary because it is the module that
+# turns an operator into SQL. Importing it here keeps one source of truth;
+# duplicating the list is how a validator and a compiler drift apart. The
+# dependency is acyclic - dataset_compiler imports spec_models only.
+from etl_copilot.dataset_compiler import (
+    _OPERATOR_ALIASES as _FILTER_OPERATOR_ALIASES,
+)
+from etl_copilot.dataset_compiler import _OPERATORS as _FILTER_OPERATORS
 from etl_copilot.spec_models import (
     DECOMPOSABLE,
     FANOUT_SAFE,
@@ -99,6 +107,43 @@ def _validate_structural(spec: DatasetSpec) -> List[ValidationIssue]:
     if not spec.entity_key:
         issues.append(_err("missing_entity_key", "An entity key is required.", "entity_key"))
 
+    # The compiler uses entity_key[0] for the grain, every join-back and the
+    # row-count check. A second key column was silently discarded, which made
+    # the output a different grain from the one the spec declared.
+    if len(spec.entity_key) > 1:
+        issues.append(
+            _err(
+                "composite_entity_key_unsupported",
+                "entity_key has %d columns (%s). Only a single-column entity "
+                "key is supported." % (len(spec.entity_key), ", ".join(spec.entity_key)),
+                "entity_key",
+                "Pick the one column that identifies a row of the entity table.",
+            )
+        )
+
+    if spec.limit is not None:
+        issues.append(
+            _err(
+                "row_limit_unsupported",
+                "A row limit is not supported. Truncating the output would "
+                "make it disagree with the source-grain totals reconciliation "
+                "compares it against, so the dataset could never be verified.",
+                "limit",
+                "Set order_by instead and take the top rows afterwards; the "
+                "dataset stays complete and verifiable.",
+            )
+        )
+
+    if spec.order_direction and str(spec.order_direction).strip().lower() not in ("asc", "desc"):
+        issues.append(
+            _err(
+                "invalid_order_direction",
+                "order_direction must be 'asc' or 'desc', not '%s'."
+                % spec.order_direction,
+                "order_direction",
+            )
+        )
+
     if not spec.measures and not spec.attributes:
         issues.append(
             _err(
@@ -141,6 +186,25 @@ def _validate_structural(spec: DatasetSpec) -> List[ValidationIssue]:
                     % (measure.name, measure.aggregation.value),
                     field,
                     "Only COUNT may omit a column (COUNT(*)).",
+                )
+            )
+
+    if spec.order_by:
+        output_names = {str(key).lower() for key in spec.entity_key}
+        output_names |= {
+            str(a.name or a.source_column).lower() for a in spec.attributes
+        }
+        output_names |= {str(m.name).lower() for m in spec.measures}
+
+        if str(spec.order_by).lower() not in output_names:
+            issues.append(
+                _err(
+                    "unknown_order_column",
+                    "order_by '%s' is not an output column. The ORDER BY runs "
+                    "on the outer SELECT, where only output names exist."
+                    % spec.order_by,
+                    "order_by",
+                    "Use one of: %s." % ", ".join(sorted(output_names)),
                 )
             )
 
@@ -194,6 +258,17 @@ def _validate_catalog_and_types(spec: DatasetSpec, catalog: Optional[Catalog]) -
                 )
             )
             continue
+
+        if measure.aggregation is AggFunction.MEDIAN:
+            issues.append(
+                _err(
+                    "unsupported_aggregation",
+                    "MEDIAN is not supported by the compiler (measure '%s')."
+                    % measure.name,
+                    field,
+                    "Use AVG, or compute the median outside the dataset.",
+                )
+            )
 
         if measure.source_column is not None:
             column = _column(catalog, measure.source_table, measure.source_column)
@@ -261,15 +336,155 @@ def _validate_catalog_and_types(spec: DatasetSpec, catalog: Optional[Catalog]) -
 
         if spec.entity_table and attribute.source_table != spec.entity_table:
             issues.append(
-                _warn(
+                _err(
                     "attribute_off_entity_grain",
-                    "Attribute '%s.%s' is not on the entity table; it may not be "
-                    "functionally dependent on the entity key."
+                    "Attribute '%s.%s' is not on the entity table, so it is "
+                    "not functionally dependent on the entity key."
                     % (attribute.source_table, attribute.source_column),
                     field,
                     "Make it a measure (MIN/MAX) if it can vary per entity.",
                 )
             )
+
+    return issues
+
+
+def _validate_target(spec: DatasetSpec, catalog: Optional[Catalog]) -> List[ValidationIssue]:
+    """The AutoML handoff rejects a target that is missing or non-numeric.
+
+    routers.datamodel._create_project_from_frame raises HTTP 400 for both,
+    after the dataset has been built, executed, reconciled and written. The
+    checks are cheap and belong before that work, not after it.
+    """
+
+    issues: List[ValidationIssue] = []
+
+    if not spec.target_column:
+        return issues
+
+    target = str(spec.target_column)
+
+    outputs = {str(key): "key" for key in spec.entity_key}
+    for attribute in spec.attributes:
+        outputs[str(attribute.name or attribute.source_column)] = "attribute"
+    for measure in spec.measures:
+        outputs[str(measure.name)] = "measure"
+
+    if target not in outputs:
+        issues.append(
+            _err(
+                "unknown_target_column",
+                "target_column '%s' is not one of the dataset's columns."
+                % target,
+                "target_column",
+                "Use one of: %s." % ", ".join(sorted(outputs)),
+            )
+        )
+        return issues
+
+    # A measure is numeric by construction. An attribute or the entity key
+    # carries the source column's type.
+    if outputs[target] == "measure" or catalog is None:
+        return issues
+
+    source_table = spec.entity_table
+    source_column = target
+
+    for attribute in spec.attributes:
+        if str(attribute.name or attribute.source_column) == target:
+            source_table = attribute.source_table
+            source_column = attribute.source_column
+            break
+
+    column = _column(catalog, source_table, source_column)
+
+    if column is not None and not _is_numeric(column.type):
+        issues.append(
+            _warn(
+                "non_numeric_target",
+                "target_column '%s' is %s. AutoML currently accepts only a "
+                "numeric target, so the handoff will refuse this dataset."
+                % (target, column.type),
+                "target_column",
+                "Pick a numeric column or measure as the target.",
+            )
+        )
+
+    return issues
+
+
+def _validate_filters(spec: DatasetSpec, catalog: Optional[Catalog]) -> List[ValidationIssue]:
+    """Filters were the one part of a spec nothing checked.
+
+    An unknown filter column used to travel all the way into the generated
+    SQL and fail at the database, and an unknown operator used to raise
+    SpecCompileError at compile time. Neither reaches the repair round,
+    because the repair round only ever sees ValidationIssue objects.
+    """
+
+    issues: List[ValidationIssue] = []
+
+    def check(filters, owning_table, field):
+        for index, spec_filter in enumerate(filters or []):
+            here = "%s[%d]" % (field, index)
+            operator = str(spec_filter.operator or "").strip().lower()
+
+            if (operator not in _FILTER_OPERATORS
+                    and operator not in _FILTER_OPERATOR_ALIASES):
+                issues.append(
+                    _err(
+                        "unknown_filter_operator",
+                        "Filter operator '%s' is not supported."
+                        % spec_filter.operator,
+                        here,
+                        "Use one of: %s." % ", ".join(sorted(_FILTER_OPERATORS)),
+                    )
+                )
+
+            canonical = _FILTER_OPERATOR_ALIASES.get(operator, operator)
+
+            if (canonical not in ("is_null", "is_not_null")
+                    and spec_filter.value is None):
+                issues.append(
+                    _err(
+                        "missing_filter_value",
+                        "Filter on '%s' uses %s but has no value."
+                        % (spec_filter.column, canonical),
+                        here,
+                    )
+                )
+
+            table = spec_filter.source_table or owning_table
+
+            if catalog is None or not table:
+                continue
+
+            if _table(catalog, table) is None:
+                issues.append(
+                    _err(
+                        "unknown_table",
+                        "Filter sources unknown table '%s'." % table,
+                        here,
+                    )
+                )
+                continue
+
+            if _column(catalog, table, spec_filter.column) is None:
+                issues.append(
+                    _err(
+                        "unknown_column",
+                        "Filter sources unknown column '%s.%s'."
+                        % (table, spec_filter.column),
+                        here,
+                        "A hallucinated filter column reaches the database "
+                        "if this is not checked.",
+                    )
+                )
+
+    check(spec.filters, spec.entity_table, "filters")
+
+    for index, measure in enumerate(spec.measures):
+        check(measure.filters, measure.source_table, "measures[%d].filters" % index)
 
     return issues
 
@@ -367,14 +582,22 @@ def _validate_grain(spec: DatasetSpec, paths: Optional[List[JoinPath]]) -> List[
 
         if path.requires_nested_aggregation:
             if measure.aggregation not in DECOMPOSABLE:
+                # NOT an error: dataset_compiler routes exactly this case to
+                # _multi_hop_single_level_cte, which aggregates once over the
+                # joined path. That is correct because the CTE contains only
+                # this path's tables, so no other measure can be inflated.
+                # Verified numerically at 3 hops against a ground-truth AVG:
+                # 10 of 10 entity values matched exactly. Grading it an error
+                # blocked a dataset the compiler builds correctly.
                 issues.append(
-                    _err(
+                    _warn(
                         "non_decomposable_multi_hop",
-                        "%s on '%s' crosses %d hops and cannot be decomposed into "
-                        "two aggregation levels."
+                        "%s on '%s' crosses %d hops, so it is aggregated once "
+                        "over the joined path rather than in two levels."
                         % (measure.aggregation.value, measure.name, len(path.hops)),
                         field,
-                        "The compiler must aggregate it once over the joined path.",
+                        "Correct for this function; the value is computed over "
+                        "every related row exactly once.",
                     )
                 )
             continue
@@ -404,6 +627,8 @@ def validate_spec(
     issues: List[ValidationIssue] = []
     issues.extend(_validate_structural(spec))
     issues.extend(_validate_catalog_and_types(spec, catalog))
+    issues.extend(_validate_filters(spec, catalog))
+    issues.extend(_validate_target(spec, catalog))
     issues.extend(_validate_join_paths(spec, join_paths))
     issues.extend(_validate_grain(spec, join_paths))
     return issues
