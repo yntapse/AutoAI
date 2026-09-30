@@ -49,10 +49,14 @@ def explain_dataset(spec: DatasetSpec, plan: CompiledPlan) -> List[str]:
     return lines
 
 
-def audit_payload(spec: DatasetSpec, plan: CompiledPlan) -> Dict[str, Any]:
+def audit_payload(
+    spec: DatasetSpec,
+    plan: CompiledPlan,
+    include_sql: bool = True,
+) -> Dict[str, Any]:
     """The structured record to persist alongside the dataset."""
 
-    return {
+    payload = {
         "spec_version": plan.spec_version,
         "entity_table": spec.entity_table,
         "entity_key": list(spec.entity_key),
@@ -87,5 +91,7 @@ def audit_payload(spec: DatasetSpec, plan: CompiledPlan) -> Dict[str, Any]:
             }
             for path in spec.join_paths
         ],
-        "sql": plan.sql,
     }
+    if include_sql:
+        payload["sql"] = plan.sql
+    return payload

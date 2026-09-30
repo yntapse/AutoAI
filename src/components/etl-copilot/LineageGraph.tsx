@@ -1,3 +1,5 @@
+import type { EtlCopilotLineage } from "@/services/projectService";
+
 export interface PreviewJoinHop {
   left_table: string;
   left_column: string;
@@ -36,6 +38,7 @@ export interface PreviewPlanSpec {
 
 interface LineageGraphProps {
   spec: PreviewPlanSpec | null;
+  lineage?: EtlCopilotLineage | null;
   selectedTable: string;
   finalColumns: string[];
 }
@@ -69,10 +72,11 @@ function FlowStage({
 
 export default function LineageGraph({
   spec,
+  lineage,
   selectedTable,
   finalColumns,
 }: LineageGraphProps) {
-  const sourceTables = Array.from(
+  const specSourceTables = Array.from(
     new Set(
       [
         spec?.entity_table,
@@ -86,13 +90,20 @@ export default function LineageGraph({
       ].filter((table): table is string => Boolean(table)),
     ),
   );
+  const sourceTables = lineage?.tables_referenced.length
+    ? lineage.tables_referenced
+    : specSourceTables;
 
-  const joins = (spec?.join_paths ?? []).flatMap((path) =>
-    path.hops.map(
-      (hop) =>
-        `${hop.left_table}.${hop.left_column} -> ${hop.right_table}.${hop.right_column}`,
-    ),
-  );
+  const joins = lineage?.join_paths.length
+    ? lineage.join_paths.flatMap((path) =>
+        path.hops.map((hop) => `${path.source_table}: ${hop}`),
+      )
+    : (spec?.join_paths ?? []).flatMap((path) =>
+        path.hops.map(
+          (hop) =>
+            `${hop.left_table}.${hop.left_column} -> ${hop.right_table}.${hop.right_column}`,
+        ),
+      );
   const transformations = [
     ...(spec?.attributes ?? []).map(
       (attribute) =>
@@ -103,6 +114,13 @@ export default function LineageGraph({
         `${measure.name} = ${measure.aggregation}(${measure.source_table}.${measure.source_column || "*"})`,
     ),
   ];
+  const measureAudit = (lineage?.measures ?? []).map((measure) => {
+    const cardinality = measure.cardinality_per_hop.length
+      ? `; cardinality ${measure.cardinality_per_hop.join(" -> ")}`
+      : "";
+    const nested = measure.nested_aggregation ? "; nested aggregation" : "";
+    return `${measure.name}: ${measure.aggregation}(${measure.source}); path ${measure.join_path.join(" -> ")}; verified ${measure.path_verified ? "yes" : "no"}${cardinality}${nested}`;
+  });
 
   if (sourceTables.length === 0 && selectedTable) sourceTables.push(selectedTable);
 
@@ -119,6 +137,14 @@ export default function LineageGraph({
           ↓
         </div>
         <FlowStage title="Transformations" items={transformations} />
+        {lineage && (
+          <>
+            <div className="text-center text-sm text-cyan-400" aria-hidden="true">
+              ↓
+            </div>
+            <FlowStage title="Measure Audit" items={measureAudit} />
+          </>
+        )}
         <div className="text-center text-sm text-cyan-400" aria-hidden="true">
           ↓
         </div>

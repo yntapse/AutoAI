@@ -41,6 +41,25 @@ const LABEL_CLS = "mb-2 block text-[13px] font-semibold text-slate-300";
 
 const PANEL_CLS = "rounded-xl border border-white/[0.08] bg-white/[0.02] p-4";
 
+function formatBuildJobError(detail: unknown) {
+  if (typeof detail === "string" && detail) return detail;
+  if (!detail || typeof detail !== "object") return "Dataset build failed.";
+
+  const error = detail as {
+    message?: unknown;
+    error?: unknown;
+    hint?: unknown;
+    issues?: { message?: unknown }[];
+  };
+  const parts = [error.message, error.error, error.hint]
+    .filter(Boolean)
+    .map(String);
+  if (Array.isArray(error.issues)) {
+    parts.push(...error.issues.map((issue) => String(issue?.message ?? "")).filter(Boolean));
+  }
+  return parts.length ? parts.join(" - ") : "Dataset build failed.";
+}
+
 export interface EtlCopilotPanelProps extends DataModelConnectionParams {
   availableTables: string[];
 
@@ -87,6 +106,8 @@ export default function EtlCopilotPanel({
     rows?: number;
     columns?: number;
     fileId: string;
+    projectId: string;
+    projectName?: string;
   } | null>(null);
   const [buildReconciliation, setBuildReconciliation] =
     useState<ReconciliationData | null>(null);
@@ -146,6 +167,7 @@ export default function EtlCopilotPanel({
     function handleRestoreHistory(item: SavedRecipe) {
       setUserRequest(item.prompt);
       setPreview(item.preview ?? null);
+      setBuildReconciliation(null);
     }
 
     function handleClearHistory() {
@@ -157,6 +179,7 @@ export default function EtlCopilotPanel({
     try {
       setError(null);
       setPreview(null);
+      setBuildReconciliation(null);
       setLoadingState("previewing");
 
       const result = await etlCopilotPreview({
@@ -223,7 +246,7 @@ export default function EtlCopilotPanel({
       }
 
       if (job.status === "failed") {
-        throw new Error(job.error?.detail || "Dataset build failed.");
+        throw new Error(formatBuildJobError(job.error?.detail));
       }
 
       const completedResult = job.result;
@@ -235,14 +258,14 @@ export default function EtlCopilotPanel({
         throw new Error("Completed build did not return project details.");
       }
 
-      const buildDetails = completedResult as EtlCopilotBuildResult & {
-        reconciliation?: ReconciliationData;
-      };
+      const buildDetails = completedResult as EtlCopilotBuildResult;
       setBuildProfile(buildDetails);
       setDatasetSummary({
         rows: buildDetails.rows,
         columns: buildDetails.columns,
         fileId: completedResult.file_id,
+        projectId: completedResult.project_id,
+        projectName: buildDetails.project_name,
       });
       setBuildReconciliation(buildDetails.reconciliation ?? null);
 
@@ -292,11 +315,7 @@ export default function EtlCopilotPanel({
     null;
   const selectedTableForPreview = selectedTable?.name ?? "";
   const planSpec = (preview?.spec as PreviewPlanSpec | undefined) ?? null;
-  const previewReconciliation = (
-    preview as (EtlCopilotPreviewResponse & {
-      reconciliation?: ReconciliationData;
-    }) | null
-  )?.reconciliation;
+  const previewReconciliation = preview?.reconciliation;
 
   useEffect(() => {
     if (!selectedTableForPreview) {
@@ -406,6 +425,8 @@ export default function EtlCopilotPanel({
           rows={datasetSummary.rows}
           columns={datasetSummary.columns}
           fileId={datasetSummary.fileId}
+          projectId={datasetSummary.projectId}
+          projectName={datasetSummary.projectName}
         />
       )}
 
@@ -495,6 +516,7 @@ export default function EtlCopilotPanel({
 
           <ReconciliationReport
             reconciliation={buildReconciliation ?? previewReconciliation}
+            mode={buildReconciliation ? "build" : "preview"}
           />
 
           <div className="grid gap-4 md:grid-cols-2">
@@ -510,6 +532,7 @@ export default function EtlCopilotPanel({
 
           <LineageGraph
             spec={planSpec}
+            lineage={preview.lineage}
             selectedTable={selectedTable?.name ?? ""}
             finalColumns={preview.columns}
           />

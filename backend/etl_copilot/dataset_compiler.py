@@ -872,6 +872,8 @@ class DatasetCompiler:
         if entity_where:
             lines.append("WHERE %s" % " AND ".join(entity_where))
 
+        output_body = "\n".join(lines)
+
         if spec.order_by:
             # The outer SELECT is where output names exist, so ORDER BY runs
             # on the alias. Ordering changes row order only - it selects no
@@ -887,14 +889,45 @@ class DatasetCompiler:
         body = "\n".join(lines)
 
         if subqueries:
-            cte_block = ",\n".join(
+            cte_entries = [
                 "%s AS (\n    %s\n)" % (plan.name, plan.sql) for plan in subqueries
-            )
+            ]
+            cte_block = ",\n".join(cte_entries)
             sql = "WITH %s\n%s" % (cte_block, body)
         else:
+            cte_entries = []
             sql = body
 
         sql = _assert_extract_safe(sql)
+
+        cte_entries.append("etl_preview_output AS (\n    %s\n)" % output_body)
+        output_selects = [
+            "COUNT(*) AS %s" % self._q("output_row_count"),
+            (
+                "COUNT(DISTINCT %s) + CASE WHEN COUNT(%s) < COUNT(*) "
+                "THEN 1 ELSE 0 END AS %s"
+            )
+            % (
+                self._q(entity_key),
+                self._q(entity_key),
+                self._q("output_distinct_entity_count"),
+            ),
+        ]
+        for index, measure in enumerate(spec.measures):
+            if measure.aggregation not in (AggFunction.SUM, AggFunction.COUNT):
+                continue
+            output_selects.append(
+                "COALESCE(SUM(%s), 0) AS %s"
+                % (
+                    self._q(measure.name),
+                    self._q("output_total_%d" % index),
+                )
+            )
+
+        preview_reconciliation_sql = _assert_extract_safe(
+            "WITH %s\nSELECT %s\nFROM etl_preview_output"
+            % (",\n".join(cte_entries), ", ".join(output_selects))
+        )
 
         return CompiledPlan(
             sql=sql,
@@ -904,6 +937,11 @@ class DatasetCompiler:
             tables_referenced=tables_referenced,
             subqueries=subqueries,
             reconciliation=self._reconciliation(spec),
+            preview_reconciliation=ReconQuery(
+                kind="preview_output_totals",
+                sql=preview_reconciliation_sql,
+                params=dict(params),
+            ),
             lineage=self._lineage(spec),
             spec_version=spec.spec_version,
         )

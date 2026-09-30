@@ -6,12 +6,15 @@ export interface ReconciliationCheck {
 }
 
 export interface ReconciliationData {
-  passed?: boolean;
+  available?: boolean;
+  passed?: boolean | null;
   checks?: ReconciliationCheck[];
+  message?: string;
 }
 
 interface ReconciliationReportProps {
   reconciliation: ReconciliationData | null | undefined;
+  mode?: "preview" | "build";
 }
 
 function displayValue(value: unknown) {
@@ -36,32 +39,40 @@ function difference(expected: unknown, actual: unknown) {
 
 export default function ReconciliationReport({
   reconciliation,
+  mode = "build",
 }: ReconciliationReportProps) {
   const checks = reconciliation?.checks ?? [];
   const totals = checks.filter((item) =>
     item.check.startsWith("source_grain_total:"),
   );
-  const status =
-    reconciliation?.passed === true
-      ? "PASS"
+  const status = reconciliation?.available === false
+    ? "NOT AVAILABLE"
+    : reconciliation?.passed === true
+      ? mode === "preview" ? "PREVIEW PASS" : "PASS"
       : reconciliation?.passed === false
-        ? "FAIL"
+        ? mode === "preview" ? "PREVIEW FAIL" : "FAIL"
         : "NOT AVAILABLE";
   const statusClass =
-    status === "PASS"
+    status === "PASS" || status === "PREVIEW PASS"
       ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
-      : status === "FAIL"
+      : status === "FAIL" || status === "PREVIEW FAIL"
         ? "border-red-500/30 bg-red-500/10 text-red-300"
         : "border-white/10 bg-white/[0.04] text-slate-400";
 
   return (
     <section className="rounded-xl border border-white/[0.08] bg-black/20 p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h4 className="text-sm font-semibold text-white">Verification</h4>
+        <h4 className="text-sm font-semibold text-white">
+          {mode === "preview" ? "Preview Reconciliation" : "Build Verification"}
+        </h4>
         <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${statusClass}`}>
           {status}
         </span>
       </div>
+
+      {reconciliation?.message && (
+        <p className="mb-3 text-xs text-slate-400">{reconciliation.message}</p>
+      )}
 
       {totals.length > 0 ? (
         <div className="space-y-3">

@@ -50,6 +50,7 @@ from etl_copilot.build_service import BuildError
 from etl_copilot.copilot_service import CopilotError, ETLCopilot, catalog_for_llm
 from etl_copilot.dataset_compiler import SpecCompileError
 from etl_copilot.reconciler import ReconciliationError
+from etl_copilot.quality import compute_quality_score
 
 # routers.datamodel imports `main` only inside function bodies, so importing it
 # here is safe and introduces no cycle.
@@ -212,7 +213,9 @@ def _connection_string(request: EtlCopilotConnection) -> str:
             odbc_driver=request.odbc_driver,
         )
     except DataSourceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = str(exc)
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
+        raise HTTPException(status_code=400, detail=detail)
 
 
 def _resolved_schema(request: EtlCopilotConnection) -> str:
@@ -221,7 +224,9 @@ def _resolved_schema(request: EtlCopilotConnection) -> str:
     try:
         return default_schema(request.db_type)
     except DataSourceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = str(exc)
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
+        raise HTTPException(status_code=400, detail=detail)
 
 
 def _jsonable(value):
@@ -280,9 +285,11 @@ def _raise_for(exc: Exception):
           was written, and the user's data is what changed.
     """
     if isinstance(exc, CopilotError):
+        detail = _issue_detail(str(exc), getattr(exc, "issues", None))
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
         raise HTTPException(
             status_code=400,
-            detail=_issue_detail(str(exc), getattr(exc, "issues", None)),
+            detail=detail,
         )
 
     if isinstance(exc, ReconciliationError):
@@ -298,7 +305,9 @@ def _raise_for(exc: Exception):
         )
 
     if isinstance(exc, (BuildError, SpecCompileError, DataSourceError)):
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = str(exc)
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
+        raise HTTPException(status_code=400, detail=detail)
 
     # Everything the OpenAI SDK raises is an UPSTREAM fault, not a bad
     # request: a network blip, a rate limit, a revoked key, a completion
@@ -327,16 +336,20 @@ def _resolve_target(requested: Optional[str], result: Dict[str, Any]) -> str:
             return candidate
 
     if requested and requested not in columns:
+        detail = (
+            "Target column '%s' is not in the generated dataset. "
+            "Available columns: %s" % (requested, ", ".join(map(str, columns)))
+        )
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Target column '%s' is not in the generated dataset. "
-                "Available columns: %s" % (requested, ", ".join(map(str, columns)))
-            ),
+            detail=detail,
         )
 
     if not columns:
-        raise HTTPException(status_code=400, detail="The dataset has no columns.")
+        detail = "The dataset has no columns."
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
+        raise HTTPException(status_code=400, detail=detail)
 
     return str(columns[-1])
 
@@ -373,8 +386,6 @@ def _build_and_register(
             detail="The dataset was built but its rows were not returned.",
         )
 
-    from main import _compute_quality_score
-
     total_rows = int(len(frame))
     total_columns = int(len(frame.columns))
     total_cells = total_rows * total_columns
@@ -386,7 +397,7 @@ def _build_and_register(
             missing_value_count * 100.0 / total_cells if total_cells else None
         ),
         "duplicate_rows": int(frame.duplicated().sum()),
-        "quality_score": int(_compute_quality_score(frame)),
+        "quality_score": int(compute_quality_score(frame)),
     }
     column_profiles = [
         {
@@ -478,7 +489,9 @@ def etl_copilot_schema(request: EtlCopilotSchemaRequest):
     try:
         catalog = copilot.discover_schema(connection_string, schema=schema)
     except DataSourceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = str(exc)
+        _trace("[ETL] RAISING HTTPException 400 detail=%r" % detail)
+        raise HTTPException(status_code=400, detail=detail)
 
     payload = catalog_for_llm(catalog)
 
@@ -579,6 +592,8 @@ def etl_copilot_preview(request: EtlCopilotPreviewRequest):
             # then dropped here, so the UI could never show the rows.
             "preview_rows": result.get("preview_rows") or [],
             "has_more": bool(result.get("has_more")),
+            "lineage": result.get("lineage"),
+            "reconciliation": result.get("reconciliation"),
         })
         _trace("[ETL preview] 7/7 response serialized, returning 200")
         return response
@@ -649,6 +664,7 @@ def etl_copilot_build(
         job_id = str(uuid.uuid4())
         _set_job(job_id, status="pending", stage="queued", progress=0)
         background_tasks.add_task(_run_build_job, job_id, request)
+        _trace("[ETL build] job=%s queued" % job_id)
 
         return JSONResponse(
             status_code=202,
@@ -714,7 +730,14 @@ def _set_job(job_id: str, **fields) -> None:
             "kind": "etl_copilot",
         },
     )
+    previous_state = (job.get("status"), job.get("stage"), job.get("progress"))
     job.update(fields)
+    current_state = (job.get("status"), job.get("stage"), job.get("progress"))
+    if current_state != previous_state:
+        _trace(
+            "[ETL build] job=%s status=%s stage=%s progress=%s"
+            % (job_id, current_state[0], current_state[1], current_state[2])
+        )
 
 
 def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -731,6 +754,15 @@ def _run_build_job(job_id: str, request: EtlCopilotBuildRequest) -> None:
         db = SessionLocal()
         _set_job(job_id, status="running", stage="building", progress=20)
         payload = _build_and_register(db, request)
+        _trace(
+            "[ETL build] job=%s registered project_id=%s file_id=%s rows=%s"
+            % (
+                job_id,
+                payload.get("project_id"),
+                payload.get("file_id"),
+                payload.get("rows"),
+            )
+        )
         _set_job(
             job_id,
             status="completed",
@@ -740,6 +772,18 @@ def _run_build_job(job_id: str, request: EtlCopilotBuildRequest) -> None:
             completed_at=datetime.utcnow().isoformat(),
         )
     except HTTPException as exc:
+        detail = getattr(exc, "detail", str(exc))
+        _trace(
+            "[ETL build] job=%s FAILED status_code=%s type=%s message=%s detail=%r"
+            % (
+                job_id,
+                exc.status_code,
+                type(exc).__name__,
+                str(exc),
+                detail,
+            )
+        )
+        _trace(traceback.format_exc())
         _set_job(
             job_id,
             status="failed",
@@ -749,6 +793,12 @@ def _run_build_job(job_id: str, request: EtlCopilotBuildRequest) -> None:
             completed_at=datetime.utcnow().isoformat(),
         )
     except Exception as exc:  # noqa: BLE001  (a background job must not die silently)
+        detail = getattr(exc, "detail", str(exc))
+        _trace(
+            "[ETL build] job=%s FAILED type=%s message=%s detail=%r"
+            % (job_id, type(exc).__name__, str(exc), detail)
+        )
+        _trace(traceback.format_exc())
         _set_job(
             job_id,
             status="failed",

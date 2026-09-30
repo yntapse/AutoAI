@@ -460,6 +460,47 @@ export interface EtlCopilotPreviewResponse {
   errors: unknown[];
   warnings: unknown[];
   spec: unknown;
+  lineage?: EtlCopilotLineage | null;
+  reconciliation?: EtlCopilotReconciliation | null;
+}
+
+export interface EtlCopilotLineage {
+  spec_version: number;
+  entity_table: string;
+  entity_key: string[];
+  declared_grain: string[];
+  tables_referenced: string[];
+  output_columns: string[];
+  measures: {
+    name: string;
+    source: string;
+    aggregation: string;
+    join_path: string[];
+    path_verified: boolean;
+    cardinality_per_hop: string[];
+    nested_aggregation: boolean;
+    zero_when_absent: boolean;
+    explanation: string;
+  }[];
+  join_paths: {
+    source_table: string;
+    hops: string[];
+    verified: boolean;
+    discovered_via: string;
+    alternatives_considered: number;
+  }[];
+}
+
+export interface EtlCopilotReconciliation {
+  available?: boolean;
+  passed?: boolean | null;
+  checks?: {
+    check: string;
+    expected?: unknown;
+    actual?: unknown;
+    passed?: boolean;
+  }[];
+  message?: string;
 }
 
 export interface EtlCopilotBuildResponse {
@@ -470,6 +511,7 @@ export interface EtlCopilotBuildResponse {
 
 export interface EtlCopilotBuildResult {
   project_id: string;
+  project_name?: string;
   file_id: string;
   target_column: string;
   rows: number;
@@ -488,12 +530,14 @@ export interface EtlCopilotBuildResult {
     distinct_count: number;
     sample_values: unknown[];
   }[];
+  reconciliation?: EtlCopilotReconciliation;
+  lineage?: EtlCopilotLineage;
 }
 
 export interface EtlCopilotJobStatusResponse {
   status: string;
   result?: EtlCopilotBuildResult | null;
-  error?: { detail?: string } | null;
+  error?: { detail?: unknown } | null;
 }
 
 

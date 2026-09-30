@@ -144,6 +144,68 @@ class Reconciler:
 
         return result
 
+    def reconcile_preview(
+        self,
+        connection_string: str,
+        spec: DatasetSpec,
+        plan: CompiledPlan,
+    ) -> ReconciliationResult:
+        """Run full-result controls without transferring rows or gating Preview."""
+        output_query = plan.preview_reconciliation
+        if output_query is None:
+            raise ReconciliationError("The compiled plan has no preview totals query.")
+
+        output_frame = extract_to_dataframe(
+            connection_string,
+            output_query.sql,
+            params=output_query.params,
+        )
+        output = output_frame.iloc[0].to_dict()
+        result = ReconciliationResult()
+
+        entity_query = next(
+            (query for query in plan.reconciliation if query.kind == "entity_count"),
+            None,
+        )
+        output_rows = output.get("output_row_count")
+        if entity_query is not None:
+            expected_rows = self._scalar(
+                connection_string, entity_query.sql, entity_query.params
+            )
+            result.record("entity_row_count", expected_rows, output_rows)
+
+        output_distinct = output.get("output_distinct_entity_count")
+        result.record(
+            "output_rows_equal_distinct_keys", output_distinct, output_rows
+        )
+
+        measures_by_name = {measure.name: measure for measure in spec.measures}
+        for query in plan.reconciliation:
+            if query.kind != "measure_total":
+                continue
+
+            measure = measures_by_name.get(query.measure_name)
+            if measure is None or measure.aggregation not in (
+                AggFunction.SUM,
+                AggFunction.COUNT,
+            ):
+                continue
+
+            output_key = "output_total_%d" % spec.measures.index(measure)
+            if output_key not in output:
+                result.record("measure_present:%s" % measure.name, True, False)
+                continue
+
+            expected = self._scalar(connection_string, query.sql, query.params)
+            result.record(
+                "source_grain_total:%s" % measure.name,
+                expected,
+                output[output_key],
+                tolerance=self._tolerance_for(expected),
+            )
+
+        return result
+
     def gate(self, result: ReconciliationResult) -> None:
         """Raise unless every check passed. This is the hard gate."""
         if result.passed:

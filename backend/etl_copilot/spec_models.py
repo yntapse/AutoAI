@@ -318,6 +318,7 @@ class CompiledPlan(BaseModel):
     tables_referenced: List[str] = []
     subqueries: List[SubqueryPlan] = []
     reconciliation: List[ReconQuery] = []
+    preview_reconciliation: Optional[ReconQuery] = None
     lineage: List[MeasureLineage] = []
     spec_version: int = 1
 

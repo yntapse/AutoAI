@@ -68,6 +68,7 @@ export default function NewProjectPage() {
   const [pendingCopilotTraining, setPendingCopilotTraining] = useState<{
     fileId: string;
     targetColumn: string;
+    projectId: string;
   } | null>(null);
 
   // --- Database: table list (POST /datasource/tables) -----------------------
@@ -1207,6 +1208,7 @@ export default function NewProjectPage() {
                               setPendingCopilotTraining({
                                 fileId,
                                 targetColumn,
+                                projectId,
                               });
                             }}
                             onReset={() => {
@@ -1218,17 +1220,26 @@ export default function NewProjectPage() {
                         {connectionSuccess &&
                           dbMode === "copilot" &&
                           pendingCopilotTraining && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                router.push(
-                                  `/training/${encodeURIComponent(pendingCopilotTraining.fileId)}?target_column=${encodeURIComponent(pendingCopilotTraining.targetColumn)}`,
-                                )
-                              }
-                              className="rounded-xl bg-cyan-600 px-4 py-2.5 text-[13px] font-semibold text-white transition hover:bg-cyan-500"
-                            >
-                              Go To Training
-                            </button>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => router.push("/dashboard")}
+                                className="rounded-xl border border-white/10 px-4 py-2.5 text-[13px] font-semibold text-slate-200 transition hover:bg-white/[0.06]"
+                              >
+                                View Projects
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  router.push(
+                                    `/training/${encodeURIComponent(pendingCopilotTraining.fileId)}?target_column=${encodeURIComponent(pendingCopilotTraining.targetColumn)}`,
+                                  )
+                                }
+                                className="rounded-xl bg-cyan-600 px-4 py-2.5 text-[13px] font-semibold text-white transition hover:bg-cyan-500"
+                              >
+                                Go To Training
+                              </button>
+                            </div>
                           )}
 
                         <button

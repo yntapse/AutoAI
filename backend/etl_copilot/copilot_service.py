@@ -26,8 +26,9 @@ from etl_copilot.build_service import BuildService
 from etl_copilot.dataset_compiler import DatasetCompiler, SpecCompileError
 from etl_copilot.join_graph import resolve_paths_for_spec
 from etl_copilot.join_verifier import JoinVerifier
-from etl_copilot.lineage import explain_dataset
+from etl_copilot.lineage import audit_payload, explain_dataset
 from etl_copilot.openai_spec_generator import OpenAISpecGenerator
+from etl_copilot.reconciler import ReconciliationError
 from etl_copilot.schema_reader import SchemaReader
 from services.db_connector import DataSourceError, preview_to_dataframe
 from etl_copilot.spec_models import (
@@ -300,10 +301,13 @@ class ETLCopilot:
         explanation: List[str] = []
         preview_rows = []
         has_more = False
+        reconciliation = None
+        lineage = None
         
         if not blocking:
             plan = self.compile_spec(spec)
             explanation = explain_dataset(spec, plan)
+            lineage = audit_payload(spec, plan, include_sql=False)
             
             
             # preview_to_dataframe raises DataSourceError when the result is
@@ -322,6 +326,28 @@ class ETLCopilot:
             except DataSourceError:
                 preview_rows = []
                 has_more = False
+
+            try:
+                result = self.build_service.reconciler.reconcile_preview(
+                    connection_string,
+                    spec,
+                    plan,
+                )
+                reconciliation = {
+                    "available": True,
+                    "passed": result.passed,
+                    "checks": result.checks,
+                }
+            except (DataSourceError, ReconciliationError):
+                reconciliation = {
+                    "available": False,
+                    "passed": None,
+                    "checks": [],
+                    "message": (
+                        "Preview checks could not be completed. Build will run "
+                        "the authoritative reconciliation."
+                    ),
+                }
             
         return {
             "spec": spec.dict(),
@@ -331,4 +357,6 @@ class ETLCopilot:
             "explanation": explanation,
             "preview_rows": preview_rows,
             "has_more": has_more,
+            "lineage": lineage,
+            "reconciliation": reconciliation,
         }

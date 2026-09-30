@@ -21,6 +21,7 @@ SECURITY NOTE for SQL Server:
 """
 
 import re
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
@@ -53,6 +54,26 @@ DEFAULT_PORT = {POSTGRESQL: 5432, MSSQL: 1433}
 class DataSourceError(Exception):
     """Raised when a connection or query is rejected. The message is safe to
     show to a user - it never contains the password."""
+
+
+def _coerce_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert SQL Server Decimal columns into true numeric pandas columns.
+
+    SQL Server returns DECIMAL/MONEY values as decimal.Decimal objects.
+    Pandas stores them as dtype=object, which later causes AutoML
+    numeric-target validation to fail.
+    """
+    for column in df.columns:
+        if df[column].dtype != object:
+            continue
+
+        values = df[column].dropna()
+
+        if len(values) and all(isinstance(v, Decimal) for v in values):
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    return df
 
 
 def _check_db_type(db_type: str) -> str:
@@ -347,7 +368,7 @@ def extract_to_dataframe(
             f"Maximum {MAX_COLUMNS} allowed."
         )
 
-    return df
+    return _coerce_decimal_columns(df)
 
 
 def preview_to_dataframe(
@@ -393,6 +414,7 @@ def preview_to_dataframe(
     if df.empty:
         raise DataSourceError("The query returned no rows.")
 
+    df = _coerce_decimal_columns(df)
     return df, has_more
 
 

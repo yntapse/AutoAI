@@ -26,6 +26,7 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 import pandas as pd
+from etl_copilot.quality import compute_quality_score as _compute_quality_score
 from fastapi import (
     FastAPI,
     File,
@@ -9887,40 +9888,6 @@ def _get_proactive_suggestion(
             100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
         )
         return f"✅ Dataset quality: {quality}/100. ML-ready! Go Back to Training."
-
-
-def _compute_quality_score(df: pd.DataFrame) -> int:
-    """Compute a 0-100 quality score for a DataFrame."""
-    if df.shape[0] == 0:
-        return 0
-    total_cells = df.shape[0] * df.shape[1]
-    nulls = int(df.isnull().sum().sum())
-    dups = int(df.duplicated().sum())
-
-    # Completeness (0-50 points)
-    completeness_ratio = 1 - (nulls / max(total_cells, 1))
-    completeness_score = int(completeness_ratio * 50)
-
-    # No duplicates (0-15 points)
-    dup_ratio = dups / max(df.shape[0], 1)
-    dup_score = int((1 - min(dup_ratio * 5, 1)) * 15)
-
-    # Type correctness (0-20 points) — object columns that look numeric lose points
-    type_penalty = 0
-    for col in df.select_dtypes(include=["object"]).columns:
-        numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
-        if numeric_count > df.shape[0] * 0.5:
-            type_penalty += 5
-    type_score = max(0, 20 - type_penalty)
-
-    # Column utility (0-15 points) — constant or near-constant columns lose points
-    constant_penalty = 0
-    for col in df.columns:
-        if df[col].nunique() <= 1:
-            constant_penalty += 5
-    utility_score = max(0, 15 - constant_penalty)
-
-    return min(100, max(0, completeness_score + dup_score + type_score + utility_score))
 
 
 def _build_quality_progress_bar(quality_history: list, current_score: int) -> str:
