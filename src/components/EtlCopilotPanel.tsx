@@ -10,6 +10,7 @@ import {
   type DataModelConnectionParams,
   type EtlCopilotSchemaResponse,
   type EtlCopilotPreviewResponse,
+  type EtlCopilotBuildResult,
 } from "@/services/projectService";
 import DatabaseExplorer, {
   type ExplorerRelationship,
@@ -28,6 +29,8 @@ import ReconciliationReport, {
 import SavedRecipes, {
   type SavedRecipe,
 } from "@/components/etl-copilot/SavedRecipes";
+import DataQualityAnalysis from "@/components/etl-copilot/DataQualityAnalysis";
+import ColumnProfiling from "@/components/etl-copilot/ColumnProfiling";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
@@ -87,6 +90,9 @@ export default function EtlCopilotPanel({
   } | null>(null);
   const [buildReconciliation, setBuildReconciliation] =
     useState<ReconciliationData | null>(null);
+  const [buildProfile, setBuildProfile] = useState<EtlCopilotBuildResult | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const [copiedSql, setCopiedSql] = useState(false);
@@ -229,11 +235,10 @@ export default function EtlCopilotPanel({
         throw new Error("Completed build did not return project details.");
       }
 
-      const buildDetails = completedResult as typeof completedResult & {
-        rows?: number;
-        columns?: number;
+      const buildDetails = completedResult as EtlCopilotBuildResult & {
         reconciliation?: ReconciliationData;
       };
+      setBuildProfile(buildDetails);
       setDatasetSummary({
         rows: buildDetails.rows,
         columns: buildDetails.columns,
@@ -402,6 +407,13 @@ export default function EtlCopilotPanel({
           columns={datasetSummary.columns}
           fileId={datasetSummary.fileId}
         />
+      )}
+
+      {buildProfile && (
+        <>
+          <DataQualityAnalysis metrics={buildProfile.data_quality} />
+          <ColumnProfiling columns={buildProfile.column_profiles} />
+        </>
       )}
 
       <SavedRecipes

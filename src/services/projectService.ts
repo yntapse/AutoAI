@@ -472,6 +472,22 @@ export interface EtlCopilotBuildResult {
   project_id: string;
   file_id: string;
   target_column: string;
+  rows: number;
+  columns: number;
+  data_quality: {
+    total_rows: number;
+    total_columns: number;
+    missing_value_percentage: number | null;
+    duplicate_rows: number;
+    quality_score: number;
+  };
+  column_profiles: {
+    column_name: string;
+    data_type: string;
+    null_count: number;
+    distinct_count: number;
+    sample_values: unknown[];
+  }[];
 }
 
 export interface EtlCopilotJobStatusResponse {

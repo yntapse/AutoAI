@@ -373,6 +373,32 @@ def _build_and_register(
             detail="The dataset was built but its rows were not returned.",
         )
 
+    from main import _compute_quality_score
+
+    total_rows = int(len(frame))
+    total_columns = int(len(frame.columns))
+    total_cells = total_rows * total_columns
+    missing_value_count = int(frame.isnull().sum().sum())
+    data_quality = {
+        "total_rows": total_rows,
+        "total_columns": total_columns,
+        "missing_value_percentage": (
+            missing_value_count * 100.0 / total_cells if total_cells else None
+        ),
+        "duplicate_rows": int(frame.duplicated().sum()),
+        "quality_score": int(_compute_quality_score(frame)),
+    }
+    column_profiles = [
+        {
+            "column_name": str(column),
+            "data_type": str(frame[column].dtype),
+            "null_count": int(frame[column].isnull().sum()),
+            "distinct_count": int(frame[column].nunique(dropna=True)),
+            "sample_values": _jsonable(frame[column].dropna().head(3).tolist()),
+        }
+        for column in frame.columns
+    ]
+
     target_column = _resolve_target(request.target_column, result)
 
     source_label = "%s://%s/%s (ETL Copilot)" % (
@@ -400,6 +426,8 @@ def _build_and_register(
     payload["warnings"] = result.get("warnings")
     payload["lineage"] = result.get("lineage")
     payload["spec"] = result.get("spec")
+    payload["data_quality"] = data_quality
+    payload["column_profiles"] = column_profiles
 
     # Coerced once, here, so the background job stores a JSON-safe result too.
     return _jsonable(payload)
