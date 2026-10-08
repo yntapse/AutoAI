@@ -18,6 +18,10 @@ from dotenv import load_dotenv
 from routers.datamodel import router as datamodel_router
 from routers.etl_agent import router as etl_agent_router
 from routers.etl_copilot import router as etl_copilot_router
+from routers.pipelines import router as pipeline_router
+from routers.profiling import router as profiling_router
+from routers.quality import router as quality_router
+from routers.cleaning import router as cleaning_router
 from routers.etl_copilot import _trace
 
 
@@ -58,6 +62,14 @@ from models.sandbox_job import SandboxJob
 from models.dataset_profile import DatasetProfile
 from models.experiment_memory import ExperimentMemory
 from models.project import Project
+from models.pipeline_definition import PipelineDefinition
+from models.pipeline_version import PipelineVersion
+from models.pipeline_run import PipelineRun
+from models.cleaning_rule import CleaningRule
+from models.transformation_rule import TransformationRule
+from models.agent_decision import AgentDecision
+from models.source_profile_snapshot import SourceProfileSnapshot
+from models.quality_rule import QualityRule
 from xgboost import XGBRegressor
 import numpy as np
 
@@ -230,6 +242,10 @@ def build_stamp():
 app.include_router(datamodel_router)
 app.include_router(etl_agent_router)
 app.include_router(etl_copilot_router)
+app.include_router(pipeline_router)
+app.include_router(profiling_router)
+app.include_router(quality_router)
+app.include_router(cleaning_router)
 try:
     Base.metadata.create_all(bind=engine)
 except OperationalError as exc:

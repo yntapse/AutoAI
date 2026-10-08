@@ -91,13 +91,26 @@ SHAPE_RULES = """- Use measure_name, source_table, source_column, aggregation
 - aggregation must be one of: SUM, AVG, MIN, MAX, COUNT, COUNT_DISTINCT,
   STDDEV  (MEDIAN is not supported)
 - attributes must be columns of entity_table only
+- include_in_output is optional; a measure used only for HAVING is hidden by
+    default, so set it to true only when the user explicitly requests that output
+- set include_in_output to false when the user does not request the measure,
+    even if it is needed internally to evaluate HAVING
 - filters is a list of {"column", "operator", "value"}
+- filters are row-level conditions on real catalog columns; their value must
+  be a scalar, never SQL, a subquery, or a description of a condition
+- having is a list of {"measure_name", "operator", "value"} for conditions
+  on an aggregated output measure, such as "more than 5 orders"; reference
+  the measure_name that computes the aggregate, never put SQL in the value;
+  use only comparison operators, not is_null or is_not_null
 - operator must be one of: eq, ne, gt, gte, lt, lte, is_null, is_not_null
 - omit "value" only for is_null and is_not_null
-- to rank, set "order_by" to an OUTPUT name (a measure_name, an attribute
-  column, or entity_key) and "order_direction" to "asc" or "desc"
-- there is no row limit: never emit "limit", "top" or "offset". Order the
-  rows instead and the whole dataset comes back sorted.
+- for "top N" or "first N", set "limit" to N, "order_by" to the requested
+    OUTPUT measure or attribute, and "order_direction" to "desc" or "asc";
+    never represent Top-N as a HAVING condition
+- a measure used for Top-N ordering is part of the requested output and must
+    not be hidden
+- for a ranking request without a row count, set "order_by" and
+    "order_direction" without "limit"
 - Return ONLY JSON"""
 
 FORMAT_EXAMPLE = """{
@@ -115,7 +128,11 @@ FORMAT_EXAMPLE = """{
             "aggregation": "COUNT"
         }
     ],
-    "filters": []
+    "filters": [],
+    "having": [],
+    "order_by": null,
+    "order_direction": "desc",
+    "limit": null
 }"""
 
 

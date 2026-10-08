@@ -196,7 +196,14 @@ class Reconciler:
                 result.record("measure_present:%s" % measure.name, True, False)
                 continue
 
-            expected = self._scalar(connection_string, query.sql, query.params)
+            expected_sql = query.sql
+            if measure.aggregation is AggFunction.SUM:
+                expected_sql = (
+                    "SELECT COALESCE((%s), 0) AS expected_total" % query.sql
+                )
+            expected = self._scalar(
+                connection_string, expected_sql, query.params
+            )
             result.record(
                 "source_grain_total:%s" % measure.name,
                 expected,

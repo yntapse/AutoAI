@@ -24,6 +24,8 @@ from etl_copilot.spec_models import (
     Catalog,
     ColumnInfo,
     DatasetSpec,
+    FilterSpec,
+    HavingSpec,
     JoinHop,
     MeasureSpec,
     TableInfo,
@@ -283,6 +285,113 @@ def main():
     print("      compiler gives:             {:,}".format(total_sales))
     check("compiler avoids the flat-join inflation", total_sales != naive,
           "inflation factor %.1fx avoided" % (naive / float(total_sales)))
+
+    # ---- aggregate HAVING regression ----
+    print("\n[8a] Aggregate HAVING filter")
+    malformed = build_spec()
+    malformed.filters = [
+        FilterSpec(
+            column="CustomerID",
+            operator="eq",
+            value="SELECT CustomerID FROM Orders GROUP BY CustomerID",
+        )
+    ]
+    malformed_issues = validate_spec(malformed, catalog)
+    check("SQL text in a row-filter value is rejected",
+          any(issue.code == "sql_filter_value" for issue in malformed_issues))
+
+    cursor.execute(
+        "INSERT INTO Orders VALUES (?, ?, ?, ?)",
+        (1001, 1, "2026-01-01", 5000),
+    )
+    filtered = build_spec()
+    filtered.join_paths = spec.join_paths
+    filtered.measures = [
+        MeasureSpec(measure_name="order_count", source_table="Orders",
+                    source_column="OrderID", aggregation="COUNT")
+        if measure.name == "order_count" else measure
+        for measure in filtered.measures
+    ]
+    filtered.having = [
+        HavingSpec(measure_name="order_count", operator="gt", value=10)
+    ]
+    filtered_issues = errors_only(validate_spec(filtered, catalog, filtered.join_paths))
+    check("aggregate filter validates", not filtered_issues,
+          "; ".join(issue.message for issue in filtered_issues))
+    filtered_plan = compiler.compile(filtered)
+    check("HAVING helper is inferred as internal",
+          next(m for m in filtered.measures if m.name == "order_count").include_in_output is None)
+    check("aggregate filter is bound", filtered_plan.params.get("having_0") == 10)
+    check("aggregate filter is not a SQL-valued row filter",
+        "CustomerID] = :having_0" not in filtered_plan.sql and
+        "a1.[order_count] > :having_0" in filtered_plan.sql,
+        filtered_plan.sql)
+    check("COUNT(OrderID) remains available internally",
+          "COUNT(s0.[OrderID]) AS [order_count]" in filtered_plan.sql)
+    check("supporting order count stays out of output",
+        "order_count" not in filtered_plan.output_columns and
+        "COALESCE(a1.[order_count]" not in filtered_plan.sql)
+    final_projection = filtered_plan.sql.split("SELECT t0.", 1)[1].split(
+        "FROM [Customers] AS t0", 1
+    )[0]
+    check("helper is absent from final SQL SELECT",
+          "order_count" not in final_projection)
+    cursor.execute(filtered_plan.sql, filtered_plan.params)
+    filtered_rows = cursor.fetchall()
+    check("helper is absent from fetched dataset schema",
+          "order_count" not in [description[0] for description in cursor.description])
+    check("more than 10 orders returns only the qualifying customer",
+          len(filtered_rows) == 1, str(len(filtered_rows)))
+    for query in filtered_plan.reconciliation:
+        cursor.execute(query.sql, query.params)
+        expected = cursor.fetchone()[0]
+        if query.kind == "entity_count":
+            check("HAVING entity-count control matches output",
+                  expected == len(filtered_rows), str(expected))
+        elif query.kind == "measure_total" and query.measure_name == "total_sales":
+            actual = sum(row[3] for row in filtered_rows)
+            check("HAVING source-total control matches output",
+                  expected == actual, "%s vs %s" % (expected, actual))
+
+    explicitly_requested = filtered.copy(deep=True)
+    explicitly_requested.measures = [
+        measure.copy(update={"include_in_output": True})
+        if measure.name == "order_count" else measure
+        for measure in explicitly_requested.measures
+    ]
+    explicit_plan = compiler.compile(explicitly_requested)
+    check("explicit Order Count request remains in output",
+          "order_count" in explicit_plan.output_columns and
+          "COALESCE(a1.[order_count]" in explicit_plan.sql)
+
+    normal_sales = build_spec()
+    normal_sales.join_paths = spec.join_paths
+    normal_sales.measures = [
+        MeasureSpec(measure_name="Total Sales", source_table="Orders",
+                    source_column="OrderAmount", aggregation="SUM"),
+        MeasureSpec(measure_name="Average Order Value", source_table="Orders",
+                    source_column="OrderAmount", aggregation="AVG"),
+    ]
+    normal_plan = compiler.compile(normal_sales)
+    check("normal sales request returns only requested columns",
+          normal_plan.output_columns == [
+              "CustomerID", "CustomerName", "City",
+              "Total Sales", "Average Order Value",
+          ])
+
+    top_spec = build_spec()
+    top_spec.join_paths = spec.join_paths
+    top_spec.order_by = "total_sales"
+    top_spec.order_direction = "desc"
+    top_spec.limit = 10
+    sql_server_top_plan = DatasetCompiler("mssql", "").compile(top_spec)
+    check("SQL Server Top-N uses TOP (10)",
+          "SELECT TOP (10)" in sql_server_top_plan.sql and
+          "ORDER BY [total_sales] DESC" in sql_server_top_plan.sql)
+    check("SQL Server Top-N keeps its sort measure projected",
+          "total_sales" in sql_server_top_plan.output_columns and
+          "COALESCE(a1.[total_sales]" in sql_server_top_plan.sql)
+    cursor.execute("DELETE FROM Orders WHERE OrderID = 1001")
 
     print("\n[9] Lineage")
     for record in plan.lineage:

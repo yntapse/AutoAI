@@ -121,16 +121,22 @@ def _validate_structural(spec: DatasetSpec) -> List[ValidationIssue]:
             )
         )
 
-    if spec.limit is not None:
+    if spec.limit is not None and spec.limit <= 0:
         issues.append(
             _err(
-                "row_limit_unsupported",
-                "A row limit is not supported. Truncating the output would "
-                "make it disagree with the source-grain totals reconciliation "
-                "compares it against, so the dataset could never be verified.",
+                "invalid_row_limit",
+                "limit must be a positive integer.",
                 "limit",
-                "Set order_by instead and take the top rows afterwards; the "
-                "dataset stays complete and verifiable.",
+            )
+        )
+
+    if spec.limit is not None and not spec.order_by:
+        issues.append(
+            _err(
+                "row_limit_requires_order",
+                "A row limit requires order_by so the selected rows are deterministic.",
+                "order_by",
+                "Set order_by to the requested ranking column.",
             )
         )
 
@@ -454,6 +460,17 @@ def _validate_filters(spec: DatasetSpec, catalog: Optional[Catalog]) -> List[Val
                     )
                 )
 
+            if (isinstance(spec_filter.value, str)
+                    and spec_filter.value.lstrip().upper().startswith(("SELECT ", "WITH "))):
+                issues.append(
+                    _err(
+                        "sql_filter_value",
+                        "Filter values must be scalar literals, not SQL statements.",
+                        here,
+                        "Use a row-level scalar filter or an aggregate HAVING condition.",
+                    )
+                )
+
             table = spec_filter.source_table or owning_table
 
             if catalog is None or not table:
@@ -485,6 +502,54 @@ def _validate_filters(spec: DatasetSpec, catalog: Optional[Catalog]) -> List[Val
 
     for index, measure in enumerate(spec.measures):
         check(measure.filters, measure.source_table, "measures[%d].filters" % index)
+
+    return issues
+
+
+def _validate_having(spec: DatasetSpec) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    measure_names = {measure.name for measure in spec.measures}
+
+    for index, condition in enumerate(spec.having or []):
+        field = "having[%d]" % index
+        if condition.measure_name not in measure_names:
+            issues.append(
+                _err(
+                    "unknown_having_measure",
+                    "HAVING references unknown measure '%s'."
+                    % condition.measure_name,
+                    field,
+                )
+            )
+
+        operator = str(condition.operator or "").strip().lower()
+        if (operator not in _FILTER_OPERATORS
+                and operator not in _FILTER_OPERATOR_ALIASES):
+            issues.append(
+                _err(
+                    "unknown_having_operator",
+                    "HAVING operator '%s' is not supported." % condition.operator,
+                    field,
+                )
+            )
+        elif _FILTER_OPERATOR_ALIASES.get(operator, operator) in (
+            "is_null", "is_not_null"):
+            issues.append(
+                _err(
+                    "invalid_having_operator",
+                    "HAVING requires a comparison operator and value.",
+                    field,
+                )
+            )
+
+        if isinstance(condition.value, (dict, list)):
+            issues.append(
+                _err(
+                    "invalid_having_value",
+                    "HAVING value must be a scalar, not SQL or a structured value.",
+                    field,
+                )
+            )
 
     return issues
 
@@ -628,6 +693,7 @@ def validate_spec(
     issues.extend(_validate_structural(spec))
     issues.extend(_validate_catalog_and_types(spec, catalog))
     issues.extend(_validate_filters(spec, catalog))
+    issues.extend(_validate_having(spec))
     issues.extend(_validate_target(spec, catalog))
     issues.extend(_validate_join_paths(spec, join_paths))
     issues.extend(_validate_grain(spec, join_paths))

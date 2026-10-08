@@ -1,17 +1,25 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   etlCopilotSchema,
   etlCopilotPreview,
   etlCopilotBuild,
   etlCopilotStatus,
+  analyzeSourceProfile,
   type DataModelConnectionParams,
   type EtlCopilotSchemaResponse,
   type EtlCopilotPreviewResponse,
   type EtlCopilotBuildResult,
+  type CleaningStep,
+  type PipelineVersion,
+  type SourceProfilingReport as SourceProfilingReportData,
 } from "@/services/projectService";
+import {
+  createBuildGuard,
+  startEtlCopilotPolling,
+} from "@/services/etlCopilotPolling.mjs";
 import DatabaseExplorer, {
   type ExplorerRelationship,
   type ExplorerTable,
@@ -31,6 +39,9 @@ import SavedRecipes, {
 } from "@/components/etl-copilot/SavedRecipes";
 import DataQualityAnalysis from "@/components/etl-copilot/DataQualityAnalysis";
 import ColumnProfiling from "@/components/etl-copilot/ColumnProfiling";
+import SourceProfilingReport from "@/components/etl-copilot/SourceProfilingReport";
+import PipelineManagement from "@/components/etl-copilot/PipelineManagement";
+import CleaningPipeline from "@/components/etl-copilot/CleaningPipeline";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
@@ -79,6 +90,7 @@ export default function EtlCopilotPanel({
   database,
   username,
   password,
+  schemaName,
   availableTables,
   onDatasetReady,
   onReset,
@@ -86,6 +98,10 @@ export default function EtlCopilotPanel({
   const [loadingState, setLoadingState] = useState<
     "idle" | "schema" | "previewing" | "building" | "polling"
   >("idle");
+  const [buildJobId, setBuildJobId] = useState<string | null>(null);
+  const [buildGuard] = useState(createBuildGuard);
+  const isMountedRef = useRef(false);
+  const cancelBuildPollingRef = useRef<(() => void) | null>(null);
 
   const [userRequest, setUserRequest] = useState("");
 
@@ -109,14 +125,32 @@ export default function EtlCopilotPanel({
     projectId: string;
     projectName?: string;
   } | null>(null);
+  const [pipelineProjectId, setPipelineProjectId] = useState<string | null>(null);
+  const [cleaningSteps, setCleaningSteps] = useState<CleaningStep[]>([]);
+  const [selectedPipelineId, setSelectedPipelineId] = useState<string | null>(null);
+  const [pipelineVersions, setPipelineVersions] = useState<PipelineVersion[]>([]);
   const [buildReconciliation, setBuildReconciliation] =
     useState<ReconciliationData | null>(null);
   const [buildProfile, setBuildProfile] = useState<EtlCopilotBuildResult | null>(
     null,
   );
+  const [sourceProfile, setSourceProfile] =
+    useState<SourceProfilingReportData | null>(null);
+  const [isProfiling, setIsProfiling] = useState(false);
+  const [profilingError, setProfilingError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [copiedSql, setCopiedSql] = useState(false);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      cancelBuildPollingRef.current?.();
+      cancelBuildPollingRef.current = null;
+      buildGuard.finish();
+    };
+  }, [buildGuard]);
 
   useEffect(() => {
     let isMounted = true;
@@ -215,11 +249,52 @@ export default function EtlCopilotPanel({
     }
   }
 
+  async function handleProfileSelectedTable() {
+    if (!selectedTableForPreview || isProfiling) return;
+    setIsProfiling(true);
+    setProfilingError(null);
+    setSourceProfile(null);
+    try {
+      const result = await analyzeSourceProfile(
+        {
+          dbType,
+          host,
+          port,
+          database,
+          username,
+          password,
+          schemaName,
+        },
+        [selectedTableForPreview],
+      );
+      setSourceProfile(result);
+    } catch (err) {
+      setProfilingError(
+        err instanceof Error ? err.message : "Source profiling failed.",
+      );
+    } finally {
+      setIsProfiling(false);
+    }
+  }
+
   void onReset;
 
+  function finishBuild(message?: string) {
+    if (!isMountedRef.current) return;
+    cancelBuildPollingRef.current = null;
+    buildGuard.finish();
+    setLoadingState("idle");
+    if (message) setError(message);
+  }
+
   async function handleBuildDataset() {
+    if (!buildGuard.tryStart()) return;
+
     try {
       setError(null);
+      setDatasetSummary(null);
+      setBuildProfile(null);
+      setBuildReconciliation(null);
       setLoadingState("building");
 
       const result = await etlCopilotBuild({
@@ -231,55 +306,81 @@ export default function EtlCopilotPanel({
         password,
         projectName: `ETL_${Date.now()}`,
         userRequest,
+        cleaningSteps,
       });
 
+      if (!isMountedRef.current) {
+        buildGuard.finish();
+        return;
+      }
       if (!result.job_id) {
         throw new Error("Build job did not return a job ID.");
       }
 
+      setBuildJobId(result.job_id);
       setLoadingState("polling");
-      let job = await etlCopilotStatus(result.job_id);
+      cancelBuildPollingRef.current = startEtlCopilotPolling({
+        jobId: result.job_id,
+        readStatus: etlCopilotStatus,
+        onCompleted: (job) => {
+          if (!isMountedRef.current) return;
+          const completedResult = job.result as EtlCopilotBuildResult | undefined;
+          if (
+            !completedResult?.file_id ||
+            !completedResult.project_id ||
+            !completedResult.target_column
+          ) {
+            finishBuild("Completed build did not return project details.");
+            return;
+          }
 
-      while (job.status !== "completed" && job.status !== "failed") {
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
-        job = await etlCopilotStatus(result.job_id);
-      }
-
-      if (job.status === "failed") {
-        throw new Error(formatBuildJobError(job.error?.detail));
-      }
-
-      const completedResult = job.result;
-      if (
-        !completedResult?.file_id ||
-        !completedResult.project_id ||
-        !completedResult.target_column
-      ) {
-        throw new Error("Completed build did not return project details.");
-      }
-
-      const buildDetails = completedResult as EtlCopilotBuildResult;
-      setBuildProfile(buildDetails);
-      setDatasetSummary({
-        rows: buildDetails.rows,
-        columns: buildDetails.columns,
-        fileId: completedResult.file_id,
-        projectId: completedResult.project_id,
-        projectName: buildDetails.project_name,
+          try {
+            setBuildProfile(completedResult);
+            setDatasetSummary({
+              rows: completedResult.rows,
+              columns: completedResult.columns,
+              fileId: completedResult.file_id,
+              projectId: completedResult.project_id,
+              projectName: completedResult.project_name,
+            });
+            setPipelineProjectId((current) => current ?? completedResult.project_id);
+            setBuildReconciliation(completedResult.reconciliation ?? null);
+            onDatasetReady(
+              completedResult.file_id,
+              completedResult.project_id,
+              completedResult.target_column,
+            );
+            finishBuild();
+          } catch (err) {
+            finishBuild(
+              err instanceof Error ? err.message : "Dataset generation failed",
+            );
+          }
+        },
+        onFailed: (job) => {
+          const error = job.error as { detail?: unknown } | undefined;
+          finishBuild(formatBuildJobError(error?.detail ?? job.error));
+        },
+        onNotFound: () => {
+          finishBuild(
+            `Build job ${result.job_id} was not found. Completion could not be confirmed.`,
+          );
+        },
+        onError: (err) => {
+          finishBuild(
+            err instanceof Error
+              ? `Could not confirm the build status: ${err.message}`
+              : "Could not confirm the build status.",
+          );
+        },
+        onTimeout: () => {
+          finishBuild(
+            `Build ${result.job_id} is still running, but its status could not be confirmed within 90 seconds.`,
+          );
+        },
       });
-      setBuildReconciliation(buildDetails.reconciliation ?? null);
-
-      onDatasetReady(
-        completedResult.file_id,
-        completedResult.project_id,
-        completedResult.target_column,
-      );
-
-      setLoadingState("idle");
     } catch (err) {
-      setLoadingState("idle");
-
-      setError(
+      finishBuild(
         err instanceof Error ? err.message : "Dataset generation failed",
       );
     }
@@ -408,7 +509,11 @@ export default function EtlCopilotPanel({
             tableCount={schema.table_count}
             relationshipCount={schema.relationship_count}
             selectedTable={selectedTable?.name ?? ""}
-            onSelectTable={setSelectedTableName}
+            onSelectTable={(tableName) => {
+              setSelectedTableName(tableName);
+              setSourceProfile(null);
+              setProfilingError(null);
+            }}
           />
           <TablePreview
             table={selectedTable}
@@ -417,8 +522,49 @@ export default function EtlCopilotPanel({
             isLoading={isLoadingTableSample}
             error={tableSampleError}
           />
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={!selectedTableForPreview || isProfiling}
+              onClick={handleProfileSelectedTable}
+              className="rounded-xl border border-cyan-400/30 bg-cyan-500/10 px-4 py-2 text-sm font-medium text-cyan-200 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isProfiling ? "Profiling source..." : "Profile selected table"}
+            </button>
+            {profilingError && (
+              <p role="alert" className="text-sm text-red-400">
+                {profilingError}
+              </p>
+            )}
+          </div>
+          {sourceProfile && <SourceProfilingReport report={sourceProfile} />}
         </>
       )}
+
+      <CleaningPipeline
+        connection={{
+          dbType,
+          host,
+          port,
+          database,
+          username,
+          password,
+          schemaName,
+        }}
+        userRequest={userRequest}
+        columns={
+          (catalog?.tables?.[selectedTableForPreview] ?? tableSampleColumns)
+        }
+        steps={cleaningSteps}
+        onStepsChange={setCleaningSteps}
+        pipelineId={selectedPipelineId}
+        versions={pipelineVersions}
+        onVersionsChange={setPipelineVersions}
+        onCleaningStepsSaved={(steps, versions) => {
+          setCleaningSteps(steps);
+          setPipelineVersions(versions);
+        }}
+      />
 
       {datasetSummary && (
         <DatasetReadyCard
@@ -442,6 +588,52 @@ export default function EtlCopilotPanel({
         onSelect={handleRestoreHistory}
         onClear={handleClearHistory}
       />
+
+      {pipelineProjectId && (
+        <PipelineManagement
+          projectId={pipelineProjectId}
+          connection={{
+            dbType,
+            host,
+            port,
+            database,
+            username,
+            password,
+            schemaName,
+          }}
+          userRequest={userRequest}
+          selectedTable={selectedTableForPreview}
+          preview={preview}
+          sourceProfile={sourceProfile}
+          buildResult={buildProfile}
+          cleaningSteps={cleaningSteps}
+          onOpenPipeline={(savedRequest) => {
+            setUserRequest(savedRequest);
+            setPreview(null);
+            setBuildReconciliation(null);
+          }}
+          onPipelineSelected={(pipelineId, steps, versions) => {
+            setSelectedPipelineId(pipelineId);
+            setCleaningSteps(steps);
+            setPipelineVersions(versions);
+          }}
+          onRunCompleted={(completedResult) => {
+            setBuildProfile(completedResult);
+            setDatasetSummary({
+              rows: completedResult.rows,
+              columns: completedResult.columns,
+              fileId: completedResult.file_id,
+              projectId: completedResult.project_id,
+              projectName: completedResult.project_name,
+            });
+            onDatasetReady(
+              completedResult.file_id,
+              completedResult.project_id,
+              completedResult.target_column,
+            );
+          }}
+        />
+      )}
 
       <div className="mb-3 flex items-center justify-between">
         <label className={LABEL_CLS}>Dataset Request</label>
@@ -480,6 +672,11 @@ export default function EtlCopilotPanel({
                   ? "Building dataset..."
                   : "Build Dataset"}
             </button>
+            {loadingState === "polling" && buildJobId && (
+              <p className="mt-2 text-xs text-slate-400">
+                Build job: {buildJobId}
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -526,7 +723,6 @@ export default function EtlCopilotPanel({
             />
             <JoinPreview
               paths={planSpec?.join_paths ?? []}
-              relationships={catalog?.relationships ?? []}
             />
           </div>
 

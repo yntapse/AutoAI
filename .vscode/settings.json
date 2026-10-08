@@ -1,5 +1,30 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python.terminal.activateEnvironment": false
+    "python.defaultInterpreterPath": "C:\\Users\\Rishi\\Desktop\\AutoML\\AutoAI-main\\venv\\Scripts\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
+    "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "python.envFile": "${workspaceFolder}/backend/.env",
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": [
+        "backend"
+    ],
+    "python.analysis.exclude": [
+        "**/.venv/**",
+        "**/node_modules/**",
+        "**/.next/**"
+    ],
+    "files.watcherExclude": {
+        "**/.venv/**": true,
+        "**/venv/**": true,
+        "**/node_modules/**": true,
+        "**/.next/**": true
+    },
+    "search.exclude": {
+        "**/.venv": true,
+        "**/venv": true,
+        "**/node_modules": true,
+        "**/.next": true
+    }
 }

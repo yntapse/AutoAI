@@ -24,22 +24,34 @@ this path (persist=False). One dataset, one file_id, one owner.
 """
 
 import datetime
+import logging
 import os
 import pathlib
 import threading
+import time
 import traceback
 import uuid
 from decimal import Decimal
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from openai import OpenAIError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from database import SessionLocal
+from models.pipeline_definition import PipelineDefinition
+from models.pipeline_run import PipelineRun
+from models.pipeline_version import PipelineVersion
+from services.data_cleaner import (
+    CleaningValidationError,
+    apply_cleaning_steps,
+    validate_cleaning_steps,
+)
 from services.db_connector import (
     DataSourceError,
     build_connection_string,
@@ -60,6 +72,7 @@ router = APIRouter(
     prefix="/etl-copilot",
     tags=["ETL Copilot"],
 )
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +204,11 @@ class EtlCopilotBuildRequest(EtlCopilotPreviewRequest):
             "Run the build as a background job and return a job_id immediately. "
             "Poll GET /etl-copilot/status/{job_id} for the result."
         ),
+    )
+    pipeline_version_id: Optional[UUID] = None
+    cleaning_steps: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Ordered in-memory cleaning steps applied before project registration.",
     )
 
 
@@ -354,11 +372,16 @@ def _resolve_target(requested: Optional[str], result: Dict[str, Any]) -> str:
     return str(columns[-1])
 
 
-def _build_and_register(
+def _build_dataset_and_register(
     db: Session,
     request: EtlCopilotBuildRequest,
 ) -> Dict[str, Any]:
     """The whole build path, shared by the sync and background entry points."""
+
+    try:
+        validate_cleaning_steps(request.cleaning_steps)
+    except CleaningValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     copilot = get_copilot()
     connection_string = _connection_string(request)
@@ -385,6 +408,14 @@ def _build_and_register(
             status_code=500,
             detail="The dataset was built but its rows were not returned.",
         )
+
+    try:
+        frame, cleaning_summary = apply_cleaning_steps(
+            frame,
+            request.cleaning_steps,
+        )
+    except CleaningValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     total_rows = int(len(frame))
     total_columns = int(len(frame.columns))
@@ -439,9 +470,114 @@ def _build_and_register(
     payload["spec"] = result.get("spec")
     payload["data_quality"] = data_quality
     payload["column_profiles"] = column_profiles
+    payload["cleaning_summary"] = cleaning_summary
 
     # Coerced once, here, so the background job stores a JSON-safe result too.
     return _jsonable(payload)
+
+
+def _build_and_register(
+    db: Session,
+    request: EtlCopilotBuildRequest,
+) -> Dict[str, Any]:
+    """Build through the existing path and persist the corresponding run."""
+    started_at = datetime.datetime.utcnow()
+    started_clock = time.perf_counter()
+    run = None
+    run_project_id = None
+
+    if request.pipeline_version_id is not None:
+        version = (
+            db.query(PipelineVersion)
+            .filter(PipelineVersion.id == request.pipeline_version_id)
+            .first()
+        )
+        if version is None:
+            raise HTTPException(status_code=404, detail="Pipeline version not found.")
+        pipeline = (
+            db.query(PipelineDefinition)
+            .filter(PipelineDefinition.id == version.pipeline_definition_id)
+            .first()
+        )
+        if pipeline is None or pipeline.status == "deleted":
+            raise HTTPException(status_code=404, detail="Pipeline not found.")
+        run_project_id = pipeline.project_id
+        run = PipelineRun(
+            project_id=run_project_id,
+            pipeline_version_id=version.id,
+            status="running",
+            started_at=started_at,
+        )
+        db.add(run)
+        try:
+            db.commit()
+            db.refresh(run)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.exception("Could not record pipeline run start")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not record pipeline run.",
+            ) from exc
+
+    try:
+        payload = _build_dataset_and_register(db, request)
+    except Exception as exc:
+        if run is not None:
+            run.status = "failed"
+            run.completed_at = datetime.datetime.utcnow()
+            run.execution_time = max(
+                0.0,
+                time.perf_counter() - started_clock,
+            )
+            run.execution_log = "Build failed (%s)." % type(exc).__name__
+            try:
+                db.commit()
+            except SQLAlchemyError:
+                db.rollback()
+                logger.exception("Could not persist failed pipeline run")
+        raise
+
+    completed_at = datetime.datetime.utcnow()
+    if run is None:
+        try:
+            run = PipelineRun(
+                project_id=UUID(payload["project_id"]),
+                pipeline_version_id=None,
+                status="completed",
+                started_at=started_at,
+            )
+            db.add(run)
+        except (KeyError, ValueError) as exc:
+            logger.exception("Successful build did not return a project identifier")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not associate the completed build with a project.",
+            ) from exc
+    run.status = "completed"
+    run.completed_at = completed_at
+    run.dataset_file_id = payload.get("file_id")
+    run.row_count = payload.get("rows")
+    run.execution_time = max(
+        0.0,
+        time.perf_counter() - started_clock,
+    )
+    run.execution_log = "Dataset build completed successfully."
+    try:
+        db.commit()
+        db.refresh(run)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Dataset built but pipeline run could not be persisted")
+        raise HTTPException(
+            status_code=500,
+            detail="Dataset built, but its run history could not be saved.",
+        ) from exc
+    payload["pipeline_run_id"] = str(run.id)
+    payload["pipeline_version_id"] = (
+        str(request.pipeline_version_id) if request.pipeline_version_id else None
+    )
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +721,7 @@ def etl_copilot_preview(request: EtlCopilotPreviewRequest):
             "spec": result.get("spec"),
             "entity_table": (result.get("spec") or {}).get("entity_table"),
             "target_column": (result.get("spec") or {}).get("target_column"),
-            "columns": _preview_columns(result.get("spec")),
+            "columns": result.get("columns") or [],
             "errors": [i for i in issues if i.get("severity") == "error"],
             "warnings": [i for i in issues if i.get("severity") != "error"],
             # preview_plan() executes a 10-row sample. These were computed and
@@ -623,27 +759,6 @@ def etl_copilot_preview(request: EtlCopilotPreviewRequest):
                 "stage": "etl_copilot_preview",
             },
         )
-
-
-def _preview_columns(spec: Optional[Dict[str, Any]]) -> List[str]:
-    """The columns the dataset will have, from the spec alone.
-
-    The plan is not executed during a preview, so this is derived rather than
-    observed: entity key, then attributes, then measures - the order the
-    compiler emits.
-    """
-    if not spec:
-        return []
-
-    columns: List[str] = list(spec.get("entity_key") or [])
-
-    for attribute in spec.get("attributes") or []:
-        columns.append(attribute.get("name") or attribute.get("source_column"))
-
-    for measure in spec.get("measures") or []:
-        columns.append(measure.get("name"))
-
-    return [str(c) for c in columns if c]
 
 
 @router.post("/build")

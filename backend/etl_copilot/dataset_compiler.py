@@ -201,6 +201,16 @@ class DatasetCompiler:
             % (function, measure.name)
         )
 
+    def _measure_is_output(self, spec: DatasetSpec, measure: MeasureSpec) -> bool:
+        """Hide an unmarked measure when it exists only to evaluate HAVING."""
+
+        if measure.name.lower() == str(spec.order_by or "").lower():
+            return True
+        if measure.include_in_output is not None:
+            return measure.include_in_output
+        having_names = {condition.measure_name for condition in spec.having or []}
+        return measure.name not in having_names
+
     def _coalesce(self, expression: str, measure: MeasureSpec) -> str:
         """COALESCE only where a LEFT JOIN miss genuinely means zero.
 
@@ -559,6 +569,9 @@ class DatasetCompiler:
         # ---- expected row count, under the same entity filters ----
         count_params: Dict[str, Any] = {}
         count_where = self._where(spec.filters, "r0", "rc", count_params)
+        count_where += self._having_recon_where(
+            spec, count_params, "rch", "r0"
+        )
 
         count_lines = [
             "SELECT COUNT(DISTINCT r0.%s) AS %s"
@@ -580,6 +593,8 @@ class DatasetCompiler:
         by_source = {path.source_table: path for path in spec.join_paths}
 
         for index, measure in enumerate(spec.measures):
+            if not self._measure_is_output(spec, measure):
+                continue
             # SUM and COUNT are the two functions whose per-entity results sum
             # back to a single source-grain total. AVG, MEDIAN and STDDEV do
             # not (an average of averages is not an average) and COUNT_DISTINCT
@@ -598,6 +613,9 @@ class DatasetCompiler:
             where = self._where(spec.filters, "r0", "re%d" % index, params)
             where += self._where(
                 measure.filters, source_alias, "rm%d" % index, params
+            )
+            where += self._having_recon_where(
+                spec, params, "rh%d" % index, "r0"
             )
 
             if measure.source_column is None:
@@ -631,6 +649,134 @@ class DatasetCompiler:
 
         return queries
 
+    def _limited_reconciliation(self, spec, cte_entries, output_body, params):
+        """Reconcile a deliberate Top-N against that same selected output."""
+
+        output_name = "etl_top_n_output"
+        entries = list(cte_entries)
+        entries.append("%s AS (\n    %s\n)" % (output_name, output_body))
+        prefix = "WITH %s\n" % ",\n".join(entries)
+        queries = [
+            ReconQuery(
+                kind="entity_count",
+                sql=_assert_extract_safe(
+                    "%sSELECT COUNT(*) AS %s FROM %s"
+                    % (prefix, self._q("expected_rows"), output_name)
+                ),
+                params=dict(params),
+            )
+        ]
+
+        for measure in spec.measures:
+            if (not self._measure_is_output(spec, measure)
+                    or measure.aggregation not in (AggFunction.SUM, AggFunction.COUNT)):
+                continue
+            queries.append(
+                ReconQuery(
+                    kind="measure_total",
+                    measure_name=measure.name,
+                    sql=_assert_extract_safe(
+                        "%sSELECT COALESCE(SUM(%s), 0) AS %s FROM %s"
+                        % (
+                            prefix,
+                            self._q(measure.name),
+                            self._q("expected_total"),
+                            output_name,
+                        )
+                    ),
+                    params=dict(params),
+                )
+            )
+
+        return queries
+
+    def _having_recon_where(self, spec, params, prefix, entity_alias):
+        """Correlate aggregate conditions to the entity in reconciliation SQL."""
+
+        measures = {measure.name: measure for measure in spec.measures}
+        paths = {path.source_table: path for path in spec.join_paths}
+        clauses = []
+
+        for index, condition in enumerate(spec.having or []):
+            measure = measures.get(condition.measure_name)
+            if measure is None:
+                raise SpecCompileError(
+                    "HAVING references unknown measure '%s'."
+                    % condition.measure_name
+                )
+
+            operator = str(condition.operator).strip().lower()
+            operator = _OPERATOR_ALIASES.get(operator, operator)
+            if operator not in _OPERATORS or operator in ("is_null", "is_not_null"):
+                raise SpecCompileError(
+                    "Unsupported HAVING operator '%s'." % condition.operator
+                )
+
+            path = paths.get(measure.source_table)
+            if path is None:
+                raise SpecCompileError(
+                    "No join path for HAVING measure '%s'." % measure.name
+                )
+
+            aliases = {}
+            from_lines = []
+            for hop_index, hop in enumerate(path.hops):
+                alias = "h%d_%d" % (index, hop_index)
+                aliases[hop.right_table] = alias
+                if hop_index == 0:
+                    from_lines.append("FROM %s AS %s" % (
+                        self._qt(hop.right_table), alias
+                    ))
+                else:
+                    left_alias = aliases[hop.left_table]
+                    from_lines.append(
+                        "JOIN %s AS %s ON %s.%s = %s.%s"
+                        % (
+                            self._qt(hop.right_table),
+                            alias,
+                            left_alias,
+                            self._q(hop.left_column),
+                            alias,
+                            self._q(hop.right_column),
+                        )
+                    )
+
+            if path.hops:
+                first_hop = path.hops[0]
+                source_alias = aliases[measure.source_table]
+                correlation = "%s.%s = %s.%s" % (
+                    aliases[first_hop.right_table],
+                    self._q(first_hop.right_column),
+                    entity_alias,
+                    self._q(first_hop.left_column),
+                )
+                where = [correlation]
+            else:
+                source_alias = entity_alias
+                where = []
+
+            where += self._where(
+                measure.filters, source_alias, "%s_f%d" % (prefix, index), params
+            )
+            key = "%s_%d" % (prefix, index)
+            params[key] = condition.value
+            aggregate_sql = "SELECT %s %s" % (
+                self._measure_expression(measure, source_alias),
+                " ".join(from_lines),
+            )
+            if where:
+                aggregate_sql += " WHERE %s" % " AND ".join(where)
+
+            clauses.append(
+                "(%s) %s :%s" % (
+                    aggregate_sql,
+                    _OPERATORS[operator],
+                    key,
+                )
+            )
+
+        return clauses
+
 
     # -- lineage ---------------------------------------------------------
 
@@ -639,6 +785,8 @@ class DatasetCompiler:
         records: List[MeasureLineage] = []
 
         for measure in spec.measures:
+            if not self._measure_is_output(spec, measure):
+                continue
             path = by_source.get(measure.source_table)
             hops = path.hops if path else []
 
@@ -702,6 +850,7 @@ class DatasetCompiler:
         subqueries: List[SubqueryPlan] = []
         join_lines: List[str] = []
         measure_selects: List[str] = []
+        measure_refs: Dict[str, str] = {}
         # Measures are emitted in GROUP order, not spec order. Deriving
         # output_columns from spec.measures therefore produced a column list
         # in a different order from the SELECT it describes.
@@ -775,6 +924,11 @@ class DatasetCompiler:
                         )
                     )
                     for measure in other:
+                        measure_refs[measure.name] = "%s.%s" % (
+                            flat_alias, self._q(measure.name)
+                        )
+                        if not self._measure_is_output(spec, measure):
+                            continue
                         emitted_measures.append(measure.name)
                         measure_selects.append(
                             "%s AS %s"
@@ -807,6 +961,11 @@ class DatasetCompiler:
             )
 
             for measure in measures:
+                measure_refs[measure.name] = "%s.%s" % (
+                    alias, self._q(measure.name)
+                )
+                if not self._measure_is_output(spec, measure):
+                    continue
                 emitted_measures.append(measure.name)
                 measure_selects.append(
                     "%s AS %s"
@@ -864,15 +1023,40 @@ class DatasetCompiler:
 
         output_columns.extend(emitted_measures)
 
-        lines = ["SELECT %s" % ", ".join(entity_selects + measure_selects)]
+        select_keyword = "SELECT"
+        if spec.limit is not None and self.db_type == "mssql":
+            if spec.limit <= 0:
+                raise SpecCompileError("limit must be a positive integer.")
+            select_keyword = "SELECT TOP (%d)" % spec.limit
+        lines = [
+            "%s %s" % (select_keyword, ", ".join(entity_selects + measure_selects))
+        ]
         lines.append("FROM %s AS t0" % self._qt(spec.entity_table))
         lines.extend(join_lines)
 
         entity_where = self._where(spec.filters, "t0", "entity", params)
+        for index, condition in enumerate(spec.having or []):
+            measure_ref = measure_refs.get(condition.measure_name)
+            if measure_ref is None:
+                raise SpecCompileError(
+                    "HAVING references unknown measure '%s'."
+                    % condition.measure_name
+                )
+            operator = str(condition.operator).strip().lower()
+            operator = _OPERATOR_ALIASES.get(operator, operator)
+            if operator not in _OPERATORS or operator in ("is_null", "is_not_null"):
+                raise SpecCompileError(
+                    "Unsupported HAVING operator '%s'." % condition.operator
+                )
+            key = "having_%d" % index
+            params[key] = condition.value
+            entity_where.append(
+                "%s %s :%s" % (measure_ref, _OPERATORS[operator], key)
+            )
         if entity_where:
             lines.append("WHERE %s" % " AND ".join(entity_where))
 
-        output_body = "\n".join(lines)
+        unlimited_output_body = "\n".join(lines)
 
         if spec.order_by:
             # The outer SELECT is where output names exist, so ORDER BY runs
@@ -885,6 +1069,15 @@ class DatasetCompiler:
             lines.append(
                 "ORDER BY %s %s" % (self._q(spec.order_by), direction)
             )
+
+        if spec.limit is not None:
+            if spec.limit <= 0:
+                raise SpecCompileError("limit must be a positive integer.")
+            if self.db_type == "postgresql":
+                lines.append("LIMIT %d" % spec.limit)
+            output_body = "\n".join(lines)
+        else:
+            output_body = unlimited_output_body
 
         body = "\n".join(lines)
 
@@ -900,7 +1093,8 @@ class DatasetCompiler:
 
         sql = _assert_extract_safe(sql)
 
-        cte_entries.append("etl_preview_output AS (\n    %s\n)" % output_body)
+        preview_cte_entries = list(cte_entries)
+        preview_cte_entries.append("etl_preview_output AS (\n    %s\n)" % output_body)
         output_selects = [
             "COUNT(*) AS %s" % self._q("output_row_count"),
             (
@@ -914,6 +1108,8 @@ class DatasetCompiler:
             ),
         ]
         for index, measure in enumerate(spec.measures):
+            if not self._measure_is_output(spec, measure):
+                continue
             if measure.aggregation not in (AggFunction.SUM, AggFunction.COUNT):
                 continue
             output_selects.append(
@@ -926,8 +1122,14 @@ class DatasetCompiler:
 
         preview_reconciliation_sql = _assert_extract_safe(
             "WITH %s\nSELECT %s\nFROM etl_preview_output"
-            % (",\n".join(cte_entries), ", ".join(output_selects))
+            % (",\n".join(preview_cte_entries), ", ".join(output_selects))
         )
+
+        reconciliation = self._reconciliation(spec)
+        if spec.limit is not None:
+            reconciliation = self._limited_reconciliation(
+                spec, cte_entries, output_body, params
+            )
 
         return CompiledPlan(
             sql=sql,
@@ -936,7 +1138,7 @@ class DatasetCompiler:
             declared_grain=list(spec.entity_key),
             tables_referenced=tables_referenced,
             subqueries=subqueries,
-            reconciliation=self._reconciliation(spec),
+            reconciliation=reconciliation,
             preview_reconciliation=ReconQuery(
                 kind="preview_output_totals",
                 sql=preview_reconciliation_sql,

@@ -352,6 +352,7 @@ class ETLCopilot:
         return {
             "spec": spec.dict(),
             "sql": plan.sql if plan else None,
+            "columns": list(plan.output_columns) if plan else [],
             "issues": [i.dict() for i in issues],
             "blocking": bool(blocking),
             "explanation": explanation,

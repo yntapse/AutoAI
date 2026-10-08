@@ -1,9 +1,8 @@
-import type { ExplorerRelationship } from "./DatabaseExplorer";
 import type { PreviewJoinHop, PreviewJoinPath } from "./LineageGraph";
+import { getJoinPreviewRows } from "./joinPreviewModel.mjs";
 
 interface JoinPreviewProps {
   paths: PreviewJoinPath[];
-  relationships: ExplorerRelationship[];
 }
 
 function getImpact(hops: PreviewJoinHop[]) {
@@ -56,26 +55,25 @@ function HopDetails({ hops }: { hops: PreviewJoinHop[] }) {
   );
 }
 
-export default function JoinPreview({ paths, relationships }: JoinPreviewProps) {
-  const hasPlanPaths = paths.length > 0;
+export default function JoinPreview({ paths }: JoinPreviewProps) {
+  const rows = getJoinPreviewRows(paths);
 
   return (
     <section className="rounded-xl border border-white/[0.08] bg-black/20 p-4">
       <h4 className="mb-3 text-sm font-semibold text-white">Join Preview</h4>
 
-      {hasPlanPaths ? (
+      {rows.length > 0 ? (
         <div className="space-y-3">
-          {paths.map((path, index) => {
+          {rows.map(({ path, key, title }) => {
             const impact = getImpact(path.hops);
             return (
               <article
-                key={`${path.entity_table}-${path.source_table}-${index}`}
+                key={key}
                 className="rounded-lg border border-white/[0.08] bg-white/[0.02] p-3"
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm text-white">
-                    {path.entity_table} <span className="text-cyan-400">to</span>{" "}
-                    {path.source_table}
+                    {title}
                   </div>
                   <span className="text-xs text-slate-500">
                     {path.verified ? "Verified" : "Unverified"}
@@ -96,44 +94,9 @@ export default function JoinPreview({ paths, relationships }: JoinPreviewProps) 
             );
           })}
         </div>
-      ) : relationships.length > 0 ? (
-        <div className="space-y-3">
-          {relationships.map((relationship, index) => {
-            const hop: PreviewJoinHop = relationship;
-            const impact = getImpact([hop]);
-            return (
-              <article
-                key={`${relationship.left_table}-${relationship.right_table}-${index}`}
-                className="rounded-lg border border-white/[0.08] bg-white/[0.02] p-3"
-              >
-                <div className="text-xs text-slate-300">
-                  {relationship.left_table}.{relationship.left_column}
-                  <span className="px-2 text-cyan-400">-&gt;</span>
-                  {relationship.right_table}.{relationship.right_column}
-                </div>
-                <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2">
-                  <div>
-                    <span className="text-slate-500">Join type: </span>
-                    <span className="text-slate-300">
-                      {relationship.join_type || "Not specified"}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500">Fan-out risk: </span>
-                    <span className={impact.color}>{impact.risk}</span>
-                  </div>
-                  <div className="sm:col-span-2">
-                    <span className="text-slate-500">Expected row impact: </span>
-                    <span className="text-slate-300">{impact.impact}</span>
-                  </div>
-                </div>
-              </article>
-            );
-          })}
-        </div>
       ) : (
         <p className="text-sm text-slate-500">
-          Generate a plan to see relationship paths.
+          No join relationships are used by this plan.
         </p>
       )}
     </section>

@@ -62,12 +62,22 @@ class FilterSpec(BaseModel):
         extra = "forbid"
 
 
+class HavingSpec(BaseModel):
+    measure_name: str
+    operator: str
+    value: Any
+
+    class Config:
+        extra = "forbid"
+
+
 class MeasureSpec(BaseModel):
     name: str = Field(alias="measure_name")
     source_table: str
     source_column: Optional[str] = Field(default=None, alias="column")
     aggregation: AggFunction
     distinct_key: List[str] = []
+    include_in_output: Optional[bool] = None
     zero_when_absent: Optional[bool] = None
     filters: List[FilterSpec] = []
     time_column: Optional[str] = None
@@ -185,6 +195,7 @@ class DatasetSpec(BaseModel):
     attributes: List[AttributeSpec] = []
     measures: List[MeasureSpec] = []
     filters: List[FilterSpec] = []
+    having: List[HavingSpec] = []
 
     # Temporary compatibility field.
     # Final architecture will use join_paths as the execution contract.
@@ -198,10 +209,7 @@ class DatasetSpec(BaseModel):
     order_by: Optional[str] = None
     order_direction: str = "desc"
 
-    # Accepted so a model that emits it gets a readable explanation instead of
-    # an opaque "extra fields not permitted". The validator rejects it: a row
-    # limit truncates the dataset, and reconciliation compares the output
-    # against source-grain totals, so a truncated output can never reconcile.
+    # Optional ranked row cap, used for explicit requests such as "top 10".
     limit: Optional[int] = None
 
     target_column: Optional[str] = None

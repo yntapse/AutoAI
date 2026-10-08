@@ -435,7 +435,9 @@ async function unwrapCopilotResponse<T>(
       message = payload;
     }
 
-    throw new Error(message);
+    const error = new Error(message) as Error & { status: number };
+    error.status = response.status;
+    throw error;
   }
 
   return payload as T;
@@ -514,6 +516,9 @@ export interface EtlCopilotBuildResult {
   project_name?: string;
   file_id: string;
   target_column: string;
+  pipeline_run_id?: string | null;
+  pipeline_version_id?: string | null;
+  cleaning_summary?: CleaningPreviewResult;
   rows: number;
   columns: number;
   data_quality: {
@@ -534,10 +539,337 @@ export interface EtlCopilotBuildResult {
   lineage?: EtlCopilotLineage;
 }
 
+export interface CleaningStep {
+  id?: string;
+  step_name: string;
+  step_type:
+    | "remove_null_rows"
+    | "replace_null_values"
+    | "remove_duplicates"
+    | "convert_data_type"
+    | "handle_outliers";
+  configuration: Record<string, unknown>;
+  enabled: boolean;
+  step_order?: number;
+  created_by?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CleaningPreviewResult {
+  original_row_count: number;
+  new_row_count: number;
+  rows_removed: number;
+  columns_changed: string[];
+  applied_steps: {
+    step_number: number;
+    step_name: string;
+    step_type: string;
+    status: string;
+  }[];
+  sample_rows: Record<string, unknown>[];
+}
+
+export async function previewCleaningPipeline(
+  params: DataModelConnectionParams & {
+    userRequest: string;
+    cleaningSteps: CleaningStep[];
+  },
+): Promise<CleaningPreviewResult> {
+  const response = await fetch(`${API_BASE}/cleaning/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...dataModelConnectionBody(params),
+      user_request: params.userRequest,
+      cleaning_steps: params.cleaningSteps,
+    }),
+  });
+  return unwrapDataModelResponse(
+    response,
+    "Could not preview cleaning steps.",
+  );
+}
+
+export async function saveCleaningSteps(
+  pipelineId: string,
+  steps: CleaningStep[],
+): Promise<PipelineDefinition> {
+  const response = await fetch(`${API_BASE}/pipeline/${pipelineId}/cleaning-steps`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ steps }),
+  });
+  return unwrapDataModelResponse(response, "Could not save cleaning steps.");
+}
+
+export async function listVersionCleaningSteps(
+  versionId: string,
+): Promise<CleaningStep[]> {
+  const response = await fetch(
+    `${API_BASE}/pipeline/version/${versionId}/cleaning-steps`,
+  );
+  return unwrapDataModelResponse(response, "Could not load cleaning steps.");
+}
+
 export interface EtlCopilotJobStatusResponse {
   status: string;
   result?: EtlCopilotBuildResult | null;
   error?: { detail?: unknown } | null;
+}
+
+export interface PipelineVersion {
+  id: string;
+  pipeline_definition_id: string;
+  version_number: number;
+  pipeline_json: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface PipelineDefinition {
+  id: string;
+  project_id: string;
+  pipeline_name: string;
+  description: string | null;
+  status: string;
+  latest_run_status: string | null;
+  created_at: string;
+  updated_at: string;
+  versions: PipelineVersion[];
+}
+
+export interface PipelineRun {
+  id: string;
+  pipeline_version_id: string | null;
+  project_id: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  execution_log: string | null;
+  dataset_file_id: string | null;
+  row_count: number | null;
+  execution_time: number | null;
+}
+
+export async function listPipelines(projectId: string): Promise<PipelineDefinition[]> {
+  const response = await fetch(`${API_BASE}/pipeline/${projectId}`);
+  return unwrapDataModelResponse(response, "Could not load saved pipelines.");
+}
+
+export async function savePipeline(params: {
+  projectId: string;
+  pipelineName: string;
+  description?: string;
+  pipelineJson: Record<string, unknown>;
+  initialRunId?: string | null;
+}): Promise<PipelineDefinition> {
+  const response = await fetch(`${API_BASE}/pipeline/save`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project_id: params.projectId,
+      pipeline_name: params.pipelineName,
+      description: params.description ?? null,
+      pipeline_json: params.pipelineJson,
+      initial_run_id: params.initialRunId ?? null,
+    }),
+  });
+  return unwrapDataModelResponse(response, "Could not save the pipeline.");
+}
+
+export async function getPipeline(pipelineId: string): Promise<PipelineDefinition> {
+  const response = await fetch(`${API_BASE}/pipeline/detail/${pipelineId}`);
+  return unwrapDataModelResponse(response, "Could not load the pipeline.");
+}
+
+export async function updatePipeline(
+  pipelineId: string,
+  changes: {
+    pipelineName?: string;
+    description?: string | null;
+    pipelineJson?: Record<string, unknown>;
+  },
+): Promise<PipelineDefinition> {
+  const response = await fetch(`${API_BASE}/pipeline/${pipelineId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...(changes.pipelineName !== undefined
+        ? { pipeline_name: changes.pipelineName }
+        : {}),
+      ...(changes.description !== undefined
+        ? { description: changes.description }
+        : {}),
+      ...(changes.pipelineJson !== undefined
+        ? { pipeline_json: changes.pipelineJson }
+        : {}),
+    }),
+  });
+  return unwrapDataModelResponse(response, "Could not update the pipeline.");
+}
+
+export async function deletePipeline(pipelineId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/pipeline/${pipelineId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    await unwrapDataModelResponse(response, "Could not delete the pipeline.");
+  }
+}
+
+export async function clonePipeline(pipelineId: string): Promise<PipelineDefinition> {
+  const response = await fetch(`${API_BASE}/pipeline/${pipelineId}/clone`, {
+    method: "POST",
+  });
+  return unwrapDataModelResponse(response, "Could not clone the pipeline.");
+}
+
+export async function listPipelineVersions(pipelineId: string): Promise<PipelineVersion[]> {
+  const response = await fetch(`${API_BASE}/pipeline/version/${pipelineId}`);
+  return unwrapDataModelResponse(response, "Could not load pipeline versions.");
+}
+
+export async function comparePipelineVersions(
+  pipelineId: string,
+  fromVersion: number,
+  toVersion: number,
+): Promise<{
+  changes: Record<string, { before: unknown; after: unknown }>;
+}> {
+  const response = await fetch(
+    `${API_BASE}/pipeline/version/${pipelineId}/compare/${fromVersion}/${toVersion}`,
+  );
+  return unwrapDataModelResponse(response, "Could not compare pipeline versions.");
+}
+
+export async function restorePipelineVersion(
+  pipelineId: string,
+  versionId: string,
+): Promise<PipelineDefinition> {
+  const response = await fetch(
+    `${API_BASE}/pipeline/${pipelineId}/restore/${versionId}`,
+    { method: "POST" },
+  );
+  return unwrapDataModelResponse(response, "Could not restore the pipeline version.");
+}
+
+export async function listPipelineRuns(projectId: string): Promise<PipelineRun[]> {
+  const response = await fetch(`${API_BASE}/pipeline/run-history/${projectId}`);
+  return unwrapDataModelResponse(response, "Could not load pipeline run history.");
+}
+
+export async function runPipeline(
+  pipelineId: string,
+  connection: DataModelConnectionParams,
+): Promise<EtlCopilotBuildResponse> {
+  const response = await fetch(`${API_BASE}/pipeline/${pipelineId}/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dataModelConnectionBody(connection)),
+  });
+  return unwrapDataModelResponse(response, "Could not start the pipeline run.");
+}
+
+export interface SourceProfileColumn {
+  column_name: string;
+  data_type: string;
+  null_count: number;
+  null_percentage: number | null;
+  distinct_count: number | null;
+  distinct_percentage: number | null;
+  min: unknown;
+  max: unknown;
+  mean: number | null;
+  median: number | null;
+  std_dev: number | null;
+  quartiles: { q1: number; q2: number | null; q3: number } | null;
+  outliers: {
+    method: string;
+    count: number | null;
+    percentage: number | null;
+    lower_bound: number | null;
+    upper_bound: number | null;
+    complete: boolean;
+    multiplier?: number;
+    reason?: string;
+  };
+  type_analysis: {
+    declared_type: string;
+    detected_type: string | null;
+    expected_type: string;
+    observed_types: string[];
+    type_mismatch_count: number | null;
+    mixed_type: boolean | null;
+    type_analysis_complete: boolean;
+  };
+}
+
+export interface SourceProfileTable {
+  table_name: string;
+  row_count: number;
+  column_count: number;
+  duplicate_rows: {
+    count: number | null;
+    percentage: number | null;
+    method: string;
+    complete: boolean;
+    columns_checked: string[];
+  };
+  duplicate_keys: {
+    columns: string[];
+    duplicate_count: number | null;
+    complete: boolean;
+  };
+  quality_score: number;
+  score_coverage: number;
+  columns: SourceProfileColumn[];
+}
+
+export interface SourceProfilingReport {
+  snapshot_id: string;
+  pipeline_run_id: string | null;
+  analyzed_at: string;
+  schema_name: string;
+  table_count: number;
+  summary: {
+    overall_quality_score: number;
+    score_coverage: number;
+    tables_profiled: number;
+    total_rows: number;
+    columns_above_null_threshold: number;
+    issue_counts: Record<string, number>;
+    null_threshold_percentage: number;
+  };
+  tables: SourceProfileTable[];
+  issues: {
+    category: string;
+    severity: string;
+    table_name: string;
+    column_name: string | null;
+    message: string;
+    actual: unknown;
+    expected: unknown;
+  }[];
+  recommendations: string[];
+}
+
+export async function analyzeSourceProfile(
+  params: DataModelConnectionParams,
+  selectedTables: string[],
+): Promise<SourceProfilingReport> {
+  const response = await fetch(`${API_BASE}/profiling/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      datasource: dataModelConnectionBody(params),
+      selected_tables: selectedTables,
+    }),
+  });
+
+  return unwrapDataModelResponse<SourceProfilingReport>(
+    response,
+    "Could not profile the selected source tables.",
+  );
 }
 
 
@@ -611,6 +943,7 @@ export async function etlCopilotBuild(
   params: DataModelConnectionParams & {
     projectName: string;
     userRequest: string;
+    cleaningSteps?: CleaningStep[];
   },
 ): Promise<EtlCopilotBuildResponse> {
   const response = await fetch(`${API_BASE}/etl-copilot/build`, {
@@ -620,6 +953,7 @@ export async function etlCopilotBuild(
       ...dataModelConnectionBody(params),
       project_name: params.projectName,
       user_request: params.userRequest,
+      cleaning_steps: params.cleaningSteps ?? [],
       background: true,
     }),
   });
@@ -633,9 +967,11 @@ export async function etlCopilotBuild(
 
 export async function etlCopilotStatus(
   jobId: string,
+  signal?: AbortSignal,
 ): Promise<EtlCopilotJobStatusResponse> {
   const response = await fetch(
     `${API_BASE}/etl-copilot/status/${jobId}`,
+    { signal },
   );
 
   return unwrapCopilotResponse<EtlCopilotJobStatusResponse>(
