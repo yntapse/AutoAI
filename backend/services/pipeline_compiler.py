@@ -590,6 +590,200 @@ def _step_missing(ctx: _Ctx, node: dict, cols: Sequence[Column], prev: str) -> S
     return Step(columns=out, sql=f"SELECT {', '.join(exprs)} FROM {prev}", notes=notes)
 
 
+_AGG_FUNCS = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT"}
+_NOT_NUMBERS = ("interval", "point")  # type_category() calls these numeric because their names contain "int"
+
+
+def _is_number(col: Column) -> bool:
+    t = (col.data_type or "").strip().lower()
+    return col.category == "numeric" and not t.startswith(_NOT_NUMBERS)
+
+
+def _config(node: dict) -> dict:
+    cfg = node.get("config")
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise _StepError("This step's settings are malformed.", "invalid", "config")
+    return cfg
+
+
+def _step_aggregate(ctx: _Ctx, node: dict, cols: Sequence[Column], prev: str) -> Step:
+    cfg = _config(node)
+    group_by = cfg.get("group_by") or []
+    measures = cfg.get("measures")
+    if not isinstance(group_by, list) or not all(isinstance(n, str) for n in group_by):
+        raise _StepError("Group-by columns must be a list of column names.", "invalid", "group_by")
+    if len(set(group_by)) != len(group_by):
+        raise _StepError("A group-by column is listed twice.", "invalid", "group_by")
+    if not isinstance(measures, list) or not measures:
+        raise _StepError("Add at least one measure (for example, a sum).", "incomplete", "measures")
+    keys = [_need_column(cols, n, "group_by") for n in group_by]
+    for k in keys:
+        if _uncomparable(ctx.db_type, k.data_type):
+            raise _StepError(f"Column '{k.name}' has type {k.data_type}, which cannot be grouped.", "invalid", "group_by")
+        if (k.data_type or "").strip().lower().startswith("point"):
+            raise _StepError(f"Column '{k.name}' has type {k.data_type}, which cannot be grouped.", "invalid", "group_by")
+    float_type = "FLOAT" if ctx.db_type == MSSQL else "DOUBLE PRECISION"
+    out: List[Column] = [Column(k.name, k.data_type, k.category) for k in keys]
+    seen: Set[str] = {k.name.casefold() for k in keys}
+    parts: List[str] = [ctx.q(k.name) for k in keys]
+    for m in measures:
+        if not isinstance(m, dict):
+            raise _StepError("A measure is malformed.", "invalid", "measures")
+        fn = m.get("function")
+        if not isinstance(fn, str) or fn not in _AGG_FUNCS:
+            raise _StepError("Choose sum, average, min, max or count.", "invalid" if fn else "incomplete", "measures")
+        alias = m.get("alias")
+        problem = validate_new_name(alias)
+        if problem:
+            raise _StepError(f"{problem} (measure '{fn}')", "invalid" if alias else "incomplete", "measures")
+        if alias.casefold() in seen:
+            raise _StepError(f"Two columns would be called '{alias}'. Column names must be unique.", "invalid", "measures")
+        seen.add(alias.casefold())
+        src = m.get("column")
+        if fn == "count" and src in (None, ""):
+            expr, dtype = "COUNT(*)", "bigint"
+        else:
+            col = _need_column(cols, src, "measures")
+            if _uncomparable(ctx.db_type, col.data_type):
+                raise _StepError(f"'{col.name}' has type {col.data_type}, which cannot be used in {fn}.", "invalid", "measures")
+            if fn in ("min", "max") and (col.category not in ("numeric", "text", "datetime")
+                                         or (col.data_type or "").strip().lower().startswith(("point",))):
+                raise _StepError(f"'{col.name}' has type {col.data_type}, which cannot be used in {fn}.", "invalid", "measures")
+            if fn in ("sum", "avg") and not _is_number(col):
+                raise _StepError(f"'{col.name}' is not a number, so it cannot be summed or averaged.", "invalid", "measures")
+            q = ctx.q(col.name)
+            if fn == "count":
+                expr, dtype = f"COUNT({q})", "bigint"
+            elif fn == "avg":
+                # SQL Server's AVG of a whole-number column would be a whole number, so average as a float.
+                expr = f"AVG(CAST({q} AS {float_type}))"
+                dtype = "float" if ctx.db_type == MSSQL else "double precision"
+            elif fn == "sum":
+                if _is_integer_type(col.data_type):
+                    # SQL Server's SUM of an int column is an int and can overflow.
+                    expr = f"SUM(CAST({q} AS BIGINT))" if ctx.db_type == MSSQL else f"SUM({q})"
+                    dtype = "bigint"
+                else:
+                    expr, dtype = f"SUM({q})", "numeric"
+            else:
+                expr, dtype = f"{_AGG_FUNCS[fn]}({q})", col.data_type
+        out.append(make_column(alias, dtype))
+        parts.append(f"{expr} AS {ctx.q(alias)}")
+    sql = f"SELECT {', '.join(parts)} FROM {prev}"
+    if keys:
+        sql += " GROUP BY " + ", ".join(ctx.q(k.name) for k in keys)
+    return Step(columns=out, sql=sql,
+                notes=["info: the result has one row per group. Columns you did not choose are dropped."])
+
+
+# What each kind of column may be converted to. Anything not listed is refused.
+_CONVERT_ALLOWED = {
+    "numeric": {"integer", "decimal", "text"},
+    "text": {"integer", "decimal", "text", "date"},
+    "datetime": {"text", "date"},
+    "boolean": {"text"},
+    "other": {"text"},
+}
+
+# convert-to name: (PostgreSQL type, SQL Server type, PostgreSQL name shown, SQL Server name shown)
+_CONVERT_TO = {
+    "integer": ("BIGINT", "BIGINT", "bigint", "bigint"),
+    "decimal": ("NUMERIC", "DECIMAL(38,10)", "numeric", "numeric"),
+    "text": ("TEXT", "NVARCHAR(MAX)", "text", "nvarchar"),
+    "date": ("DATE", "DATE", "date", "date"),
+}
+
+
+def _step_change_type(ctx: _Ctx, node: dict, cols: Sequence[Column], prev: str) -> Step:
+    mappings = _config(node).get("mappings")
+    if not isinstance(mappings, list) or not mappings:
+        raise _StepError("Add at least one conversion.", "incomplete", "mappings")
+    chosen: Dict[str, str] = {}
+    for m in mappings:
+        if not isinstance(m, dict):
+            raise _StepError("A conversion is malformed.", "invalid", "mappings")
+        col = _need_column(cols, m.get("column"), "mappings")
+        to = m.get("to")
+        if to in (None, ""):
+            raise _StepError(f"Choose a new type for '{col.name}'.", "incomplete", "mappings")
+        if not isinstance(to, str) or to not in _CONVERT_TO:
+            raise _StepError("The new type must be integer, decimal, text or date.", "invalid", "mappings")
+        if col.name in chosen:
+            raise _StepError(f"'{col.name}' is converted twice.", "invalid", "mappings")
+        t = (col.data_type or "").strip().lower()
+        if t.startswith(_NOT_NUMBERS):
+            raise _StepError(f"'{col.name}' has type {col.data_type}, which cannot be converted.", "invalid", "mappings")
+        if to not in _CONVERT_ALLOWED.get(col.category, set()):
+            raise _StepError(f"'{col.name}' ({col.data_type}) cannot be converted to {to}.", "invalid", "mappings")
+        if to == "date" and t.startswith("time") and not t.startswith("timestamp"):
+            raise _StepError(f"'{col.name}' holds a time of day, which cannot be converted to a date.", "invalid", "mappings")
+        if to == "integer" and col.category == "numeric" and not _is_integer_type(col.data_type):
+            raise _StepError(
+                f"'{col.name}' holds decimals. Converting decimals to whole numbers is not available yet, "
+                "because PostgreSQL rounds them and SQL Server cuts them off.", "invalid", "mappings")
+        chosen[col.name] = to
+    out: List[Column] = []
+    exprs: List[str] = []
+    for c in cols:
+        to = chosen.get(c.name)
+        if to is None:
+            out.append(c)
+            exprs.append(ctx.q(c.name))
+            continue
+        pg_type, ms_type, pg_name, ms_name = _CONVERT_TO[to]
+        sql_type, shown = (ms_type, ms_name) if ctx.db_type == MSSQL else (pg_type, pg_name)
+        out.append(make_column(c.name, shown))
+        exprs.append(f"CAST({ctx.q(c.name)} AS {sql_type}) AS {ctx.q(c.name)}")
+    notes = ["warning: values that cannot be converted will stop the run with a database error. "
+             "A count of failing values before the run is planned for a later phase."]
+    if "date" in chosen.values():
+        notes.append("warning: how text is read as a date depends on the database's language and date settings. Check the preview.")
+    return Step(columns=out, sql=f"SELECT {', '.join(exprs)} FROM {prev}", notes=notes)
+
+
+_DERIVE_OPS = {"add": "+", "subtract": "-", "multiply": "*", "divide": "/"}
+
+
+def _derive_operand(ctx: _Ctx, cols: Sequence[Column], spec: Any, side: str) -> Tuple[str, bool]:
+    if not isinstance(spec, dict) or ("column" in spec) == ("value" in spec):
+        raise _StepError(f"Choose a column or enter a number for the {side} side.", "incomplete", side)
+    if "column" in spec:
+        col = _need_column(cols, spec.get("column"), side)
+        if not _is_number(col):
+            raise _StepError(f"'{col.name}' is not a number, so it cannot be used in a calculation.", "invalid", side)
+        return ctx.q(col.name), True
+    number = _coerce_value(make_column(f"{side} number", "numeric"), spec.get("value"), side)
+    return ctx.param(number), False
+
+
+def _step_derive(ctx: _Ctx, node: dict, cols: Sequence[Column], prev: str) -> Step:
+    cfg = _config(node)
+    name = cfg.get("name")
+    problem = validate_new_name(name)
+    if problem:
+        raise _StepError(problem, "invalid" if name else "incomplete", "name")
+    op = cfg.get("operation")
+    if op in (None, ""):
+        raise _StepError("Choose an operation.", "incomplete", "operation")
+    if not isinstance(op, str) or op not in _DERIVE_OPS:
+        raise _StepError("The operation must be add, subtract, multiply or divide.", "invalid", "operation")
+    if any(c.name.casefold() == name.casefold() for c in cols):
+        raise _StepError(f"A column called '{name}' already exists. Choose another name.", "invalid", "name")
+    left, left_is_col = _derive_operand(ctx, cols, cfg.get("left"), "left")
+    right, right_is_col = _derive_operand(ctx, cols, cfg.get("right"), "right")
+    if not (left_is_col or right_is_col):
+        raise _StepError("Use at least one column. A calculation on two plain numbers gives the same value in every row.", "invalid", "left")
+    if op == "divide":
+        expr = f"(({left} * 1.0) / NULLIF({right}, 0))"  # * 1.0 avoids whole-number division
+    else:
+        expr = f"({left} {_DERIVE_OPS[op]} {right})"
+    return Step(columns=[*cols, make_column(name, "numeric")],
+                sql=f"SELECT {_select_list(ctx, cols)}, {expr} AS {ctx.q(name)} FROM {prev}",
+                notes=["info: an empty value in the calculation gives an empty result. Dividing by zero gives an empty result, not an error."])
+
+
 def _step_output(ctx: _Ctx, node: dict, cols: Sequence[Column], prev: str) -> Step:
     name = (node.get("config") or {}).get("name")
     if name not in (None, ""):
@@ -610,6 +804,9 @@ TRANSFORMS: Dict[str, Callable[[_Ctx, dict, Sequence[Column], str], Step]] = {
     "rename_columns": _step_rename,
     "remove_duplicates": _step_dedupe,
     "handle_missing": _step_missing,
+    "aggregate": _step_aggregate,
+    "change_type": _step_change_type,
+    "derive_column": _step_derive,
 }
 
 NODE_TYPES = ("source", "join", "output", *TRANSFORMS)

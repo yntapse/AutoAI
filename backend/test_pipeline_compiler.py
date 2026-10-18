@@ -458,6 +458,150 @@ class Transforms(Base):
         sql, _ = pc.build_preview_sql(c, "j", 5)
         self.assertNotIn("DISTINCT", sql)
 
+    def test_aggregate_group_by_region(self):
+        names, data = self.exec_node({"type": "aggregate", "config": {
+            "group_by": ["region"],
+            "measures": [{"function": "sum", "column": "age", "alias": "age_total"},
+                         {"function": "count", "column": None, "alias": "rows_n"}]}})
+        self.assertEqual(names, ["region", "age_total", "rows_n"])
+        got = {r[0]: (r[1], r[2]) for r in data}
+        self.assertEqual(got, {"West": (101, 3), "East": (50, 2), "North": (25, 1)})
+        # SQL Server: SUM of a whole-number column is widened to BIGINT, AVG is done as a float
+        nodes = [src("s", "t-cust"), {"id": "t", "type": "aggregate", "config": {"measures": [
+            {"function": "sum", "column": "age", "alias": "a"}, {"function": "avg", "column": "age", "alias": "b"}]}},
+                 {"id": "o", "type": "output", "config": {}}]
+        c = self.compile(nodes, [edge("s", "t"), edge("t", "o")], db=MS)
+        self.assertEqual(c.results["t"].status, "ready", self.issues(c, "t"))
+        sql = pc.build_preview_sql(c, "o", 5)[0]
+        self.assertIn("SUM(CAST(", sql)
+        self.assertIn("AS BIGINT)", sql)
+        self.assertIn("AVG(CAST(", sql)
+        self.assertIn("AS FLOAT)", sql)
+
+    def test_aggregate_without_group_by_gives_one_row(self):
+        names, data = self.exec_node({"type": "aggregate", "config": {
+            "measures": [{"function": "max", "column": "age", "alias": "oldest"}]}})
+        self.assertEqual(names, ["oldest"])
+        self.assertEqual([tuple(r) for r in data], [(50,)])
+
+    def test_aggregate_validation(self):
+        bad = [
+            {"measures": []},
+            {"measures": [{"function": "sum", "column": "full_name", "alias": "x"}]},
+            {"measures": [{"function": "median", "column": "age", "alias": "x"}]},
+            {"measures": [{"function": "sum", "column": "nope", "alias": "x"}]},
+            {"measures": [{"function": "sum", "column": "age", "alias": ""}]},
+            {"measures": [{"function": "sum", "column": "age", "alias": 5}]},
+            {"measures": [{"function": ["sum"], "column": "age", "alias": "x"}]},
+            {"measures": ["sum"]},
+            {"group_by": "region", "measures": [{"function": "count", "alias": "n"}]},
+            {"group_by": ["nope"], "measures": [{"function": "count", "alias": "n"}]},
+            {"group_by": ["region"], "measures": [{"function": "sum", "column": "age", "alias": "region"}]},
+            {"group_by": ["region", "region"], "measures": [{"function": "count", "alias": "n"}]},
+            {"measures": [{"function": "count", "alias": "n"}, {"function": "max", "column": "age", "alias": "N"}]},
+        ]
+        for cfg in bad:
+            status = self.chain({"type": "aggregate", "config": cfg}).results["t"].status
+            self.assertIn(status, ("invalid", "not_configured"), cfg)
+        for cfg in ("x", ["a"], 5, True):  # a step whose settings are not even a dictionary must not crash
+            status = self.chain({"type": "aggregate", "config": cfg}).results["t"].status
+            self.assertIn(status, ("invalid", "not_configured"), cfg)
+
+    # change_type -------------------------------------------------------
+    def test_change_type_converts_and_keeps_other_columns(self):
+        names, data = self.exec_node({"type": "change_type", "config": {"mappings": [{"column": "age", "to": "text"}]}})
+        self.assertEqual(names, ["customer_id", "full_name", "region", "age", "score", "joined"])
+        self.assertTrue(all(isinstance(r[3], str) or r[3] is None for r in data))
+        names, data = self.exec_node({"type": "change_type", "config": {"mappings": [{"column": "age", "to": "decimal"}]}})
+        self.assertEqual(names, ["customer_id", "full_name", "region", "age", "score", "joined"])
+        self.assertEqual(len(data), 6)
+
+    def test_change_type_sql_server_text(self):
+        nodes = [src("s", "t-cust"), {"id": "t", "type": "change_type", "config": {"mappings": [{"column": "age", "to": "decimal"}]}},
+                 {"id": "o", "type": "output", "config": {}}]
+        c = self.compile(nodes, [edge("s", "t"), edge("t", "o")], db=MS)
+        self.assertEqual(c.results["t"].status, "ready", self.issues(c, "t"))
+        self.assertIn("DECIMAL(38,10)", pc.build_preview_sql(c, "o", 5)[0])
+
+    def test_change_type_validation(self):
+        bad = [{"mappings": []}, {"mappings": [{"column": "age", "to": "blob"}]}, {"mappings": [{"column": "nope", "to": "text"}]},
+               {"mappings": [{"column": "age", "to": ""}]}, {"mappings": [{"column": ["age"], "to": "text"}]},
+               {"mappings": [{"column": "age", "to": ["text"]}]}, {"mappings": "age"}, {"mappings": ["age"]},
+               {"mappings": [{"column": "age", "to": "text"}, {"column": "age", "to": "text"}]},
+               {"mappings": [{"column": "score", "to": "integer"}]},      # decimals to whole numbers is refused
+               {"mappings": [{"column": "age", "to": "date"}]},           # a number cannot become a date
+               {"mappings": [{"column": "joined", "to": "integer"}]}]     # a date cannot become a number
+        for cfg in bad:
+            status = self.chain({"type": "change_type", "config": cfg}).results["t"].status
+            self.assertIn(status, ("invalid", "not_configured"), cfg)
+        for cfg in ("x", ["a"], 5, True):
+            status = self.chain({"type": "change_type", "config": cfg}).results["t"].status
+            self.assertIn(status, ("invalid", "not_configured"), cfg)
+        # interval / point / boolean / time-of-day columns: only the safe conversions are allowed
+        odd = pc.SourceTable("t-odd", "main", "odd", cols(("dur", "interval"), ("pt", "point"), ("flag", "boolean"),
+                                                          ("tm", "time"), ("n", "numeric")), row_count=1, row_count_is_estimate=False)
+
+        def odd_status(column, to):
+            nodes = [src("s", "t-odd"), {"id": "t", "type": "change_type", "config": {"mappings": [{"column": column, "to": to}]}},
+                     {"id": "o", "type": "output", "config": {}}]
+            return self.compile(nodes, [edge("s", "t"), edge("t", "o")], sources={"t-odd": odd}).results["t"].status
+        for column, to in [("dur", "text"), ("dur", "integer"), ("dur", "decimal"), ("pt", "text"), ("flag", "integer"),
+                           ("flag", "date"), ("tm", "date"), ("n", "date")]:
+            self.assertIn(odd_status(column, to), ("invalid", "not_configured"), (column, to))
+        self.assertEqual(odd_status("flag", "text"), "ready")
+        self.assertEqual(odd_status("n", "integer"), "invalid")           # numeric(n) may hold decimals
+        self.assertEqual(odd_status("tm", "text"), "ready")
+
+    # derive_column -----------------------------------------------------
+    def test_derive_multiply_by_number(self):
+        names, data = self.exec_node({"type": "derive_column", "config": {
+            "name": "age_x2", "operation": "multiply", "left": {"column": "age"}, "right": {"value": 2}}})
+        self.assertEqual(names[-1], "age_x2")
+        self.assertIn(100, [r[-1] for r in data])
+
+    def test_derive_divide_is_decimal_and_zero_gives_null(self):
+        _, data = self.exec_node({"type": "derive_column", "config": {
+            "name": "half", "operation": "divide", "left": {"column": "age"}, "right": {"value": 4}}})
+        self.assertIn(12.5, [float(r[-1]) for r in data if r[-1] is not None])
+        _, data = self.exec_node({"type": "derive_column", "config": {
+            "name": "z", "operation": "divide", "left": {"column": "age"}, "right": {"value": 0}}})
+        self.assertTrue(all(r[-1] is None for r in data))
+        # SQL Server: whole numbers must not use whole-number division, and zero must not raise an error
+        nodes = [src("s", "t-cust"), {"id": "t", "type": "derive_column", "config": {
+            "name": "h", "operation": "divide", "left": {"column": "age"}, "right": {"value": 4}}},
+                 {"id": "o", "type": "output", "config": {}}]
+        c = self.compile(nodes, [edge("s", "t"), edge("t", "o")], db=MS)
+        self.assertEqual(c.results["t"].status, "ready", self.issues(c, "t"))
+        sql = pc.build_preview_sql(c, "o", 5)[0]
+        self.assertIn("* 1.0", sql)
+        self.assertIn("NULLIF(", sql)
+
+    def test_derive_validation(self):
+        col = lambda n: {"column": n}
+        bad = [
+            {"name": "x", "operation": "add", "left": col("full_name"), "right": {"value": 1}},
+            {"name": "age", "operation": "add", "left": col("age"), "right": {"value": 1}},
+            {"name": "AGE", "operation": "add", "left": col("age"), "right": {"value": 1}},
+            {"name": "", "operation": "add", "left": col("age"), "right": {"value": 1}},
+            {"name": 5, "operation": "add", "left": col("age"), "right": {"value": 1}},
+            {"name": "x", "operation": "power", "left": col("age"), "right": {"value": 1}},
+            {"name": "x", "operation": ["add"], "left": col("age"), "right": {"value": 1}},
+            {"name": "x", "operation": "add", "left": {"value": 1}, "right": {"value": 2}},
+            {"name": "x", "operation": "add", "left": col("age"), "right": {"value": "abc"}},
+            {"name": "x", "operation": "add", "left": col("age"), "right": {"value": True}},
+            {"name": "x", "operation": "add", "left": col("age"), "right": {"value": float("nan")}},
+            {"name": "x", "operation": "add", "left": col("age")},
+            {"name": "x", "operation": "add", "left": "age", "right": {"value": 1}},
+            {"name": "x", "operation": "add", "left": {"column": ["age"]}, "right": {"value": 1}},
+            {"name": "x", "operation": "add", "left": {"column": "age", "value": 1}, "right": {"value": 1}},
+        ]
+        for cfg in bad:
+            status = self.chain({"type": "derive_column", "config": cfg}).results["t"].status
+            self.assertIn(status, ("invalid", "not_configured"), cfg)
+        for cfg in ("x", ["a"], 5, True):
+            status = self.chain({"type": "derive_column", "config": cfg}).results["t"].status
+            self.assertIn(status, ("invalid", "not_configured"), cfg)
+
 
 class SqlShape(Base):
     def test_preview_is_capped_in_the_database(self):
