@@ -1,11 +1,9 @@
 """
-Unit tests for assess_training_readiness() in backend/main.py
+Unit tests for assess_training_readiness() in services/training_readiness.py
 
-Pure logic: no database rows, no HTTP server, no uploads directory.
-
-PREREQUISITE: importing main.py runs Base.metadata.create_all(), so PostgreSQL
-must be reachable and DATABASE_URL set - the same prerequisite every other
-backend test in this repo already has.
+Pure logic: no database, no HTTP server, no uploads directory. The function
+used to live in main.py, which connects to PostgreSQL at import time; it is now
+a service, so this test needs nothing running.
 
 Run from backend/:
     python -m pytest test_training_readiness.py -v
@@ -17,7 +15,9 @@ import sys
 import pandas as pd
 
 try:
-    from main import (
+    # The logic lives in services/training_readiness.py; main.py re-exports it.
+    # Importing the service directly means this test no longer needs a database.
+    from services.training_readiness import (
         DEFAULT_CV_FOLDS,
         MIN_TRAINING_ROWS,
         SMALL_DATASET_ROW_THRESHOLD,
@@ -25,8 +25,7 @@ try:
         assess_training_readiness,
     )
 except Exception as exc:  # pragma: no cover
-    print("Could not import from main.py.")
-    print("Is PostgreSQL running and DATABASE_URL set? Original error:")
+    print("Could not import services/training_readiness.py. Original error:")
     print(f"  {type(exc).__name__}: {exc}")
     raise SystemExit(2)
 

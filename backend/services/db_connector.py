@@ -236,13 +236,27 @@ def quote_identifier(db_type: str, name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def preview_query(db_type: str, table: str, limit: int = 5) -> str:
+
+def preview_query(
+    db_type: str,
+    table: str,
+    limit: int = 5,
+    schema: Optional[str] = None,
+) -> str:
     """SQL Server uses TOP; PostgreSQL uses LIMIT."""
     db_type = _check_db_type(db_type)
+
     safe_table = quote_identifier(db_type, table)
+
+    if schema:
+        safe_schema = quote_identifier(db_type, schema)
+        safe_table = f"{safe_schema}.{safe_table}"
+
     if db_type == MSSQL:
         return f"SELECT TOP {int(limit)} * FROM {safe_table}"
+
     return f"SELECT * FROM {safe_table} LIMIT {int(limit)}"
+
 
 
 def _version_query(db_type: str) -> str:
@@ -416,6 +430,201 @@ def preview_to_dataframe(
 
     df = _coerce_decimal_columns(df)
     return df, has_more
+
+
+# ---------------------------------------------------------------------------
+# Paged table preview
+#
+# preview_query() and preview_to_dataframe() above are unchanged and keep
+# serving their existing callers. The functions below add what a paged table
+# browser needs: an ORDER BY that makes pages repeatable, a keyset (WHERE key >
+# last-seen) or OFFSET position, and a runner that does NOT treat an empty
+# table as an error. The password never appears in any message raised here.
+# ---------------------------------------------------------------------------
+
+MAX_PAGE_SIZE = 100  # one preview page; this never limits the source table
+MAX_PAGE_OFFSET = 100_000_000
+
+
+class DataSourceConnectionError(DataSourceError):
+    """The database could not be reached, or the login was refused."""
+
+
+class DataSourceTableNotFound(DataSourceError):
+    """The table or view does not exist, or this login cannot see it."""
+
+
+def _bounded_int(value: Any, low: int, high: int, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DataSourceError(f"{label} must be a whole number.")
+    if value < low or value > high:
+        raise DataSourceError(f"{label} must be between {low} and {high}.")
+    return value
+
+
+def _quote_for_text(db_type: str, name: str) -> str:
+    """quote_identifier() plus an escape for ':' - SQLAlchemy's text() would
+    otherwise read ':abc' inside a column name as a bind parameter."""
+    return quote_identifier(db_type, name).replace(":", "\\:")
+
+
+def build_page_query(
+    db_type: str,
+    table: str,
+    schema: Optional[str] = None,
+    page_size: int = PREVIEW_ROWS,
+    order_by: Optional[List[str]] = None,
+    offset: int = 0,
+    after: Optional[List[Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Build ONE page query. Returns (sql, bound_parameters).
+
+    The query asks for page_size + 1 rows; the extra row only tells the caller
+    whether a next page exists and is never shown.
+
+    order_by  column names, ascending. Required for `after`.
+    offset    rows to skip (OFFSET paging).
+    after     last-seen values of the order_by columns (keyset paging). Cannot
+              be combined with a non-zero offset. Values are bound
+              parameters, never pasted into the SQL text.
+
+    SQL Server cannot use OFFSET without ORDER BY, so with no order_by and a
+    non-zero offset it orders by (SELECT NULL), which is NOT repeatable.
+    """
+    db_type = _check_db_type(db_type)
+    page_size = _bounded_int(page_size, 1, MAX_PAGE_SIZE, "page_size")
+    offset = _bounded_int(offset, 0, MAX_PAGE_OFFSET, "offset")
+    columns = list(order_by or [])
+    if any(not isinstance(c, str) or not c for c in columns):
+        raise DataSourceError("order_by must be a list of column names.")
+    if len(set(columns)) != len(columns):
+        raise DataSourceError("order_by contains a repeated column.")
+    if not table:
+        raise DataSourceError("A table name is required.")
+
+    q = lambda name: _quote_for_text(db_type, name)  # noqa: E731
+    target = q(table)
+    if schema:
+        target = f"{q(schema)}.{target}"
+
+    params: Dict[str, Any] = {}
+    where = ""
+    if after is not None:
+        if not columns or len(after) != len(columns):
+            raise DataSourceError("The page position does not match the sort key.")
+        if offset:
+            raise DataSourceError("A key position and an offset cannot be combined.")
+        if any(value is None for value in after):
+            raise DataSourceError("A key position cannot contain NULL.")
+        # (a > :k0) OR (a = :k0 AND b > :k1) ...  works on both databases;
+        # SQL Server has no row-value comparison, so tuples are not used.
+        terms = []
+        for i, column in enumerate(columns):
+            parts = [f"{q(columns[j])} = :k{j}" for j in range(i)]
+            parts.append(f"{q(column)} > :k{i}")
+            terms.append("(" + " AND ".join(parts) + ")")
+        where = " WHERE " + " OR ".join(terms)
+        params = {f"k{i}": value for i, value in enumerate(after)}
+
+    order = " ORDER BY " + ", ".join(q(c) for c in columns) if columns else ""
+    fetch = page_size + 1
+
+    if db_type == POSTGRESQL:
+        sql = f"SELECT * FROM {target}{where}{order} LIMIT {fetch}"
+        if offset:
+            sql += f" OFFSET {offset}"
+        return sql, params
+
+    if columns:
+        return (
+            f"SELECT * FROM {target}{where}{order} "
+            f"OFFSET {offset} ROWS FETCH NEXT {fetch} ROWS ONLY",
+            params,
+        )
+    if offset == 0:
+        return f"SELECT TOP {fetch} * FROM {target}", params
+    return (
+        f"SELECT * FROM {target} ORDER BY (SELECT NULL) "
+        f"OFFSET {offset} ROWS FETCH NEXT {fetch} ROWS ONLY",
+        params,
+    )
+
+
+def _driver_message(exc: Exception) -> str:
+    """The database's own message, without SQLAlchemy's echo of the SQL text
+    and bound values, and with any password in a URL masked."""
+    text_ = str(getattr(exc, "orig", None) or exc)
+    return _mask(" ".join(text_.split()))[:500]
+
+
+def _is_missing_table(exc: Exception) -> bool:
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "pgcode", None) == "42P01":  # PostgreSQL undefined_table
+        return True
+    message = str(orig or exc).lower()
+    return "invalid object name" in message or (
+        "relation" in message and "does not exist" in message
+    )
+
+
+def run_preview_query(
+    connection_string: str,
+    query: str,
+    params: Optional[Dict[str, Any]] = None,
+    max_rows: int = PREVIEW_ROWS + 1,
+) -> Tuple[List[str], List[tuple]]:
+    """Run one validated SELECT and return (column_names, rows).
+
+    Unlike preview_to_dataframe(), an empty result is a normal answer: the
+    column names still come back, with an empty row list. Same read-only
+    protections: SELECT-only validation, PostgreSQL read-only transaction,
+    connect and query timeouts. Raises DataSourceConnectionError,
+    DataSourceTableNotFound or DataSourceError.
+    """
+    safe_query = _validate_query(query)
+    max_rows = _bounded_int(max_rows, 1, MAX_PAGE_SIZE + 1, "max_rows")
+    engine = None
+
+    try:
+        engine = _make_engine(connection_string)
+        try:
+            connection = engine.connect()
+        except Exception as exc:
+            raise DataSourceConnectionError(
+                f"Could not connect to the database - {_driver_message(exc)}"
+            ) from exc
+
+        connection = connection.execution_options(
+            stream_results=True, max_row_buffer=max_rows
+        )
+        if _dialect_of(connection_string) == POSTGRESQL:
+            connection = connection.execution_options(postgresql_readonly=True)
+
+        with connection as conn:
+            try:
+                result = conn.execute(text(safe_query), params or {})
+                columns = list(result.keys())
+                rows = [tuple(row) for row in result.fetchmany(max_rows)]
+            except Exception as exc:
+                if _is_missing_table(exc):
+                    raise DataSourceTableNotFound(
+                        "The table was not found in the database. It may have "
+                        "been renamed or dropped since the last scan."
+                    ) from exc
+                raise DataSourceError(
+                    f"Query failed - {_driver_message(exc)}"
+                ) from exc
+    except DataSourceError:
+        raise
+    except Exception as exc:
+        raise DataSourceError(f"Query failed - {_driver_message(exc)}") from exc
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+    if not columns:
+        raise DataSourceError("The query returned no columns.")
+    return columns, rows
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ import SourceProfilingReport from "@/components/etl-copilot/SourceProfilingRepor
 import PipelineManagement from "@/components/etl-copilot/PipelineManagement";
 import CleaningPipeline from "@/components/etl-copilot/CleaningPipeline";
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
 const INPUT_CLS =
   "w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-[13px] text-slate-100 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20";

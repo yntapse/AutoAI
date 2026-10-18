@@ -9,12 +9,14 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from database import SessionLocal
+from models.data_source import DataSource
 from models.pipeline_definition import PipelineDefinition
 from models.pipeline_run import PipelineRun
 from models.pipeline_version import PipelineVersion
 from models.project import Project
 from models.cleaning_rule import CleaningRule
 from services.data_cleaner import CleaningValidationError, validate_cleaning_steps
+from services.pipeline_execution import build_execution_graph
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +348,10 @@ def update_pipeline(
             validate_cleaning_steps(changes["pipeline_json"].get("cleaning_steps", []))
         except CleaningValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if "execution_graph" in changes["pipeline_json"]:
+            changes["pipeline_json"]["execution_graph"] = build_execution_graph(
+                changes["pipeline_json"]
+            )
     try:
         pipeline = _require_pipeline(db, pipeline_id)
         if "pipeline_name" in changes:
@@ -615,6 +621,10 @@ def save_cleaning_steps(
             return pipeline
         pipeline_json = dict(current.pipeline_json)
         pipeline_json["cleaning_steps"] = canonical_new
+        if "transformations" in pipeline_json:
+            pipeline_json["transformations"] = None
+        if "execution_graph" in pipeline_json:
+            pipeline_json["execution_graph"] = build_execution_graph(pipeline_json)
         new_version = PipelineVersion(
             version_number=_next_version_number(db, pipeline),
             pipeline_json=pipeline_json,
@@ -654,11 +664,60 @@ def run_pipeline(
         latest = max(pipeline.versions, key=lambda item: item.version_number)
         configuration = latest.pipeline_json
         user_request = configuration.get("user_request")
-        if not isinstance(user_request, str) or not user_request.strip():
+        is_compiled_definition = (
+            isinstance(configuration.get("tables"), list)
+            and bool(configuration.get("tables"))
+            and isinstance(configuration.get("joins", []), list)
+        )
+        if not isinstance(configuration.get("generated_plan"), dict) and not is_compiled_definition:
             raise HTTPException(
                 status_code=422,
-                detail="Saved pipeline version does not contain a dataset request.",
+                detail="Saved pipeline version does not contain an executable definition.",
             )
+        if not isinstance(user_request, str):
+            user_request = "Run saved pipeline definition"
+        saved_source = configuration.get("source")
+        if isinstance(saved_source, dict) and saved_source.get("data_source_id"):
+            try:
+                source_id = UUID(str(saved_source["data_source_id"]))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Saved pipeline source identifier is invalid.",
+                ) from exc
+            source = (
+                db.query(DataSource)
+                .filter(DataSource.id == source_id)
+                .first()
+            )
+            if source is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The saved pipeline data source no longer exists.",
+                )
+            mismatched = (
+                source.db_type.casefold() != request.db_type.casefold()
+                    or (
+                        source.host is not None
+                        and source.host.casefold() != request.host.casefold()
+                    )
+                    or (
+                        source.database is not None
+                        and source.database.casefold() != request.database.casefold()
+                    )
+                    or (source.port is not None and source.port != request.port)
+                )
+            if mismatched:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Run connection does not match the pipeline's saved data source.",
+                )
+        build_configuration = configuration.get("build_configuration")
+        saved_target = (
+            build_configuration.get("target_column")
+            if isinstance(build_configuration, dict)
+            else configuration.get("target_column")
+        ) or configuration.get("target_column")
         project = _require_project(db, pipeline.project_id)
         from routers.etl_copilot import EtlCopilotBuildRequest, _run_build_job
 
@@ -674,7 +733,7 @@ def run_pipeline(
             schema_name=request.schema_name,
             project_name=f"{project.project_name}_rerun",
             user_request=user_request,
-            target_column=request.target_column or project.target_column,
+            target_column=saved_target or request.target_column or project.target_column,
             background=True,
             pipeline_version_id=latest.id,
             cleaning_steps=_cleaning_steps_for_version(latest),

@@ -24,7 +24,9 @@ this path (persist=False). One dataset, one file_id, one owner.
 """
 
 import datetime
+import json
 import logging
+import math
 import os
 import pathlib
 import threading
@@ -33,6 +35,7 @@ import traceback
 import uuid
 from decimal import Decimal
 from json import JSONDecodeError
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -42,6 +45,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+import pandas as pd
 
 from database import SessionLocal
 from models.pipeline_definition import PipelineDefinition
@@ -56,7 +60,20 @@ from services.db_connector import (
     DataSourceError,
     build_connection_string,
     default_schema,
+    extract_to_dataframe,
+    list_columns,
 )
+from services.quality_rules import (
+    QualityRuleValidationError,
+    evaluate_rules,
+    validate_rule_definition,
+)
+from services.pipeline_execution import (
+    PipelineExecutionError,
+    build_execution_graph,
+    compile_saved_pipeline_sql,
+)
+from services.sql_builder import SqlBuildError, build_select, edges_from_dicts
 
 from etl_copilot.build_service import BuildError
 from etl_copilot.copilot_service import CopilotError, ETLCopilot, catalog_for_llm
@@ -66,7 +83,7 @@ from etl_copilot.quality import compute_quality_score
 
 # routers.datamodel imports `main` only inside function bodies, so importing it
 # here is safe and introduces no cycle.
-from routers.datamodel import _create_project_from_frame
+from routers.datamodel import _columns_for_build, _create_project_from_frame
 
 router = APIRouter(
     prefix="/etl-copilot",
@@ -372,34 +389,544 @@ def _resolve_target(requested: Optional[str], result: Dict[str, Any]) -> str:
     return str(columns[-1])
 
 
+def _build_compiled_pipeline_frame(
+    request: EtlCopilotBuildRequest,
+    pipeline_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Execute a compiled Pipeline Builder definition without invoking an LLM."""
+    tables = pipeline_json.get("tables")
+    joins = pipeline_json.get("joins", [])
+    if (
+        not isinstance(tables, list)
+        or not tables
+        or any(not isinstance(table, str) or not table.strip() for table in tables)
+        or not isinstance(joins, list)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Saved pipeline must contain a non-empty tables list and joins list.",
+        )
+    selected_columns = pipeline_json.get("selected_columns")
+    if selected_columns is not None and not isinstance(selected_columns, dict):
+        raise HTTPException(
+            status_code=422, detail="Saved selected_columns must be an object."
+        )
+    if selected_columns is not None:
+        if any(
+            table not in tables
+            or not isinstance(columns, list)
+            or any(not isinstance(column, str) for column in columns)
+            for table, columns in selected_columns.items()
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Saved selected_columns must map selected tables to column lists.",
+            )
+
+    source = pipeline_json.get("source")
+    source = source if isinstance(source, dict) else {}
+    schema = source.get("schema_name") or pipeline_json.get("schema_name")
+    schema = schema or _resolved_schema(request)
+    connection_string = _connection_string(request)
+    base_table = pipeline_json.get("base_table") or tables[0]
+    if not isinstance(base_table, str):
+        raise HTTPException(status_code=422, detail="Saved base_table must be a string.")
+
+    expected_graph = build_execution_graph(pipeline_json)
+    saved_graph = pipeline_json.get("execution_graph")
+    if saved_graph is not None and saved_graph != expected_graph:
+        raise HTTPException(
+            status_code=422,
+            detail="Saved execution_graph does not match the pipeline definition.",
+        )
+
+    try:
+        columns_by_table = _columns_for_build(
+            connection_string,
+            tables,
+            schema,
+            selected_columns,
+        )
+        if selected_columns is not None:
+            for table_name, saved_columns in selected_columns.items():
+                columns_by_table[table_name] = list(saved_columns)
+        edges = edges_from_dicts(joins)
+        built = build_select(
+            db_type=request.db_type,
+            base_table=base_table,
+            tables=tables,
+            relationships=edges,
+            columns_by_table=columns_by_table,
+            schema=schema,
+        )
+        execution_sql, query_params = compile_saved_pipeline_sql(
+            request.db_type,
+            built.sql,
+            built.alias_map,
+            pipeline_json,
+        )
+        frame = extract_to_dataframe(
+            connection_string,
+            execution_sql,
+            params=query_params,
+        )
+    except SqlBuildError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PipelineExecutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "frame": frame,
+        "sql": execution_sql,
+        "alias_map": built.alias_map,
+        "tables": tables,
+        "columns_by_table": columns_by_table,
+        "schema": schema,
+        "execution_graph": saved_graph or expected_graph,
+    }
+
+
+def _source_column_alias(
+    alias_map: Dict[str, str],
+    table_name: Optional[str],
+    column_name: str,
+) -> str:
+    """Resolve one saved table/column reference to its deterministic output alias."""
+    if not isinstance(column_name, str) or not column_name.strip():
+        raise HTTPException(
+            status_code=422, detail="Saved column references must be non-empty strings."
+        )
+    matches = [
+        output_name
+        for output_name, source in alias_map.items()
+        if source.rsplit(".", 1)[-1].casefold() == column_name.casefold()
+        and (
+            table_name is None
+            or source.rsplit(".", 1)[0].casefold() == table_name.casefold()
+        )
+    ]
+    if len(matches) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Saved column reference '%s%s' resolves to %d output columns."
+                % (
+                    "%s." % table_name if table_name else "",
+                    column_name,
+                    len(matches),
+                )
+            ),
+        )
+    return matches[0]
+
+
+def _compiled_cleaning_steps(
+    transformations: Any,
+    alias_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    if not isinstance(transformations, list):
+        return []
+
+    steps = []
+    for index, transformation in enumerate(transformations, 1):
+        if not isinstance(transformation, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="Saved transformation #%d must be an object." % index,
+            )
+        step_type = transformation.get("step_type")
+        config = transformation.get("configuration")
+        table_name = transformation.get("table_name")
+        if not isinstance(config, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="Saved transformation #%d has no configuration object." % index,
+            )
+
+        normalized = dict(config)
+        if isinstance(normalized.get("column_name"), str):
+            normalized["column_name"] = _source_column_alias(
+                alias_map,
+                table_name if isinstance(table_name, str) else None,
+                normalized["column_name"],
+            )
+        if isinstance(normalized.get("columns"), list):
+            if any(not isinstance(column, str) for column in normalized["columns"]):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Saved transformation columns must be strings.",
+                )
+            normalized["columns"] = [
+                _source_column_alias(
+                    alias_map,
+                    table_name if isinstance(table_name, str) else None,
+                    column,
+                )
+                for column in normalized["columns"]
+            ]
+
+        if step_type == "remove_duplicates" and normalized.get("scope") == "columns":
+            normalized["scope"] = "selected_columns"
+        if (
+            step_type == "replace_null_values"
+            and normalized.get("strategy") != "custom"
+        ):
+            normalized.pop("custom_value", None)
+
+        steps.append(
+            {
+                "step_name": transformation.get("step_name")
+                or transformation.get("name")
+                or str(step_type or "transformation"),
+                "step_type": step_type,
+                "configuration": normalized,
+                "enabled": transformation.get("enabled", True),
+            }
+        )
+    return steps
+
+
+def _apply_saved_filters(
+    frame: pd.DataFrame,
+    filters: Any,
+    alias_map: Dict[str, str],
+) -> pd.DataFrame:
+    if filters is None:
+        return frame
+    if not isinstance(filters, list):
+        raise HTTPException(status_code=422, detail="Saved filters must be a list.")
+
+    operators = {
+        "=": "eq",
+        "==": "eq",
+        "eq": "eq",
+        "equals": "eq",
+        "!=": "ne",
+        "<>": "ne",
+        "ne": "ne",
+        "not_equals": "ne",
+        ">": "gt",
+        "gt": "gt",
+        "greater_than": "gt",
+        ">=": "gte",
+        "gte": "gte",
+        "greater_than_or_equal": "gte",
+        "<": "lt",
+        "lt": "lt",
+        "less_than": "lt",
+        "<=": "lte",
+        "lte": "lte",
+        "less_than_or_equal": "lte",
+        "is null": "is_null",
+        "is_null": "is_null",
+        "isnull": "is_null",
+        "is not null": "is_not_null",
+        "is_not_null": "is_not_null",
+        "isnotnull": "is_not_null",
+    }
+    result = frame
+    for index, item in enumerate(filters, 1):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=422, detail="Saved filter #%d must be an object." % index
+            )
+        column = item.get("column") or item.get("column_name")
+        if not isinstance(column, str) or not column.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="Saved filter #%d has no column." % index,
+            )
+        source_table = item.get("source_table") or item.get("table_name")
+        if source_table is not None and not isinstance(source_table, str):
+            raise HTTPException(
+                status_code=422,
+                detail="Saved filter table_name must be a string.",
+            )
+        output_column = _source_column_alias(
+            alias_map,
+            source_table,
+            column,
+        )
+        operator = operators.get(str(item.get("operator", "")).strip().lower())
+        if operator is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Saved filter #%d uses an unsupported operator." % index,
+            )
+
+        values = result[output_column]
+        if operator == "is_null":
+            mask = values.isna()
+        elif operator == "is_not_null":
+            mask = values.notna()
+        else:
+            if "value" not in item:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Saved filter #%d requires a value." % index,
+                )
+            value = item["value"]
+            if (
+                value is None
+                or not isinstance(value, (str, bool, int, float))
+                or isinstance(value, float) and not math.isfinite(value)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Saved filter #%d value must be a finite JSON scalar." % index,
+                )
+            try:
+                if operator == "eq":
+                    mask = values == value
+                elif operator == "ne":
+                    mask = values != value
+                elif operator == "gt":
+                    mask = values > value
+                elif operator == "gte":
+                    mask = values >= value
+                elif operator == "lt":
+                    mask = values < value
+                else:
+                    mask = values <= value
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Saved filter #%d cannot compare its column and value." % index,
+                ) from exc
+            mask = mask.fillna(False)
+        result = result.loc[mask].copy()
+    return result
+
+
+def _profile_source_frames(
+    source_frames: Dict[str, pd.DataFrame],
+    column_metadata: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    tables = []
+    for table_name, frame in source_frames.items():
+        source_types = {
+            str(column["name"]).casefold(): column.get("type")
+            for column in column_metadata.get(table_name, [])
+        }
+        columns = []
+        for column_name in frame.columns:
+            series = frame[column_name]
+            non_null = series.dropna()
+            distinct = non_null.drop_duplicates()
+            inventory = [_jsonable(value) for value in distinct.tolist()]
+            try:
+                minimum = _jsonable(non_null.min()) if not non_null.empty else None
+                maximum = _jsonable(non_null.max()) if not non_null.empty else None
+            except (TypeError, ValueError):
+                minimum = maximum = None
+            row_count = len(frame)
+            null_count = int(series.isna().sum())
+            non_null_count = row_count - null_count
+            distinct_count = len(distinct)
+            columns.append(
+                {
+                    "column_name": str(column_name),
+                    "data_type": source_types.get(
+                        str(column_name).casefold(), str(series.dtype)
+                    ),
+                    "null_count": null_count,
+                    "null_percentage": (
+                        null_count * 100.0 / row_count if row_count else 0.0
+                    ),
+                    "distinct_count": distinct_count,
+                    "distinct_percentage": (
+                        distinct_count * 100.0 / non_null_count
+                        if non_null_count
+                        else 0.0
+                    ),
+                    "min": minimum,
+                    "max": maximum,
+                    "value_inventory": [{"value": value} for value in inventory],
+                    "inventory_complete": True,
+                }
+            )
+        tables.append(
+            {
+                "table_name": table_name,
+                "row_count": int(len(frame)),
+                "columns": columns,
+            }
+        )
+    return {"tables": tables}
+
+
+def _evaluate_saved_quality_rules(
+    request: EtlCopilotBuildRequest,
+    pipeline_json: Dict[str, Any],
+    tables: List[str],
+    schema: str,
+    connection_string: str,
+) -> Optional[Dict[str, Any]]:
+    raw_rules = pipeline_json.get("quality_rules", [])
+    if not isinstance(raw_rules, list):
+        raise HTTPException(status_code=422, detail="Saved quality_rules must be a list.")
+    if not raw_rules:
+        return None
+
+    rules = []
+    for index, item in enumerate(raw_rules, 1):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=422, detail="Saved quality rule #%d must be an object." % index
+            )
+        if not isinstance(item.get("enabled", True), bool):
+            raise HTTPException(
+                status_code=422,
+                detail="Saved quality rule #%d enabled must be boolean." % index,
+            )
+        rule_type = item.get("rule_type")
+        severity = item.get("severity", "error")
+        config = item.get("rule_config")
+        try:
+            validate_rule_definition(rule_type, severity, config)
+        except QualityRuleValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rules.append(
+            SimpleNamespace(
+                id=item.get("id") or "saved-quality-rule-%d" % index,
+                rule_name=item.get("rule_name") or item.get("name") or (
+                    "%s #%d" % (rule_type, index)
+                ),
+                rule_type=rule_type,
+                severity=severity,
+                enabled=item.get("enabled", True),
+                rule_config=config,
+            )
+        )
+
+    source_frames = {}
+    try:
+        column_metadata = list_columns(connection_string, tables, schema=schema)
+        for table_name in tables:
+            columns = _columns_for_build(
+                connection_string, [table_name], schema, None
+            )
+            statement = build_select(
+                db_type=request.db_type,
+                base_table=table_name,
+                tables=[table_name],
+                relationships=[],
+                columns_by_table=columns,
+                schema=schema,
+            )
+            source_frames[table_name] = extract_to_dataframe(
+                connection_string, statement.sql
+            )
+    except SqlBuildError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        report = evaluate_rules(
+            rules,
+            _profile_source_frames(source_frames, column_metadata),
+        )
+    except (QualityRuleValidationError, LookupError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if report["overall_status"] == "fail":
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Saved pipeline quality rules failed.", "report": report},
+        )
+    return report
+
+
 def _build_dataset_and_register(
     db: Session,
     request: EtlCopilotBuildRequest,
+    pipeline_json: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The whole build path, shared by the sync and background entry points."""
+    stage_durations: Dict[str, float] = {}
+    execution_started = time.perf_counter()
 
-    try:
-        validate_cleaning_steps(request.cleaning_steps)
-    except CleaningValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    copilot = get_copilot()
-    connection_string = _connection_string(request)
-    schema = _resolved_schema(request)
-
-    try:
-        result = copilot.create_dataset(
-            user_request=request.user_request,
-            connection_string=connection_string,
-            schema=schema,
-            dataset_name=request.project_name,
-            # AutoAI owns the file and the file_id. Letting BuildService also
-            # write one would give a single dataset two ids and two copies on
-            # disk that can drift apart.
-            persist=False,
+    compiled_pipeline = (
+        pipeline_json is not None
+        and isinstance(pipeline_json.get("tables"), list)
+        and (
+            pipeline_json.get("schema_version") is not None
+            or not isinstance(pipeline_json.get("generated_plan"), dict)
         )
-    except Exception as exc:
-        _raise_for(exc)
+    )
+    cleaning_steps = request.cleaning_steps
+    if compiled_pipeline and isinstance(pipeline_json.get("transformations"), list):
+        cleaning_steps = []
+    if not compiled_pipeline or not isinstance(pipeline_json.get("transformations"), list):
+        try:
+            validate_cleaning_steps(cleaning_steps)
+        except CleaningValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if pipeline_json is not None and not compiled_pipeline and not isinstance(
+        pipeline_json.get("generated_plan"), dict
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Saved pipeline version has no executable definition.",
+        )
+
+    quality_report = None
+    compiled_result = None
+    if compiled_pipeline:
+        query_started = time.perf_counter()
+        compiled_result = _build_compiled_pipeline_frame(request, pipeline_json)
+        stage_durations["extract_and_join"] = max(
+            0.0, time.perf_counter() - query_started
+        )
+        result = {
+            "frame": compiled_result["frame"],
+            "columns": list(compiled_result["frame"].columns),
+            "target_column": pipeline_json.get("target_column"),
+            "sql": compiled_result["sql"],
+            "execution_graph": compiled_result["execution_graph"],
+            "spec": None,
+            "explanation": [
+                "Executed the saved tables and approved joins without replanning."
+            ],
+        }
+        alias_map = compiled_result["alias_map"]
+        if isinstance(pipeline_json.get("transformations"), list):
+            cleaning_steps = _compiled_cleaning_steps(
+                pipeline_json["transformations"], alias_map
+            )
+        try:
+            validate_cleaning_steps(cleaning_steps)
+        except CleaningValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        copilot = get_copilot()
+        connection_string = _connection_string(request)
+        schema = _resolved_schema(request)
+        try:
+            build_options = {
+                "connection_string": connection_string,
+                "schema": schema,
+                "dataset_name": request.project_name,
+                # AutoAI owns the file and the file_id. Letting BuildService also
+                # write one would give a single dataset two ids and two copies on
+                # disk that can drift apart.
+                "persist": False,
+            }
+            if pipeline_json is not None:
+                result = copilot.create_dataset_from_spec(
+                    saved_spec=pipeline_json["generated_plan"],
+                    **build_options,
+                )
+            else:
+                result = copilot.create_dataset(
+                    user_request=request.user_request,
+                    **build_options,
+                )
+        except Exception as exc:
+            _raise_for(exc)
 
     frame = result.pop("frame", None)
 
@@ -409,13 +936,52 @@ def _build_dataset_and_register(
             detail="The dataset was built but its rows were not returned.",
         )
 
+    query_row_count = int(len(frame))
+    cleaning_started = time.perf_counter()
     try:
         frame, cleaning_summary = apply_cleaning_steps(
             frame,
-            request.cleaning_steps,
+            cleaning_steps,
         )
     except CleaningValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    stage_durations["cleaning"] = max(
+        0.0, time.perf_counter() - cleaning_started
+    )
+    cleaned_row_count = int(len(frame))
+
+    if compiled_pipeline:
+        connection_string = _connection_string(request)
+        quality_started = time.perf_counter()
+        quality_report = _evaluate_saved_quality_rules(
+            request=request,
+            pipeline_json=pipeline_json,
+            tables=compiled_result["tables"],
+            schema=compiled_result["schema"],
+            connection_string=connection_string,
+        )
+        stage_durations["quality_validation"] = max(
+            0.0, time.perf_counter() - quality_started
+        )
+        result["lineage"] = {
+            "schema_version": pipeline_json.get("schema_version"),
+            "plan_id": pipeline_json.get("plan_id"),
+            "source": pipeline_json.get("source"),
+            "base_table": pipeline_json.get("base_table")
+            or compiled_result["tables"][0],
+            "tables": list(compiled_result["tables"]),
+            "joins": pipeline_json.get("joins", []),
+            "transformations": pipeline_json.get("transformations", []),
+            "filters": pipeline_json.get("filters", []),
+            "group_by": pipeline_json.get("group_by", []),
+            "aggregations": pipeline_json.get("aggregations", []),
+            "quality_rules": pipeline_json.get("quality_rules", []),
+            "quality_report": quality_report,
+            "sql": compiled_result["sql"],
+            "output_columns": list(frame.columns),
+            "column_sources": compiled_result["alias_map"],
+            "execution_graph": compiled_result["execution_graph"],
+        }
 
     total_rows = int(len(frame))
     total_columns = int(len(frame.columns))
@@ -453,12 +1019,16 @@ def _build_dataset_and_register(
     # target, writes uploads/<file_id>.csv, and commits Project +
     # DatasetProfile. It raises HTTPException itself, which passes straight
     # through.
+    registration_started = time.perf_counter()
     payload = _create_project_from_frame(
         db=db,
         df=frame,
         project_name=request.project_name,
         target_column=target_column,
         source_label=source_label,
+    )
+    stage_durations["register_dataset"] = max(
+        0.0, time.perf_counter() - registration_started
     )
 
     payload["user_request"] = request.user_request
@@ -471,6 +1041,22 @@ def _build_dataset_and_register(
     payload["data_quality"] = data_quality
     payload["column_profiles"] = column_profiles
     payload["cleaning_summary"] = cleaning_summary
+    if compiled_pipeline:
+        payload["execution_metrics"] = {
+            "total_duration_seconds": max(
+                0.0, time.perf_counter() - execution_started
+            ),
+            "stage_durations_seconds": stage_durations,
+            "row_counts": {
+                "query_output": query_row_count,
+                "after_cleaning": cleaned_row_count,
+                "registered": int(payload.get("rows", len(frame))),
+            },
+            "quality_metrics": quality_report or data_quality,
+            "execution_graph": compiled_result["execution_graph"],
+        }
+    if quality_report is not None:
+        payload["quality_report"] = quality_report
 
     # Coerced once, here, so the background job stores a JSON-safe result too.
     return _jsonable(payload)
@@ -485,6 +1071,7 @@ def _build_and_register(
     started_clock = time.perf_counter()
     run = None
     run_project_id = None
+    pipeline_json = None
 
     if request.pipeline_version_id is not None:
         version = (
@@ -494,6 +1081,7 @@ def _build_and_register(
         )
         if version is None:
             raise HTTPException(status_code=404, detail="Pipeline version not found.")
+        pipeline_json = version.pipeline_json
         pipeline = (
             db.query(PipelineDefinition)
             .filter(PipelineDefinition.id == version.pipeline_definition_id)
@@ -521,7 +1109,11 @@ def _build_and_register(
             ) from exc
 
     try:
-        payload = _build_dataset_and_register(db, request)
+        payload = _build_dataset_and_register(
+            db,
+            request,
+            pipeline_json=pipeline_json,
+        )
     except Exception as exc:
         if run is not None:
             run.status = "failed"
@@ -530,7 +1122,23 @@ def _build_and_register(
                 0.0,
                 time.perf_counter() - started_clock,
             )
-            run.execution_log = "Build failed (%s)." % type(exc).__name__
+            failure_message = "Build failed (%s)." % type(exc).__name__
+            if isinstance(exc, HTTPException):
+                detail = _jsonable(exc.detail)
+                run.execution_log = json.dumps(
+                    {
+                        "message": failure_message,
+                        "detail": detail,
+                        "quality_metrics": (
+                            detail.get("report")
+                            if isinstance(detail, dict)
+                            else None
+                        ),
+                    },
+                    sort_keys=True,
+                )
+            else:
+                run.execution_log = failure_message
             try:
                 db.commit()
             except SQLAlchemyError:
@@ -562,7 +1170,27 @@ def _build_and_register(
         0.0,
         time.perf_counter() - started_clock,
     )
-    run.execution_log = "Dataset build completed successfully."
+    if request.pipeline_version_id is not None:
+        run.execution_log = json.dumps(
+            _jsonable(
+                {
+                    "message": "Dataset build completed successfully.",
+                    "lineage": payload.get("lineage"),
+                    "quality_report": payload.get("quality_report"),
+                    "execution_metrics": payload.get("execution_metrics"),
+                    "quality_metrics": payload.get("quality_report")
+                    or payload.get("data_quality"),
+                    "row_counts": (
+                        payload.get("execution_metrics", {}).get("row_counts")
+                        if isinstance(payload.get("execution_metrics"), dict)
+                        else {"registered": payload.get("rows")}
+                    ),
+                }
+            ),
+            sort_keys=True,
+        )
+    else:
+        run.execution_log = "Dataset build completed successfully."
     try:
         db.commit()
         db.refresh(run)

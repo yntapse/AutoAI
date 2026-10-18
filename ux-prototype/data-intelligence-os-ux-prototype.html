@@ -1,0 +1,1132 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Data Intelligence OS UX Prototype</title>
+<style>
+:root{
+  --bg:#0c1118;--bg2:#0f1620;--panel:#131b27;--panel2:#18222f;--panel3:#1e2a3a;--line:#263244;--line2:#324258;
+  --text:#e7edf5;--text2:#b4c0d0;--muted:#8394a9;--accent:#3d9bff;--accent2:#1f6fd1;--accentbg:rgba(61,155,255,.14);
+  --ok:#3fbf86;--okbg:rgba(63,191,134,.14);--warn:#e8a82a;--warnbg:rgba(232,168,42,.14);--err:#f0625f;--errbg:rgba(240,98,95,.15);
+  --info:#6aa9ff;--infobg:rgba(106,169,255,.13);--plan:#b794f4;--planbg:rgba(183,148,244,.15);
+  --r:8px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.45 var(--sans);overflow:hidden}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+.ico{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none;vertical-align:-3px}
+#app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+.ribbon{background:#1a2230;border-bottom:1px solid var(--line);color:var(--text2);font-size:12.5px;padding:6px 16px;display:flex;gap:12px;align-items:center}
+.ribbon b{color:var(--warn);letter-spacing:.06em;font-size:11.5px}
+.ribbon .sp{flex:1}
+.shell{display:grid;grid-template-columns:196px 1fr;min-height:0}
+.rail{background:var(--bg2);border-right:1px solid var(--line);padding:12px 10px;display:flex;flex-direction:column;gap:2px;overflow:auto}
+.brand{display:flex;align-items:center;gap:9px;padding:4px 8px 14px;font-weight:700;font-size:15px}
+.brand i{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#3d9bff,#2dd4bf);display:inline-block}
+.rail h6{margin:14px 10px 4px;font-size:11px;letter-spacing:.08em;color:var(--muted);font-weight:600;text-transform:uppercase}
+.nav{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:7px;color:var(--text2);background:none;border:0;text-align:left;width:100%}
+.nav:hover{background:var(--panel)}
+.nav.on{background:var(--accentbg);color:#fff}
+.nav .t{margin-left:auto}
+main{min-width:0;min-height:0;display:flex;flex-direction:column}
+.page{flex:1;min-height:0;overflow:auto;padding:22px 28px}
+.page h1{font-size:21px;margin:0 0 4px}
+.sub{color:var(--muted);margin:0 0 18px}
+.row{display:flex;gap:10px;align-items:center}
+.col{display:flex;flex-direction:column;gap:10px}
+.sp{flex:1}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.card h3{margin:0 0 6px;font-size:14.5px}
+.card p{margin:0;color:var(--text2)}
+.btn{background:var(--panel2);border:1px solid var(--line2);border-radius:7px;padding:6px 12px;color:var(--text);display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.btn:hover:not(:disabled){background:var(--panel3)}
+.btn.pri{background:var(--accent2);border-color:var(--accent);color:#fff;font-weight:600}
+.btn.pri:hover:not(:disabled){background:#2a7ee6}
+.btn.ghost{background:none;border-color:transparent;color:var(--text2)}
+.btn.ghost:hover:not(:disabled){background:var(--panel2)}
+.btn.sm{padding:3px 9px;font-size:12.5px}
+.btn.danger{border-color:var(--err);color:var(--err)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn:focus-visible,.nav:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.tag{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:1px 6px;border-radius:5px;border:1px solid}
+.tag.planned{color:var(--plan);background:var(--planbg);border-color:rgba(183,148,244,.4)}
+.tag.sim{color:var(--muted);border-color:var(--line2)}
+.tag.live{color:var(--ok);background:var(--okbg);border-color:rgba(63,191,134,.4)}
+.tag.partial{color:var(--warn);background:var(--warnbg);border-color:rgba(232,168,42,.4)}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--line2);color:var(--text2)}
+.pill.ok{color:var(--ok);background:var(--okbg);border-color:transparent}.pill.warn{color:var(--warn);background:var(--warnbg);border-color:transparent}
+.pill.err{color:var(--err);background:var(--errbg);border-color:transparent}.pill.info{color:var(--info);background:var(--infobg);border-color:transparent}
+.muted{color:var(--muted)}.t2{color:var(--text2)}.mono{font-family:var(--mono);font-size:12.5px}
+input[type=text],input[type=number],input[type=search],select,textarea{background:var(--bg);border:1px solid var(--line2);border-radius:7px;padding:6px 9px;width:100%}
+textarea{resize:vertical;min-height:64px}
+label.f{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line)}
+.tab{background:none;border:0;border-bottom:2px solid transparent;padding:8px 12px;color:var(--muted);display:flex;gap:6px;align-items:center}
+.tab:hover{color:var(--text)}.tab.on{color:#fff;border-bottom-color:var(--accent)}
+.tab .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.err{background:var(--err)}.dot.info{background:var(--info)}
+table.g{border-collapse:collapse;width:100%;font-size:12.5px}
+table.g th{position:sticky;top:0;background:var(--panel2);text-align:left;font-weight:600;padding:6px 10px;border-bottom:1px solid var(--line2);white-space:nowrap}
+table.g th small{display:block;font-weight:400;color:var(--muted);font-family:var(--mono);font-size:11px}
+table.g td{padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap;font-family:var(--mono)}
+table.g td.n{text-align:right}table.g td.null{color:var(--warn);font-style:italic}
+table.g tr:hover td{background:rgba(255,255,255,.025)}
+table.g td.rn,table.g th.rn{color:var(--muted);text-align:right;width:40px}
+.scroll{overflow:auto;min-height:0}
+/* notices */
+.notices{display:flex;flex-direction:column;gap:6px;padding:8px 14px 0}
+.notice{display:flex;gap:10px;align-items:flex-start;padding:8px 12px;border-radius:8px;border:1px solid;font-size:13px}
+.notice.error{background:var(--errbg);border-color:rgba(240,98,95,.5)}.notice.action{background:var(--accentbg);border-color:rgba(61,155,255,.5)}
+.notice.warning{background:var(--warnbg);border-color:rgba(232,168,42,.5)}.notice.info{background:var(--infobg);border-color:rgba(106,169,255,.35)}
+.notice .b{flex:1}.notice .acts{display:flex;gap:6px}
+/* studio */
+.studio{flex:1;min-height:0;display:flex;flex-direction:column}
+.tbar{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--bg2)}
+.tbar input.name{width:260px;background:transparent;border-color:transparent;font-weight:600;font-size:15px}
+.tbar input.name:hover,.tbar input.name:focus{background:var(--bg);border-color:var(--line2)}
+.vsep{width:1px;height:22px;background:var(--line2)}
+.guide{border-bottom:1px solid var(--line);background:var(--bg2);padding:8px 14px}
+.stages{display:flex;gap:6px;align-items:center}
+.stg{display:flex;align-items:center;gap:7px;padding:4px 11px 4px 6px;border-radius:99px;border:1px solid var(--line2);background:var(--panel);color:var(--text2);font-size:13px}
+.stg .n{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-size:11.5px;font-weight:700;background:var(--panel3);color:var(--text2)}
+.stg.on{border-color:var(--accent);color:#fff;background:var(--accentbg)}
+.stg.complete .n{background:var(--ok);color:#06210f}.stg.blocked .n,.stg.invalid .n{background:var(--err);color:#2a0606}
+.stg.review .n{background:var(--warn);color:#2a1d00}
+.stg-sep{width:14px;height:1px;background:var(--line2)}
+.ginst{display:flex;gap:14px;align-items:center;margin-top:7px}
+.ginst .msg{flex:1;font-size:14px}.ginst .msg b{color:#fff}
+.work{flex:1;min-height:0;display:grid;grid-template-columns:auto 1fr auto;position:relative}
+.palette{width:156px;border-right:1px solid var(--line);background:var(--bg2);padding:10px;overflow:auto;transition:width .15s}
+.palette.col1{width:0;padding:0;border:0;overflow:hidden}
+.palette h6{margin:8px 4px 5px;font-size:11px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+.pal{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border-radius:7px;background:none;border:1px solid transparent;color:var(--text2);text-align:left;font-size:13px}
+.pal:hover{background:var(--panel);border-color:var(--line)}
+.pal .tag{margin-left:auto;padding:0 4px;font-size:9.5px}
+.center{display:flex;flex-direction:column;min-width:0;min-height:0}
+.canvaswrap{flex:1;position:relative;min-height:0;overflow:hidden;background:
+ radial-gradient(circle,#243145 1px,transparent 1.2px) 0 0/22px 22px, var(--bg);cursor:grab}
+.canvaswrap.panning{cursor:grabbing}
+#world{position:absolute;left:0;top:0;transform-origin:0 0}
+#edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+.edge{fill:none;stroke:#5a6e88;stroke-width:2}.edge.sel{stroke:var(--accent);stroke-width:2.6}.edge.stale{stroke-dasharray:6 5}
+.edge.warn{stroke:var(--warn)}
+.edgex{pointer-events:all;cursor:pointer}.edgex circle{fill:var(--panel2);stroke:var(--line2)}.edgex:hover circle{fill:var(--errbg);stroke:var(--err)}
+.edgex text{fill:var(--text2);font-size:12px;text-anchor:middle;dominant-baseline:central}
+.node{position:absolute;width:196px;height:92px;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:8px 10px;cursor:move;user-select:none;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.node:hover{border-color:#486182}
+.node.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accentbg),0 2px 10px rgba(0,0,0,.35)}
+.node .h{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.node .h .st{margin-left:auto;display:flex;gap:5px;align-items:center}
+.node .ti{font-weight:600;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13.5px}
+.node .su{color:var(--text2);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.node .ft{position:absolute;left:10px;right:10px;bottom:7px;display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)}
+.node .ft .tag{margin-left:auto}
+.node.planned{border-style:dashed}
+.node.t-source .h .ico{color:#6cc6ff}.node.t-join .h .ico{color:#f0b429}.node.t-output .h .ico{color:var(--ok)}
+.node.t-aggregate .h .ico,.node.t-derive .h .ico{color:var(--plan)}
+.sd{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+.sd.ready{background:#5a6e88}.sd.fresh{background:var(--ok)}.sd.stale{background:var(--warn)}.sd.err{background:var(--err)}.sd.warn{background:var(--warn)}
+.sd.run{background:var(--accent);animation:pulse 1s infinite}.sd.done{background:var(--ok)}.sd.fail{background:var(--err)}.sd.q{background:#5a6e88}
+@keyframes pulse{50%{opacity:.35}}
+.port{position:absolute;width:12px;height:12px;border-radius:50%;background:var(--bg);border:2px solid #6b82a2;z-index:2}
+.port:hover{border-color:var(--accent);background:var(--accent)}
+.port.out{right:-7px}.port.in{left:-7px}
+.cvtools{position:absolute;top:10px;right:10px;display:flex;gap:4px;background:var(--panel);border:1px solid var(--line2);border-radius:9px;padding:4px;z-index:5}
+.cvtools .btn{padding:4px 7px}
+.mini{position:absolute;left:10px;bottom:10px;width:170px;height:104px;background:rgba(19,27,39,.92);border:1px solid var(--line2);border-radius:8px;z-index:5}
+.cvempty{position:absolute;inset:0;display:grid;place-items:center;z-index:3;pointer-events:none}
+.cvempty .card{pointer-events:all;max-width:440px;text-align:center}
+.hint{position:absolute;left:196px;bottom:10px;font-size:12px;color:var(--muted);z-index:4}
+.right{width:360px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column;min-height:0}
+.right.col1{width:0;border:0;overflow:hidden}
+.rbody{flex:1;overflow:auto;padding:12px 14px}
+.dock{border-top:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column;min-height:0}
+.dock .dh{display:flex;align-items:center;padding-right:8px}
+.dock .db{flex:1;min-height:0;overflow:auto}
+.sect{border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin-bottom:10px;background:var(--panel)}
+.sect h4{margin:0 0 6px;font-size:13px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px}.kv dt{color:var(--muted)}.kv dd{margin:0}
+.chk{display:flex;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line);align-items:flex-start}
+.chk .ico{margin-top:2px}.chk.error .ico{color:var(--err)}.chk.warning .ico{color:var(--warn)}.chk.info .ico{color:var(--info)}.chk.passed .ico{color:var(--ok)}
+.chk .b{flex:1}.chk .ev{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:2px}
+.stale-banner{display:flex;gap:8px;align-items:center;background:var(--warnbg);color:var(--warn);padding:6px 12px;font-size:13px;border-bottom:1px solid rgba(232,168,42,.3)}
+.sim-banner{background:var(--panel2);color:var(--muted);padding:3px 12px;font-size:12px;border-bottom:1px solid var(--line)}
+.sugg{border:1px solid var(--line2);border-radius:9px;padding:10px 12px;margin-bottom:10px;background:var(--panel)}
+.sugg h5{margin:0 0 4px;font-size:13.5px;display:flex;gap:6px;align-items:center}
+.sugg .why{color:var(--text2);font-size:12.5px;margin:4px 0}.sugg .ev{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.sugg .acts{display:flex;gap:6px;margin-top:8px}
+.bar{height:8px;background:var(--panel3);border-radius:4px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent)}
+.bar.ok i{background:var(--ok)}.bar.err i{background:var(--err)}
+.modal-bg{position:fixed;inset:0;background:rgba(3,6,10,.66);display:grid;place-items:center;z-index:50}
+.modal{background:var(--panel);border:1px solid var(--line2);border-radius:12px;padding:20px;width:min(640px,92vw);max-height:86vh;overflow:auto}
+.modal h2{margin:0 0 8px;font-size:17px}
+.ml{display:grid;grid-template-columns:300px 1fr;gap:0;height:100%;min-height:0}
+.list{border-right:1px solid var(--line);overflow:auto;min-height:0}
+.li{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.li:hover{background:var(--panel)}.li.on{background:var(--accentbg)}
+.li input{width:auto}
+.steps{display:flex;flex-direction:column;gap:8px}
+.step{display:flex;gap:10px;align-items:center;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.menu{position:absolute;right:16px;top:44px;z-index:40;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:10px;width:300px;box-shadow:0 12px 30px rgba(0,0,0,.5)}
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--panel3);border:1px solid var(--line2);border-radius:9px;padding:8px 14px;z-index:60;display:flex;gap:12px;align-items:center}
+.spin{width:14px;height:14px;border:2px solid var(--line2);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;display:inline-block}
+@keyframes sp{to{transform:rotate(360deg)}}
+kbd{font-family:var(--mono);font-size:11.5px;background:var(--panel3);border:1px solid var(--line2);border-radius:4px;padding:0 5px}
+details>summary{cursor:pointer;color:var(--text2)}
+.sqlbox{font-family:var(--mono);font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:8px;white-space:pre-wrap;color:#b9d4f5}
+.diff-add{color:var(--ok)}.diff-del{color:var(--err)}.diff-chg{color:var(--warn)}
+@media (max-width:1280px){.right{width:320px}.palette{width:150px}}
+#app{position:relative}
+.pal.rec{border-color:var(--accent);background:var(--accentbg);color:#fff}
+.pal.rec::after{content:"Next";margin-left:auto;font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase}
+.sect .pal{width:100%}
+.ribbon .btn{flex:none}
+main>.ml{flex:1}
+.studio .work{margin-top:0!important}
+.node:focus-visible{outline:2px solid var(--accent)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.port::before{content:"";position:absolute;inset:-9px}
+.palette{width:190px}.pal span:not(.tag){white-space:normal;line-height:1.2}.pal .tag{flex:none}.pal span:not(.tag){min-width:0}
+.hf{border:1px solid var(--line);border-radius:8px;padding:9px 10px;margin-bottom:10px;background:var(--panel2,transparent)}
+.hf .ai{display:flex;gap:8px;margin-top:8px;padding:8px;border-radius:7px;background:var(--accentbg);font-size:12.5px;line-height:1.4}
+.hf .ai svg{flex:none;color:var(--accent);margin-top:2px}
+.hf .eff{margin-top:8px;padding:8px;border:1px dashed var(--line2);border-radius:7px;font-size:12.5px}
+.node .ft .pill{margin-left:auto;padding:0 6px;font-size:11px}
+
+</style></head><body>
+<div id="app"></div>
+<script>
+'use strict';
+/* ===== Icons ===== */
+const IC = {
+ home:'M3 11l9-8 9 8v10a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1z',
+ catalog:'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6',
+ flow:'M4 4h6v6H4zM14 14h6v6h-6zM10 7h4a2 2 0 0 1 2 2v5',
+ play:'M7 4l13 8-13 8z', table:'M3 5h18v14H3zM3 10h18M9 5v14',
+ join:'M9 6a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM15 6a6 6 0 1 1 0 12 6 6 0 0 1 0-12z',
+ filter:'M3 4h18l-7 8v6l-4 2v-8z', drop_columns:'M4 4h5v16H4zM15 4h5v16h-5z', rename_columns:'M4 20h4L19 9l-4-4L4 16zM13 7l4 4',
+ remove_duplicates:'M8 8h11v11H8zM5 16V5h11', handle_missing:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 12h8',
+ aggregate:'M18 5H6l6 7-6 7h12', derive:'M5 4h14v16H5zM8 8h8M8 12h2M12 12h2M8 16h2M12 16h2', output:'M4 12h12M12 6l6 6-6 6M20 4v16', source:'M3 5h18v14H3zM3 10h18M9 5v14',
+ ai:'M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z',
+ undo:'M9 14L4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3', redo:'M15 14l5-5-5-5M20 9H10a6 6 0 0 0 0 12h3',
+ save:'M5 3h12l4 4v14H5zM8 3v6h8V3M8 21v-7h8v7', tidy:'M4 6h8M4 12h16M4 18h8', fit:'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5',
+ plus:'M12 5v14M5 12h14', minus:'M5 12h14', x:'M6 6l12 12M18 6L6 18', check:'M5 12l5 5 9-10',
+ warn:'M12 3l10 18H2zM12 10v5M12 18v.5', info:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 11v6M12 7.5v.5', error:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM9 9l6 6M15 9l-6 6',
+ passed:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 12l3 3 5-6',
+ key:'M8 14a4 4 0 1 1 3.5-6H21v3h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z', chevron:'M9 6l6 6-6 6', search:'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4',
+ link:'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1', arrow:'M5 12h14M13 6l6 6-6 6',
+ clock:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 7v5l3 2', dataset:'M4 4h16v6H4zM4 14h16v6H4z', migrate:'M4 8h12l-3-3M20 16H8l3 3',
+ history:'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 8v5l3 2', lineage:'M5 5h4v4H5zM15 5h4v4h-4zM10 15h4v4h-4zM7 9v3h10V9M12 12v3',
+ trash:'M5 7h14M10 4h4M7 7l1 13h8l1-13', eye:'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z',
+ upload:'M12 16V4M7 9l5-5 5 5M4 20h16', lock:'M6 11h12v9H6zM9 11V8a3 3 0 0 1 6 0v3', gear:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2',
+ panel:'M3 4h18v16H3zM15 4v16', run:'M5 4l14 8-14 8zM3 3v18', model:'M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12v9M12 12L4 7.5', bell:'M6 9a6 6 0 0 1 12 0c0 6 2 7 2 7H4s2-1 2-7zM10 20h4',
+};
+function ic(n,s){return `<svg class="ico" viewBox="0 0 24 24"${s?` style="width:${s}px;height:${s}px"`:''}><path d="${IC[n]||IC.info}"/></svg>`}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+const fmt=n=>n==null?'-':Number(n).toLocaleString('en-IN');
+const money=n=>n==null?'-':'₹'+Number(n).toLocaleString('en-IN',{maximumFractionDigits:2,minimumFractionDigits:2});
+
+/* ===== Deterministic sample retail data (generated in the browser; nothing is fetched) ===== */
+let _s=20261015; const rnd=()=>((_s=(_s*1664525+1013904223)>>>0)/4294967296);
+const pick=a=>a[Math.floor(rnd()*a.length)], ri=(a,b)=>a+Math.floor(rnd()*(b-a+1));
+const FIRST=['Aarav','Diya','Kabir','Meera','Rohan','Isha','Vikram','Anaya','Arjun','Sana','Neha','Rahul','Pooja','Aditya','Priya','Karan','Tara','Nikhil','Ritu','Sameer'];
+const LAST=['Patil','Shah','Kulkarni','Deshmukh','Joshi','More','Pawar','Jadhav','Gupta','Mehta','Khan','Iyer','Nair','Singh','Reddy'];
+const CITY=['Nashik','Pune','Mumbai','Nagpur','Thane','Aurangabad'];
+const isoDate=(y,m,d)=>`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+const rdate=(y0,y1)=>{const y=ri(y0,y1);return isoDate(y,ri(1,12),ri(1,28))};
+const PRODUCTS=[];['Notebook','Pen set','Backpack','Desk lamp','Water bottle','Headphones','Keyboard','Mouse','Monitor stand','Phone case','Charger','Planner','Mug','Tote bag','Sketchbook','Stapler','Highlighters','Webcam','Cable pack','Mouse pad','Folder','Whiteboard','Calculator','Speaker'].forEach((p,i)=>PRODUCTS.push({product_id:'P'+String(i+1).padStart(2,'0'),product_name:p,category:['Stationery','Accessories','Electronics','Home'][i%4],list_price:ri(4,90)*10}));
+const CUSTOMERS=[];for(let i=0;i<300;i++){const f=pick(FIRST),l=pick(LAST),id=1001+i;CUSTOMERS.push({customer_id:id,customer_name:f+' '+l,email:rnd()<0.045?null:(f+'.'+l+id+'@example.com').toLowerCase(),city:pick(CITY),segment:pick(['Retail','Business','Online']),signup_date:rdate(2023,2025)})}
+[7,120,250].forEach(i=>CUSTOMERS.push({...CUSTOMERS[i]})); // 3 customers were loaded twice (the planted data-quality issue)
+const ORDERS=[],ITEMS=[];let oid=5001,iid=90001;
+CUSTOMERS.slice(0,300).forEach(c=>{if(rnd()<0.9){const n=ri(1,6);for(let k=0;k<n;k++){const id=oid++;const items=ri(1,4);let tot=0;for(let j=0;j<items;j++){const p=pick(PRODUCTS),q=ri(1,5),lt=q*p.list_price;tot+=lt;ITEMS.push({item_id:iid++,order_id:id,product_name:p.product_name,quantity:q,unit_price:p.list_price,line_total:lt})}
+ ORDERS.push({order_id:id,customer_id:c.customer_id,order_date:rdate(2025,2026),status:pick(['Completed','Completed','Shipped','Cancelled']),total_amount:tot})}}});
+for(let k=0;k<3;k++){const id=oid++;const p=pick(PRODUCTS);ITEMS.push({item_id:iid++,order_id:id,product_name:p.product_name,quantity:1,unit_price:p.list_price,line_total:p.list_price});ORDERS.push({order_id:id,customer_id:9001+k,order_date:rdate(2025,2026),status:'Completed',total_amount:p.list_price})} // orphan orders: customer not in customers
+const SESSIONS=[];for(let i=0;i<400;i++)SESSIONS.push({session_id:'S'+(70000+i),customer_id:pick(CUSTOMERS).customer_id,started_at:rdate(2026,2026)+' '+String(ri(0,23)).padStart(2,'0')+':'+String(ri(0,59)).padStart(2,'0'),device:pick(['mobile','desktop','tablet'])});
+const col=(name,type,o={})=>({name,type,pk:!!o.pk,fk:o.fk||null,nullable:!!o.nullable});
+const TABLES={
+ customers:{name:'customers',schema:'retail',rows:CUSTOMERS,desc:'One row per customer (should be unique by customer_id).',cols:[col('customer_id','int',{pk:1}),col('customer_name','text'),col('email','text',{nullable:1}),col('city','text'),col('segment','text'),col('signup_date','date')]},
+ orders:{name:'orders',schema:'retail',rows:ORDERS,desc:'One row per order.',cols:[col('order_id','int',{pk:1}),col('customer_id','int',{fk:'customers.customer_id'}),col('order_date','date'),col('status','text'),col('total_amount','decimal')]},
+ order_items:{name:'order_items',schema:'retail',rows:ITEMS,desc:'One row per product line within an order.',cols:[col('item_id','int',{pk:1}),col('order_id','int',{fk:'orders.order_id'}),col('product_name','text'),col('quantity','int'),col('unit_price','decimal'),col('line_total','decimal')]},
+ products:{name:'products',schema:'retail',rows:PRODUCTS,desc:'Product list.',cols:[col('product_id','text',{pk:1}),col('product_name','text'),col('category','text'),col('list_price','decimal')]},
+ web_sessions:{name:'web_sessions',schema:'retail',rows:SESSIONS,desc:'Website visits.',cols:[col('session_id','text',{pk:1}),col('customer_id','int'),col('started_at','datetime'),col('device','text')]},
+};
+const isNum=t=>t==='int'||t==='decimal';
+const REL=[
+ {id:'r1',from:'orders.customer_id',to:'customers.customer_id',kind:'declared'},
+ {id:'r2',from:'order_items.order_id',to:'orders.order_id',kind:'declared'},
+ {id:'r3',from:'order_items.product_name',to:'products.product_name',kind:'inferred',conf:.86,why:'Same column meaning (product name) and 100% of values found; not a declared key.'},
+ {id:'r4',from:'web_sessions.customer_id',to:'customers.customer_id',kind:'inferred',conf:.92,why:'Same name and type; values overlap strongly; no foreign key is declared.'},
+];
+REL.forEach(r=>{const[a,b]=r.from.split('.'),[c,d]=r.to.split('.');const pv=new Set(TABLES[c].rows.map(x=>x[d]));const ch=TABLES[a].rows.map(x=>x[b]);r.match=ch.filter(v=>pv.has(v)).length/ch.length});
+
+/* ===== Node model ===== */
+const NT={
+ source:{label:'Source table',ports:[],live:1,desc:'Reads one table (read-only).'},
+ join:{label:'Join',ports:['left','right'],live:1,desc:'Combines two inputs on matching columns.'},
+ filter:{label:'Filter rows',ports:['in'],live:1,desc:'Keeps rows that meet conditions.'},
+ drop_columns:{label:'Drop columns',ports:['in'],live:1,desc:'Removes columns you do not need.'},
+ rename_columns:{label:'Rename columns',ports:['in'],live:1,desc:'Gives columns clearer names.'},
+ remove_duplicates:{label:'Remove duplicates',ports:['in'],live:1,desc:'Keeps one row per repeated record.'},
+ handle_missing:{label:'Handle missing',ports:['in'],live:1,desc:'Drops or fills empty values.'},
+ aggregate:{label:'Aggregate',ports:['in'],live:0,desc:'Groups rows and calculates totals, counts, dates.'},
+ derive:{label:'Create column',ports:['in'],live:0,desc:'Calculates a new column from two others.'},
+ output:{label:'Output dataset',ports:['in'],live:1,desc:'The dataset this pipeline produces.'},
+};
+const portsOf=t=>NT[t].ports;
+const OPS={eq:'equals',ne:'does not equal',gt:'greater than',gte:'at least',lt:'less than',lte:'at most',contains:'contains',is_null:'is empty',is_not_null:'is not empty'};
+function defaultConfig(t){switch(t){case 'source':return{table:null,fixes:[]};case 'join':return{type:'left',pairs:[{l:'',r:''}]};case 'filter':return{conds:[{col:'',op:'eq',value:''}]};
+ case 'drop_columns':return{cols:[]};case 'rename_columns':return{map:{}};case 'remove_duplicates':return{cols:[]};case 'handle_missing':return{col:'',action:'drop_rows',value:''};
+ case 'aggregate':return{by:[],metrics:[{fn:'count',col:'',as:'row_count'}]};case 'derive':return{name:'new_column',a:'',op:'mul',b:''};case 'output':return{name:'customer_order_summary'};}return{}}
+const hash=s=>{let h=5381;for(let i=0;i<s.length;i++)h=((h<<5)+h+s.charCodeAt(i))>>>0;return h.toString(36)};
+
+
+/* ===== Table fixes: cleaning that belongs to one table (Data health) ===== */
+const medianOf=a=>{const s=a.slice().sort((x,y)=>x-y),m=s.length>>1;return s.length?(s.length%2?s[m]:(s[m-1]+s[m])/2):null};
+function modeOf(a){const m=new Map();a.forEach(v=>m.set(v,(m.get(v)||0)+1));let b=null,bn=0;m.forEach((n,v)=>{if(n>bn){b=v;bn=n}});return b}
+function fillValue(fx,rows){const vs=rows.map(r=>r[fx.col]).filter(v=>v!=null);const r2=v=>v==null?null:Math.round(v*100)/100;
+ if(fx.how==='median')return r2(medianOf(vs.map(Number)));if(fx.how==='mean')return vs.length?r2(vs.reduce((a,b)=>a+Number(b),0)/vs.length):null;if(fx.how==='mode')return modeOf(vs);return fx.value}
+function applyFixes(cols,rows,fixes){
+ for(const fx of (fixes||[])){
+  if(fx.kind==='dedupe'){const seen=new Set();rows=rows.filter(r=>{const k=r[fx.col];if(k==null)return true;if(seen.has(k))return false;seen.add(k);return true})}
+  else if(fx.kind==='drop_rows')rows=rows.filter(r=>r[fx.col]!=null);
+  else if(fx.kind==='fill'){const v=fillValue(fx,rows);rows=rows.map(r=>r[fx.col]==null?{...r,[fx.col]:v}:r)}
+  else if(fx.kind==='drop_col'){cols=cols.filter(c=>c.name!==fx.col);rows=rows.map(r=>{const o={...r};delete o[fx.col];return o})}
+ }
+ return{cols,rows}}
+const PLANNED_FILL=['median','mean','mode'];
+const isPlannedFix=fx=>fx.kind==='fill'&&PLANNED_FILL.includes(fx.how);
+function tableHealth(tname,fixes){const t=TABLES[tname];const r=applyFixes(t.cols.map(c=>({...c})),t.rows,fixes);const F=[];
+ r.cols.forEach(c=>{const n=r.rows.filter(x=>x[c.name]==null).length;
+  if(n)F.push({id:'null:'+c.name,kind:'null',col:c.name,type:c.type,n,pct:n/r.rows.length,total:r.rows.length,reviewed:(fixes||[]).some(f=>f.kind==='keep'&&f.col===c.name)});
+  if(c.pk){const cnt=new Map();r.rows.forEach(x=>{const v=x[c.name];if(v!=null)cnt.set(v,(cnt.get(v)||0)+1)});let keys=0,extra=0;cnt.forEach(v=>{if(v>1){keys++;extra+=v-1}});if(extra)F.push({id:'dup:'+c.name,kind:'dup',col:c.name,type:c.type,keys,extra,total:r.rows.length,reviewed:false})}});
+ return{findings:F,rows:r.rows.length,cols:r.cols.length}}
+function recommend(f){
+ if(f.kind==='dup')return{pick:'dedupe',why:`${f.col} should identify exactly one row, but ${f.keys} value${f.keys>1?'s appear':' appears'} more than once (${f.extra} extra row${f.extra>1?'s':''}). Every join on it would copy those rows again. Keeping the first row of each value is the safe fix.`};
+ const nm=f.col.toLowerCase(),pct=(100*f.pct).toFixed(1);
+ if(f.pct>0.4)return{pick:'drop_col',why:`${pct}% is empty, so this column tells you very little. Dropping it is usually cleaner than filling most of it with a guess.`};
+ if(isNum(f.type))return{pick:'median',why:'The usual choice for numbers: the median is not pulled up by a few very large values. Choose the average only when the values are spread evenly.'};
+ if(/mail|phone|mobile|name|address/.test(nm))return{pick:'keep',why:`A real ${f.col} cannot be guessed. Filling it would invent false data. Keeping it blank is honest; a later step or a model can treat it as unknown.`};
+ if(f.type==='date'||f.type==='datetime')return{pick:'keep',why:'A missing date cannot be guessed. Keep it blank.'};
+ return{pick:'mode',why:'This is a category, so the most common value is the least risky fill. Do this only if empty really means "unknown".'}}
+function optionsFor(f){if(f.kind==='dup')return['dedupe','keep'];const txt=!isNum(f.type)&&f.type!=='date'&&f.type!=='datetime';return[...(isNum(f.type)?['median','mean']:[]),...(txt?['mode']:[]),'value','keep','drop_rows','drop_col']}
+const CHOICE_LABEL={keep:'Keep blank',drop_rows:'Remove the rows with no value',median:'Fill with the median',mean:'Fill with the average',mode:'Fill with the most common value',value:'Fill with a value I type',drop_col:'Drop the column',dedupe:'Keep one row per value'};
+function mkFix(f,choice,val){if(['median','mean','mode','value'].includes(choice))return{col:f.col,kind:'fill',how:choice,value:choice==='value'?val:undefined};return{col:f.col,kind:choice}}
+function fixText(fx){switch(fx.kind){case 'fill':return `${fx.col}: ${fx.how==='value'?'fill with "'+fx.value+'"':fx.how==='median'?'fill empty with the median':fx.how==='mean'?'fill empty with the average':'fill empty with the most common value'}`;
+ case 'keep':return `${fx.col}: keep blank (you reviewed this)`;case 'drop_rows':return `${fx.col}: remove rows with no value`;case 'drop_col':return `${fx.col}: column dropped`;default:return `${fx.col}: keep one row per value`}}
+function fixEffect(tname,fixes,fx){const t=TABLES[tname];const a=applyFixes(t.cols,t.rows,fixes),b=applyFixes(t.cols,t.rows,[...(fixes||[]),fx]);const idc=t.cols[0].name;
+ const emp=x=>x.cols.some(c=>c.name===fx.col)?x.rows.filter(r=>r[fx.col]==null).length:0;const sample=[];let fillv=null;
+ if(fx.kind==='fill'){fillv=fillValue(fx,a.rows);a.rows.filter(r=>r[fx.col]==null).slice(0,3).forEach(r=>sample.push(`${idc} ${r[idc]}: empty → ${fillv==null?'still empty':fillv}`))}
+ if(fx.kind==='drop_rows')a.rows.filter(r=>r[fx.col]==null).slice(0,3).forEach(r=>sample.push(`${idc} ${r[idc]} would be removed`));
+ if(fx.kind==='dedupe'){const cnt=new Map();a.rows.forEach(r=>{const v=r[fx.col];if(v!=null)cnt.set(v,(cnt.get(v)||0)+1)});[...cnt].filter(x=>x[1]>1).slice(0,3).forEach(([v,n])=>sample.push(`${fx.col} ${v} appears ${n} times → 1`))}
+ return{rowsBefore:a.rows.length,rowsAfter:b.rows.length,emptyBefore:emp(a),emptyAfter:emp(b),colGone:fx.kind==='drop_col',sample,fillv}}
+
+/* ===== Evaluation engine: real calculations on the sample data above ===== */
+const keyOf=(r,cs)=>{const k=[];for(const c of cs){const v=r[c];if(v==null)return null;k.push(v)}return k.join('\u0001')};
+function doJoin(L,R,cfg){
+ const lk=cfg.pairs.map(p=>p.l),rk=cfg.pairs.map(p=>p.r),idx=new Map();
+ R.rows.forEach(r=>{const k=keyOf(r,rk);if(k==null)return;let a=idx.get(k);if(!a)idx.set(k,a=[]);a.push(r)});
+ const lnames=new Set(L.cols.map(c=>c.name)),map={},rcols=[];
+ R.cols.forEach(c=>{const i=rk.indexOf(c.name);if(i>=0&&lk[i]===c.name)return;const out=lnames.has(c.name)?c.name+'_r':c.name;map[c.name]=out;rcols.push({...c,name:out})});
+ const cols=[...L.cols,...rcols],rows=[],used=new Set(),type=cfg.type;
+ const nullR={};rcols.forEach(c=>nullR[c.name]=null);
+ L.rows.forEach(l=>{const k=keyOf(l,lk),m=k==null?null:idx.get(k);
+  if(m){m.forEach(r=>{used.add(r);const o={...l};for(const c in map)o[map[c]]=r[c];rows.push(o)})}
+  else if(type==='left'||type==='full')rows.push({...l,...nullR})});
+ if(type==='right'||type==='full'){R.rows.forEach(r=>{if(used.has(r))return;const o={};L.cols.forEach(c=>o[c.name]=null);lk.forEach((n,i)=>{o[n]=r[rk[i]]});for(const c in map)o[map[c]]=r[c];rows.push(o)})}
+ return{cols,rows}}
+function measureJoin(L,R,cfg){
+ const lk=cfg.pairs.map(p=>p.l),rk=cfg.pairs.map(p=>p.r),idx=new Map(),lcount=new Map();
+ R.rows.forEach(r=>{const k=keyOf(r,rk);if(k==null)return;idx.set(k,(idx.get(k)||0)+1)});
+ L.rows.forEach(l=>{const k=keyOf(l,lk);if(k==null)return;lcount.set(k,(lcount.get(k)||0)+1)});
+ let matched=0,leftNull=0,leftDupRows=0;const lseen=new Set();
+ L.rows.forEach(l=>{const k=keyOf(l,lk);if(k==null){leftNull++;return}if(idx.has(k))matched++;if(lcount.get(k)>1)leftDupRows++});
+ let rightUnmatched=0;const lset=new Set(lcount.keys());R.rows.forEach(r=>{const k=keyOf(r,rk);if(k==null||!lset.has(k))rightUnmatched++});
+ let maxR=0;idx.forEach(v=>{if(v>maxR)maxR=v});
+ const out=doJoin(L,R,cfg).rows.length;
+ const base=cfg.type==='right'?R.rows.length:L.rows.length;
+ const card=(lc=>`${[...lcount.values()].some(v=>v>1)?'many':'one'}-to-${maxR>1?'many':'one'}`)();
+ return{leftRows:L.rows.length,rightRows:R.rows.length,out,matched,unmatchedLeft:L.rows.length-matched-leftNull,leftNull,rightUnmatched,maxPerKey:maxR,leftDupRows,cardinality:card,
+  matchPct:L.rows.length?matched/L.rows.length:0,extra:Math.max(0,out-base),fanOut:out>base&&(cfg.type==='left'||cfg.type==='inner'||cfg.type==='right'),baseRows:base}}
+function cmpv(c,v){return isNum(c.type)?Number(v):String(v)}
+function doAgg(I,cfg){
+ const groups=new Map();I.rows.forEach(r=>{const k=cfg.by.map(c=>r[c]).join('\u0001');let g=groups.get(k);if(!g)groups.set(k,g={r,rows:[]});g.rows.push(r)});
+ const cols=cfg.by.map(n=>I.cols.find(c=>c.name===n)).filter(Boolean).map(c=>({...c}));
+ cfg.metrics.forEach(m=>{const src=I.cols.find(c=>c.name===m.col);const t=m.fn==='count'||m.fn==='count_distinct'?'int':(m.fn==='min'||m.fn==='max')&&src?src.type:'decimal';
+  cols.push({name:m.as,type:t,origin:src?src.origin:[],via:`${m.fn}(${m.col||'*'})`})});
+ const rows=[];groups.forEach(g=>{const o={};cfg.by.forEach(c=>o[c]=g.r[c]);
+  cfg.metrics.forEach(m=>{const vs=g.rows.map(r=>m.col?r[m.col]:1);const nn=vs.filter(v=>v!=null);let v=null;
+   switch(m.fn){case 'count':v=m.col?nn.length:g.rows.length;break;case 'count_distinct':v=new Set(nn).size;break;case 'sum':v=nn.reduce((a,b)=>a+Number(b),0);break;
+    case 'avg':v=nn.length?nn.reduce((a,b)=>a+Number(b),0)/nn.length:null;break;case 'min':v=nn.length?nn.reduce((a,b)=>b<a?b:a):null;break;case 'max':v=nn.length?nn.reduce((a,b)=>b>a?b:a):null;break}
+   o[m.as]=v});rows.push(o)});
+ return{cols,rows}}
+function condOk(r,c,cd){const v=r[cd.col];if(cd.op==='is_null')return v==null;if(cd.op==='is_not_null')return v!=null;if(v==null)return false;const col=cd.colMeta;const a=cmpv(col,v),b=cmpv(col,cd.value);
+ switch(cd.op){case 'eq':return a===b;case 'ne':return a!==b;case 'gt':return a>b;case 'gte':return a>=b;case 'lt':return a<b;case 'lte':return a<=b;case 'contains':return String(v).toLowerCase().includes(String(cd.value).toLowerCase())}return true}
+function evalNode(n,ins){
+ const I=ins[0]||{cols:[],rows:[]};
+ switch(n.type){
+  case 'source':{const t=TABLES[n.config.table];if(!t)return{cols:[],rows:[]};return applyFixes(t.cols.map(c=>({name:c.name,type:c.type,origin:[t.name+'.'+c.name]})),t.rows,n.config.fixes)}
+  case 'join':return doJoin(ins[0]||{cols:[],rows:[]},ins[1]||{cols:[],rows:[]},n.config);
+  case 'filter':{const cs=n.config.conds.filter(c=>c.col).map(c=>({...c,colMeta:I.cols.find(x=>x.name===c.col)||{type:'text'}}));return{cols:I.cols,rows:I.rows.filter(r=>cs.every(c=>condOk(r,c.colMeta?c:c,c)))}}
+  case 'drop_columns':{const d=new Set(n.config.cols);return{cols:I.cols.filter(c=>!d.has(c.name)),rows:I.rows.map(r=>{const o={...r};d.forEach(k=>delete o[k]);return o})}}
+  case 'rename_columns':{const m=n.config.map;return{cols:I.cols.map(c=>m[c.name]?{...c,name:m[c.name]}:c),rows:I.rows.map(r=>{const o={};for(const k in r)o[m[k]||k]=r[k];return o})}}
+  case 'remove_duplicates':{const cs=n.config.cols.length?n.config.cols:I.cols.map(c=>c.name),seen=new Set();return{cols:I.cols,rows:I.rows.filter(r=>{const k=cs.map(c=>r[c]).join('\u0001');if(seen.has(k))return false;seen.add(k);return true})}}
+  case 'handle_missing':{const c=n.config;if(!c.col)return I;return c.action==='drop_rows'?{cols:I.cols,rows:I.rows.filter(r=>r[c.col]!=null)}:{cols:I.cols,rows:I.rows.map(r=>r[c.col]==null?{...r,[c.col]:c.value}:r)}}
+  case 'aggregate':return doAgg(I,n.config);
+  case 'derive':{const c=n.config;const f=(a,b)=>a==null||b==null?null:c.op==='mul'?a*b:c.op==='add'?a+b:c.op==='sub'?a-b:(b?a/b:null);
+   const A=I.cols.find(x=>x.name===c.a),B=I.cols.find(x=>x.name===c.b);return{cols:[...I.cols,{name:c.name,type:'decimal',origin:[...(A?A.origin:[]),...(B?B.origin:[])],via:'calculated'}],rows:I.rows.map(r=>({...r,[c.name]:f(r[c.a],r[c.b])}))}}
+  case 'output':return I}
+ return I}
+
+/* ===== Pipeline helpers (pure functions of a pipeline object {nodes,edges}) ===== */
+const nodeById=(p,id)=>p.nodes.find(n=>n.id===id);
+const inputsOf=(p,id)=>{const n=nodeById(p,id);return portsOf(n.type).map(port=>{const e=p.edges.find(e=>e.to===id&&e.port===port);return e?e.from:null})};
+function sigs(p){const memo={};const f=id=>{if(memo[id])return memo[id];memo[id]='~';const n=nodeById(p,id);if(!n)return '';const s=hash(n.type+JSON.stringify(n.config)+inputsOf(p,id).map(i=>i?f(i):'-').join('|'));return memo[id]=s};p.nodes.forEach(n=>f(n.id));return memo}
+const RCACHE=new Map();
+function resultOf(p,id,S=sigs(p)){const k=S[id];if(RCACHE.has(k))return RCACHE.get(k);const n=nodeById(p,id);const ins=inputsOf(p,id).map(i=>i?resultOf(p,i,S):null);
+ if(ins.some((x,i)=>!x&&portsOf(n.type).length&&true)&&n.type!=='source'){const r={cols:[],rows:[],missing:true};RCACHE.set(k,r);return r}
+ const r=evalNode(n,ins);RCACHE.set(k,r);return r}
+function topo(p){const out=[],seen=new Set();const v=id=>{if(seen.has(id))return;seen.add(id);inputsOf(p,id).forEach(i=>i&&v(i));out.push(id)};p.nodes.forEach(n=>v(n.id));return out}
+function wouldCycle(p,from,to){const down=new Set();const walk=id=>p.edges.filter(e=>e.from===id).forEach(e=>{if(!down.has(e.to)){down.add(e.to);walk(e.to)}});walk(to);return from===to||down.has(from)}
+function nodeIssues(p,n){const is=[],ins=inputsOf(p,n.id),c=n.config,r=ins.map(i=>i?resultOf(p,i):null);const has=(x,i)=>r[i]&&r[i].cols.some(k=>k.name===x);
+ ins.forEach((x,i)=>{if(!x)is.push(`Connect the ${portsOf(n.type)[i]==='in'?'input':portsOf(n.type)[i]+' input'}.`)});
+ switch(n.type){case 'source':if(!c.table)is.push('Choose a table.');break;
+  case 'join':if(!c.pairs.length||c.pairs.some(q=>!q.l||!q.r))is.push('Choose the matching columns.');else if(r[0]&&r[1]&&c.pairs.some(q=>!has(q.l,0)||!has(q.r,1)))is.push('A chosen column no longer exists on an input.');break;
+  case 'filter':if(!c.conds.some(q=>q.col))is.push('Add at least one condition.');break;case 'drop_columns':if(!c.cols.length)is.push('Choose columns to drop.');break;
+  case 'rename_columns':if(!Object.keys(c.map).length)is.push('Rename at least one column.');break;case 'handle_missing':if(!c.col)is.push('Choose a column.');break;
+  case 'aggregate':if(!c.by.length)is.push('Choose the columns to group by.');if(c.metrics.some(m=>!m.as||(m.fn!=='count'&&!m.col)))is.push('Complete every calculation.');break;
+  case 'derive':if(!c.a||!c.b||!c.name)is.push('Choose two columns and a name.');break;case 'output':if(!c.name)is.push('Name the dataset.');break}
+ return is}
+function nodeSummary(p,n){const c=n.config;switch(n.type){case 'source':{if(!c.table)return 'No table chosen';const nf=(c.fixes||[]).filter(f=>f.kind!=='keep').length;return `${TABLES[c.table].schema}.${c.table}${nf?` · ${nf} fix${nf>1?'es':''}`:''}`}
+ case 'join':return c.pairs[0]&&c.pairs[0].l?`${c.type.toUpperCase()} · ${c.pairs.map(q=>q.l+' = '+q.r).join(', ')}`:`${c.type.toUpperCase()} · not configured`;
+ case 'filter':{const q=c.conds.filter(x=>x.col);return q.length?q.map(x=>`${x.col} ${OPS[x.op]} ${['is_null','is_not_null'].includes(x.op)?'':x.value}`).join(' and '):'No condition yet'}
+ case 'drop_columns':return c.cols.length?'Drops '+c.cols.join(', '):'No columns chosen';case 'rename_columns':return Object.keys(c.map).length?Object.entries(c.map).map(([a,b])=>a+' → '+b).join(', '):'Nothing renamed';
+ case 'remove_duplicates':return c.cols.length?'Same '+c.cols.join(' + '):'Identical rows';case 'handle_missing':return c.col?`${c.col}: ${c.action==='drop_rows'?'drop empty rows':'fill with "'+c.value+'"'}`:'Not configured';
+ case 'aggregate':return c.by.length?`Group by ${c.by.join(', ')}`:'Not configured';case 'derive':return c.a?`${c.name} = ${c.a} ${{mul:'×',add:'+',sub:'−',div:'÷'}[c.op]} ${c.b}`:'Not configured';case 'output':return c.name}return ''}
+function nodeSql(p,n){const ins=inputsOf(p,n.id),c=n.config,nm=i=>ins[i]||'?';
+ switch(n.type){case 'source':return `SELECT * FROM ${c.table?'retail.'+c.table:'?'}`+((c.fixes||[]).filter(f=>f.kind!=='keep').length?'\n-- Table fixes applied: '+c.fixes.filter(f=>f.kind!=='keep').map(fixText).join('; '):'');
+  case 'join':return `SELECT *\nFROM ${nm(0)} l\n${c.type.toUpperCase()} JOIN ${nm(1)} r\n  ON ${c.pairs.map(q=>`l.${q.l||'?'} = r.${q.r||'?'}`).join(' AND ')}`;
+  case 'filter':return `SELECT * FROM ${nm(0)}\nWHERE ${c.conds.filter(x=>x.col).map(x=>`${x.col} ${{eq:'=',ne:'<>',gt:'>',gte:'>=',lt:'<',lte:'<=',contains:'LIKE',is_null:'IS NULL',is_not_null:'IS NOT NULL'}[x.op]} ${['is_null','is_not_null'].includes(x.op)?'':"'"+x.value+"'"}`).join('\n  AND ')||'1=1'}`;
+  case 'remove_duplicates':return `SELECT * FROM (\n  SELECT *, ROW_NUMBER() OVER (PARTITION BY ${(c.cols.length?c.cols:['<all columns>']).join(', ')} ORDER BY (SELECT 0)) rn\n  FROM ${nm(0)}) t WHERE rn = 1`;
+  case 'aggregate':return `SELECT ${[...c.by,...c.metrics.map(m=>`${m.fn==='count_distinct'?'COUNT(DISTINCT '+m.col+')':m.fn.toUpperCase()+'('+(m.col||'*')+')'} AS ${m.as}`)].join(', ')}\nFROM ${nm(0)}\nGROUP BY ${c.by.join(', ')}`;
+  default:return `-- ${NT[n.type].label}: applied to ${nm(0)}`}}
+
+/* ===== State ===== */
+const LS='dios-ux-prototype-draft-v1';
+const NW=196,NH=92;
+const emptyPipe=()=>({nodes:[],edges:[]});
+let S={route:'home',pipe:emptyPipe(),name:'Untitled pipeline',
+ catalog:{sel:[],active:'customers',tab:'schema',q:'',stale:false},
+ ui:{sel:null,dock:'preview',dockSize:'normal',right:'settings',rightOpen:true,palette:true,stage:null,view:{x:30,y:30,k:1},mini:true,prevSide:'output',histTab:'lineage',lineageCol:null,failSim:false,menu:false,busy:{},
+  dismissed:{},modal:null,showAllInfo:false,dsSel:null,dsTab:'overview',migStep:0,propChecked:{},saved:null},
+ previews:{},meas:{},acks:{},val:null,runs:[],run:null,datasets:[],versions:[],
+ hist:{past:[],future:[],cur:'Start'},toast:null,proposal:null,chat:[],handoffChoice:null,backup:null,migDecisions:{},dirty:false};
+const $=s=>document.querySelector(s);
+const P=()=>S.pipe;
+let seq=0;const nextId=type=>{const base={remove_duplicates:'dedupe',drop_columns:'drop',rename_columns:'rename',handle_missing:'missing',aggregate:'aggregate',derive:'derive'}[type]||type;let i=1;while(S.pipe.nodes.some(n=>n.id===base+'_'+i))i++;return base+'_'+i};
+function snap(){return JSON.stringify({pipe:S.pipe,name:S.name})}
+function restore(s){const o=JSON.parse(s);S.pipe=o.pipe;S.name=o.name}
+function commit(label){if(S.suspend)return;S.hist.past.push({label:S.hist.cur,snap:snap()});if(S.hist.past.length>80)S.hist.past.shift();S.hist.future=[];S.hist.cur=label;S.dirty=true;S.ui.stage=null}
+function commitPre(label,pre){if(S.suspend)return;S.hist.past.push({label:S.hist.cur,snap:pre});S.hist.future=[];S.hist.cur=label;S.dirty=true;S.ui.stage=null}
+function undo(){const e=S.hist.past.pop();if(!e)return;S.hist.future.push({label:S.hist.cur,snap:snap()});restore(e.snap);S.hist.cur=e.label;afterGraphChange('Undid')}
+function redo(){const e=S.hist.future.pop();if(!e)return;S.hist.past.push({label:S.hist.cur,snap:snap()});restore(e.snap);S.hist.cur=e.label;afterGraphChange('Redid')}
+function afterGraphChange(){if(S.ui.sel&&!nodeById(S.pipe,S.ui.sel))S.ui.sel=null;S.dirty=true;persist();refresh()}
+function persist(){}
+function writeDraft(){try{localStorage.setItem(LS,JSON.stringify({name:S.name,pipe:S.pipe,versions:S.versions,runs:S.runs,datasets:S.datasets,view:S.ui.view,saved:S.ui.saved}))}catch(e){}}
+function loadDraft(){try{const o=JSON.parse(localStorage.getItem(LS)||'null');if(!o||!o.pipe||!o.pipe.nodes.length)return false;S.name=o.name;S.pipe=o.pipe;S.versions=o.versions||[];S.runs=o.runs||[];S.datasets=o.datasets||[];S.ui.saved=o.saved||null;S.hist={past:[],future:[],cur:'Opened saved draft'};return true}catch(e){return false}}
+const hasDraft=()=>{try{const o=JSON.parse(localStorage.getItem(LS)||'null');return !!(o&&o.pipe&&o.pipe.nodes.length)}catch(e){return false}};
+function resetAll(){try{localStorage.removeItem(LS)}catch(e){}RCACHE.clear();location.reload()}
+function toast(msg,act){S.toast={msg,act};render('toast');clearTimeout(toast.t);toast.t=setTimeout(()=>{S.toast=null;render('toast')},act?7000:3200)}
+
+/* ===== Graph operations ===== */
+function posFor(){const v=S.ui.view,box=$('#cv');const w=box?box.clientWidth:900,h=box?box.clientHeight:500;const n=P().nodes.length;return{x:Math.round((w/2-v.x)/v.k-NW/2+(n%4)*30),y:Math.round((h/2-v.y)/v.k-NH/2+(n%4)*30)}}
+function addNode(type,cfg,pos,label){commit(label||'Add '+NT[type].label);const id=nextId(type);const p=pos||posFor();P().nodes.push({id,type,x:p.x,y:p.y,config:cfg||defaultConfig(type)});S.ui.sel=id;S.ui.right='settings';S.ui.rightOpen=true;persist();refresh();return id}
+function removeNode(id){const n=nodeById(P(),id);if(!n)return;commit('Remove '+id);S.pipe.nodes=S.pipe.nodes.filter(x=>x.id!==id);S.pipe.edges=S.pipe.edges.filter(e=>e.from!==id&&e.to!==id);if(S.ui.sel===id)S.ui.sel=null;persist();refresh()}
+function connect(from,to,port){const p=P(),a=nodeById(p,from),b=nodeById(p,to);if(!a||!b)return 'Missing node.';if(a.type==='output')return 'An output step has nothing after it.';if(b.type==='source')return 'A source table has no input.';
+ if(!portsOf(b.type).includes(port))return 'That input does not exist.';if(wouldCycle(p,from,to))return 'That would make a loop. Data must flow in one direction.';
+ const old=p.edges.find(e=>e.to===to&&e.port===port);if(old&&old.from===from)return null;commit(`Connect ${from} → ${to}`);if(old)S.pipe.edges=S.pipe.edges.filter(e=>e!==old);S.pipe.edges.push({from,to,port});persist();refresh();return null}
+function removeEdge(i){const e=S.pipe.edges[i];if(!e)return;commit(`Disconnect ${e.from} → ${e.to}`);S.pipe.edges.splice(i,1);persist();refresh()}
+function setCfg(id,fn,label){const n=nodeById(P(),id);if(!n)return;commit(label||'Edit '+id);fn(n.config,n);persist();refresh()}
+function insertAfter(srcId,type,cfg,label){ // put a new node between srcId and its consumers
+ commit(label||'Add '+NT[type].label);const s=nodeById(P(),srcId),id=nextId(type);const cons=P().edges.filter(e=>e.from===srcId);
+ const x=s.x+NW+40,y=s.y;P().nodes.push({id,type,x,y,config:cfg});cons.forEach(e=>e.from=id);P().edges.push({from:srcId,to:id,port:'in'});
+ const T0=layoutNodes(P());P().nodes.forEach(n=>{n.x=T0[n.id].x;n.y=T0[n.id].y});S.ui.sel=id;persist();refresh();setTimeout(fitView,30);return id}
+function tidy(){const pre=snap();const T0=layoutNodes(P());let moved=false;P().nodes.forEach(n=>{if(n.x!==T0[n.id].x||n.y!==T0[n.id].y)moved=true;n.x=T0[n.id].x;n.y=T0[n.id].y});if(!moved){toast('Layout is already tidy.');return}commitPre('Tidy layout',pre);persist();refresh();setTimeout(fitView,20);toast('Layout tidied.',{label:'Undo',fn:'undo'})}
+function layoutNodes(p){const L={},topoIds=topo(p);topoIds.forEach(id=>{const ins=inputsOf(p,id).filter(Boolean);L[id]=ins.length?Math.max(...ins.map(i=>L[i]))+1:0});
+ p.nodes.filter(n=>n.type==='source').forEach(n=>{const cons=p.edges.filter(e=>e.from===n.id).map(e=>L[e.to]);if(cons.length)L[n.id]=Math.min(...cons)-1});
+ const max=Math.max(0,...Object.values(L)),layers=[];for(let i=0;i<=max;i++)layers.push(p.nodes.filter(n=>L[n.id]===i).map(n=>n.id));
+ const Y={},GX=44,GY=24,pos={};
+ layers.forEach((ids,li)=>{const want=ids.map((id,i)=>{const ins=inputsOf(p,id).filter(x=>x&&Y[x]!=null);return{id,w:ins.length?ins.reduce((a,x)=>a+Y[x],0)/ins.length:i*(NH+GY)+(li?0:0)}});
+  want.sort((a,b)=>a.w-b.w);let y=-1e9;want.forEach(o=>{const yy=Math.max(o.w,y+NH+GY);Y[o.id]=yy;y=yy})});
+ const minY=Math.min(0,...Object.values(Y));p.nodes.map(n=>n.id).forEach(id=>{pos[id]={x:40+L[id]*(NW+GX),y:30+Y[id]-minY}});return pos}
+
+/* ===== Derived pipeline state ===== */
+const pipeSig=()=>{const s=sigs(P());return hash(Object.values(s).sort().join()+JSON.stringify(S.acks)+P().nodes.length)};
+const SG=()=>sigs(P());
+function nodeState(n){ // status dot + label shown on the node
+ const sg=SG(),issues=nodeIssues(P(),n);if(S.run&&S.run.sig===pipeSig()&&S.run.steps[n.id])return{k:S.run.steps[n.id],t:S.run.steps[n.id]};
+ if(issues.length)return{k:'ready',t:'Needs setup'};
+ const pv=S.previews[n.id],m=S.meas[n.id];
+ if(n.type==='join'&&m&&m.sig===sg[n.id]&&m.m.fanOut&&S.acks[n.id]!==m.sig)return{k:'warn',t:'Review repeated rows'};
+ if(S.val&&S.val.checks.some(c=>c.level==='error'&&c.node===n.id)&&S.val.sig===pipeSig())return{k:'err',t:'Validation error'};
+ if(pv){return pv.sig===sg[n.id]?{k:'fresh',t:'Preview is current'}:{k:'stale',t:'Preview is out of date'}}
+ return{k:'ready',t:'Not previewed yet'}}
+function ancestors(id,set=new Set()){inputsOf(P(),id).forEach(i=>{if(i&&!set.has(i)){set.add(i);ancestors(i,set)}});return set}
+const outputNode=()=>P().nodes.find(n=>n.type==='output');
+function joinStatus(j){const sg=SG(),m=S.meas[j.id];if(nodeIssues(P(),j).length)return 'setup';if(!m||m.sig!==sg[j.id])return m?'outdated':'unmeasured';if(m.m.fanOut&&S.acks[j.id]!==m.sig)return 'review';return 'ok'}
+function runChecks(){
+ const p=P(),out=outputNode(),sg=SG(),checks=[];if(!out)return checks;const R=resultOf(p,out.id,sg);const add=c=>checks.push(c);
+ const order=topo(p);
+ // key uniqueness on join inputs
+ p.nodes.filter(n=>n.type==='join').forEach(j=>{[0,1].forEach(side=>{const src=inputsOf(p,j.id)[side];if(!src)return;const res=resultOf(p,src,sg);const cn=j.config.pairs[0]&&j.config.pairs[0][side?'r':'l'];const meta=res.cols.find(c=>c.name===cn);if(!meta||!meta.origin||!meta.origin.length)return;
+  const [t,c0]=meta.origin[0].split('.');const tm=TABLES[t];if(!tm||!tm.cols.find(c=>c.name===c0&&c.pk))return;
+  const cnt=new Map();res.rows.forEach(r=>{const v=r[cn];if(v==null)return;cnt.set(v,(cnt.get(v)||0)+1)});let dk=0,ex=0;cnt.forEach(v=>{if(v>1){dk++;ex+=v-1}});
+  const id=`key:${t}.${c0}`;if(checks.some(c=>c.id===id))return;
+  if(dk){add({id,level:'error',title:`${t}.${c0} should be unique but repeats`,plain:src===j.id||inputsOf(p,j.id)[side]!==undefined&&nodeById(p,src).type==='source'?`${dk} ${c0} value${dk>1?'s appear':' appears'} more than once in ${src} (${ex} extra rows). Every join that uses them repeats the matching rows again, which inflates counts and totals.`:`${c0} appears more than once in the output of ${src}: rows were repeated by an earlier step.`,evidence:`${dk} repeated key${dk>1?'s':''}, ${ex} extra row${ex>1?'s':''}, measured in the output of ${src}`,node:src,fixKey:nodeById(p,src).type==='source'?{type:'remove_duplicates',after:src,cols:[c0]}:null})}
+  else add({id,level:'passed',title:`${t}.${c0} is unique`,plain:'Each key value appears once, so the join cannot repeat these rows by accident.',evidence:`${cnt.size} distinct of ${res.rows.filter(r=>r[cn]!=null).length} non-empty values in ${src}`,node:src})})});
+ // join repeated-rows review
+ p.nodes.filter(n=>n.type==='join').forEach(j=>{const m=S.meas[j.id];if(!m||m.sig!==sg[j.id]||!m.m.fanOut)return;const a=S.acks[j.id]===m.sig;
+  add({id:'fan:'+j.id,level:a?'info':'warning',title:a?`${j.id} repeats rows (you accepted this)`:`${j.id} repeats rows and still needs your review`,plain:`${fmt(m.m.baseRows)} rows became ${fmt(m.m.out)}. Check that later steps (such as the Aggregate step) return the data to the grain you want.`,evidence:`measured ${fmt(m.m.baseRows)} → ${fmt(m.m.out)} rows (+${fmt(m.m.extra)})`,node:j.id})});
+ // reconciliation
+ const ag=p.nodes.find(n=>n.type==='aggregate'&&ancestors(out.id).has(n.id));
+ if(ag){const sm=ag.config.metrics.find(m=>m.fn==='sum'&&R.cols.find(c=>c.name===m.as&&(c.origin||[]).includes('order_items.line_total')));
+  if(sm){const cs=new Set(TABLES.customers.rows.map(x=>x.customer_id));const od=new Set(TABLES.orders.rows.filter(o=>cs.has(o.customer_id)).map(o=>o.order_id));const exp=TABLES.order_items.rows.filter(i=>od.has(i.order_id)).reduce((a,x)=>a+x.line_total,0);const act=R.rows.reduce((a,x)=>a+(x[sm.as]||0),0);const diff=act-exp;
+   const src=nodeById(p,'customers')&&p.nodes.find(n=>n.type==='source'&&n.config.table==='customers');
+   if(Math.abs(diff)>0.005)add({id:'recon',level:'error',title:`${sm.as} does not match the order lines`,plain:`The dataset adds up to ${money(act)} but the order lines of these customers add up to ${money(exp)}. The difference of ${money(diff)} usually means some rows were counted twice.`,evidence:`dataset ${money(act)} vs source ${money(exp)} (difference ${money(diff)})`,node:ag.id});
+   else add({id:'recon',level:'passed',title:`${sm.as} matches the order lines`,plain:'The total in the dataset equals the sum of the order lines for the same customers.',evidence:`dataset ${money(act)} = source ${money(exp)}`,node:ag.id})}
+  const by=ag.config.by,seen=new Set();let dup=0;R.rows.forEach(r=>{const k=by.map(c=>r[c]).join('\u0001');if(seen.has(k))dup++;seen.add(k)});
+  add({id:'grain',level:dup?'error':'passed',title:dup?'Output is not one row per group':`Output has one row per ${by[0]||'group'}`,plain:dup?'Some groups appear more than once.':'The final dataset is at the grain you asked for.',evidence:`${fmt(R.rows.length)} rows, ${fmt(seen.size)} distinct ${by[0]||'group'} values`,node:ag.id})}
+ // volume
+ const cn=p.nodes.find(n=>n.type==='source'&&n.config.table==='customers');
+ if(cn&&ag){const distinct=new Set(TABLES.customers.rows.map(x=>x.customer_id)).size;add({id:'vol',level:R.rows.length===distinct?'passed':'warning',title:R.rows.length===distinct?'Every customer is in the dataset once':'Row count differs from the customer list',plain:R.rows.length===distinct?'The dataset has as many rows as there are distinct customers.':'Customers may have been lost or repeated.',evidence:`${fmt(R.rows.length)} output rows vs ${fmt(distinct)} distinct customers`,node:out.id})}
+ // nulls
+ const nulls=R.cols.map(c=>({c,n:R.rows.filter(r=>r[c.name]==null).length})).filter(x=>x.n>0);
+ const hn=c=>{const o=(c.origin||[])[0],tn=o&&o.split('.')[0],s=p.nodes.find(q=>q.type==='source'&&q.config.table===tn);return s?s.id:null};
+ const kept=c=>{const s=nodeById(p,hn(c));return !!(s&&(s.config.fixes||[]).some(f=>f.kind==='keep'&&f.col===c.name))};
+ nulls.forEach(x=>add({id:'null:'+x.c.name,level:kept(x.c)?'info':'warning',title:kept(x.c)?`${x.c.name} has empty values (you chose to keep them)`:`${x.c.name} has empty values`,plain:`${x.n} of ${fmt(R.rows.length)} rows (${(100*x.n/R.rows.length).toFixed(1)}%) have no ${x.c.name}. ${kept(x.c)?'You reviewed this in the table\'s Data health and kept them blank.':'Open the table\'s Data health to keep, fill or remove them.'}`,evidence:`${x.n} empty in ${fmt(R.rows.length)} rows`,node:out.id,healthNode:hn(x.c),fixKey:null}));
+ if(R.rows.length)add({id:'schema',level:'passed',title:'Column types are consistent',plain:'Every output column has a single type.',evidence:`${R.cols.length} columns: ${R.cols.map(c=>c.name+' ('+c.type+')').join(', ')}`,node:out.id});
+ if(ag){const mins=ag.config.metrics.filter(m=>['count','count_distinct','sum'].includes(m.fn)).map(m=>({m:m.as,v:Math.min(...R.rows.map(r=>r[m.as]).filter(v=>v!=null))}));add({id:'rule',level:mins.some(x=>x.v<0)?'error':'passed',title:'Counts and totals are not negative',plain:'Business rule: order counts and order totals cannot be below zero.',evidence:mins.map(x=>`min ${x.m} = ${x.v}`).join(', '),node:ag.id})}
+ // orphans
+ if(p.nodes.some(n=>n.type==='source'&&n.config.table==='orders')&&cn){const cs=new Set(TABLES.customers.rows.map(x=>x.customer_id));const o=TABLES.orders.rows.filter(r=>!cs.has(r.customer_id));if(o.length)add({id:'orphans',level:'info',title:`${o.length} orders have no matching customer`,plain:'These orders are not in the dataset because it starts from customers. This may be correct, but tell the data owner if it is not expected.',evidence:`orders.customer_id not found in customers: ${o.length} rows (${o.map(x=>x.customer_id).slice(0,3).join(', ')}…)`,node:p.nodes.find(n=>n.type==='source'&&n.config.table==='orders').id})}
+ const planned=p.nodes.filter(n=>!NT[n.type].live);if(planned.length)add({id:'planned',level:'info',title:`${planned.length} step${planned.length>1?'s use':' uses'} operations not yet available in the real product`,plain:`${[...new Set(planned.map(n=>NT[n.type].label))].join(', ')} ${planned.length>1?'are':'is'} shown in this prototype to demonstrate the experience. The current backend cannot execute ${planned.length>1?'them':'it'} yet.`,evidence:'See the feasibility matrix',node:planned[0].id});
+ const rank={error:0,warning:1,info:2,passed:3};checks.sort((a,b)=>rank[a.level]-rank[b.level]);return checks}
+
+/* ===== Guide (five stages derived from real pipeline state) ===== */
+function computeStages(){
+ const p=P(),out=outputNode(),sg=SG();const srcs=p.nodes.filter(n=>n.type==='source'),joins=p.nodes.filter(n=>n.type==='join'),trans=p.nodes.filter(n=>!['source','join','output'].includes(n.type));
+ const st={};let bad=null;
+ st.select=!srcs.length?'incomplete':srcs.some(n=>!n.config.table)?'incomplete':'complete';
+ st.join=srcs.length<2?'not_needed':(joins.length<srcs.length-1||joins.some(j=>nodeIssues(p,j).length))?'incomplete':'complete';
+ st.transform=!trans.length?'optional':trans.some(n=>nodeIssues(p,n).length)?'incomplete':'complete';
+ const anc=out?ancestors(out.id):new Set();const open=out?[...anc].filter(id=>nodeIssues(p,nodeById(p,id)).length):[];
+ let v='incomplete',hint=null;
+ if(out&&!nodeIssues(p,out).length&&!open.length){const un=joins.filter(j=>anc.has(j.id)&&['unmeasured','outdated'].includes(joinStatus(j)));const rv=joins.filter(j=>anc.has(j.id)&&joinStatus(j)==='review');
+  if(un.length){v=un.some(j=>joinStatus(j)==='outdated')?'measurement_outdated':'measurement_required';hint=un[0].id}
+  else if(rv.length){v='review_required';hint=rv[0].id}
+  else if(!S.val)v='not_validated';else if(S.val.sig!==pipeSig())v='outdated';else if(S.val.checks.some(c=>c.level==='error')){v='invalid';hint=S.val.checks.find(c=>c.level==='error').node}else v='complete'}
+ else hint=open[0]||(out?out.id:null);
+ st.validate=v;
+ const lastRun=S.run&&S.run.sig===pipeSig()?S.run:null;
+ let f='blocked';if(v==='complete'){f='ready';if(S.run&&S.run.state==='running')f='running';else if(lastRun&&lastRun.state==='failed')f='run_failed';else if(lastRun&&lastRun.state==='done')f=S.datasets.some(d=>d.runId===lastRun.id)?'published':'ran'}
+ st.final=f;
+ return{st,hint,out,srcs,joins,open}}
+const STAGE_LABEL={select:'Select tables',join:'Join',transform:'Transform',validate:'Validate',final:'Final dataset'};
+const STAGE_ORDER=['select','join','transform','validate','final'];
+function autoStage(st){for(const s of STAGE_ORDER){if(!['complete','optional','not_needed'].includes(st[s]))return s}return 'final'}
+function guideFor(stage,G){const {st,hint,out,srcs,joins}=G,s=st[stage];
+ const A=(label,act,arg)=>({label,act,arg});
+ const t={
+  select:{incomplete:srcs.length?[ 'A source step has no table yet. Select it and choose a table.',A('Choose a table','selNode',srcs.find(n=>!n.config.table)&&srcs.find(n=>!n.config.table).id)]:['Start by choosing the tables you need from the Catalog.',A('Open Catalog','go','catalog')],complete:[`${srcs.length} table${srcs.length>1?'s':''} on the canvas. Next, connect them with joins.`,A('Next: Join','stage','join')]},
+  join:{not_needed:['One table needs no join. Move on to Transform.',A('Next: Transform','stage','transform')],incomplete:[joins.length?'Finish each join: connect both inputs and choose the matching columns.':'Tables are not connected yet. Open the Assistant for suggested joins, or add a Join step from the palette.',joins.length?A('Finish '+((joins.find(j=>nodeIssues(P(),j).length)||joins[0]).id),'selNode',(joins.find(j=>nodeIssues(P(),j).length)||joins[0]).id):A('See suggested joins','assistant')],complete:['Joins are set up. Their effect on your row counts is measured in Validate.',A('Next: Transform','stage','transform')]},
+  transform:{optional:['Optional: clean each table (select it, then open Data health), filter rows or summarise. Or continue to Validate.',A('Skip to Validate','stage','validate')],incomplete:['Finish the step you started: choose its columns or conditions, or remove it.',P().nodes.find(n=>!['source','join','output'].includes(n.type)&&nodeIssues(P(),n).length)?A('Open it','selNode',P().nodes.find(n=>!['source','join','output'].includes(n.type)&&nodeIssues(P(),n).length).id):null],complete:['Transform steps are set up. Continue to Validate.',A('Next: Validate','stage','validate')]},
+  validate:{incomplete:[!out?'Add an Output dataset step at the end of the flow (highlighted in the palette).':'Some steps still need setup. Finish them, then connect the last step to Output.',hint?A('Go to '+hint,'selNode',hint):null],
+   measurement_required:['Measure each join on the real data before trusting it. Select a join and press Measure.',A('Open '+hint,'selNode',hint)],measurement_outdated:['A join changed after it was measured. Measure it again.',A('Open '+hint,'selNode',hint)],
+   review_required:['A join repeats rows. Read the explanation and accept it only if that is what you intend.',A('Review '+hint,'selNode',hint)],not_validated:['Run validation to check the final dataset against real data.',A('Run validation','validate')],
+   outdated:['Something changed after the last validation. Run it again.',A('Run validation again','validate')],invalid:['Validation found a problem that blocks the dataset. Start with the first error.',A('Go to the problem','selNode',hint)],complete:['All checks ran on current settings and no errors remain. Continue to the final dataset.',A('Next: Final dataset','stage','final')]},
+  final:{blocked:['Finish Validate first. The dataset cannot run until every error is resolved.',null],ready:['Ready. Starting the run executes every step in order and builds the dataset.',A('Start run','run')],running:['The pipeline is running. Step status is shown below.',null],run_failed:['The last run failed. The Run tab shows which step failed and why. Retrying uses the same settings.',A('Retry run','run')],ran:['The run succeeded. Review the Final dataset tab, then publish it. Publishing needs your approval.',A('Publish dataset','publishAsk')],published:['Published. Send it to AutoML or find it under Datasets.',A('Send to AutoML','dsOpen')]}};
+ const x=(t[stage]||{})[s]||['',null];return{msg:x[0],primary:x[1],status:s}}
+
+/* ===== Shared view helpers ===== */
+const tag=(k,t)=>`<span class="tag ${k}" title="${{live:'Works in the current product',partial:'Partly implemented in the current product',planned:'Not in the current product. Shown to demonstrate the experience.',sim:'Simulated in this prototype'}[k]}">${t||{live:'Live today',partial:'Partial',planned:'Planned',sim:'Simulated'}[k]}</span>`;
+const btn=(act,label,o={})=>`<button class="btn ${o.cls||''}" data-act="${act}"${o.arg!=null?` data-arg="${esc(o.arg)}"`:''}${o.dis?' disabled':''}${o.title?` title="${esc(o.title)}"`:''}${o.id?` id="${o.id}"`:''}${o.aria?` aria-label="${esc(o.aria)}"`:''}>${o.icon?ic(o.icon):''}${label}</button>`;
+const tableCount=t=>TABLES[t].rows.length;
+function colStats(tn){const t=TABLES[tn];return t.cols.map(c=>{const vs=t.rows.map(r=>r[c.name]);const nulls=vs.filter(v=>v==null).length;return{...c,nulls,distinct:new Set(vs.filter(v=>v!=null)).size}})}
+function grid(res,opts={}){ // res {cols,rows}
+ const q=(opts.q||'').toLowerCase();let rows=res.rows;if(q)rows=rows.filter(r=>res.cols.some(c=>String(r[c.name]==null?'':r[c.name]).toLowerCase().includes(q)));
+ const shown=rows.slice(0,opts.limit||100),nulls={};res.cols.forEach(c=>{nulls[c.name]=res.rows.reduce((a,r)=>a+(r[c.name]==null?1:0),0)});
+ return `<table class="g"><thead><tr><th class="rn">#</th>${res.cols.map(c=>`<th>${esc(c.name)}${nulls[c.name]?` <span class="pill warn" title="${nulls[c.name]} empty values">${nulls[c.name]} empty</span>`:''}<small>${c.type}</small></th>`).join('')}</tr></thead><tbody>${shown.map((r,i)=>`<tr><td class="rn">${i+1}</td>${res.cols.map(c=>{const v=r[c.name];return v==null?`<td class="null">empty</td>`:`<td class="${isNum(c.type)?'n':''}">${esc(isNum(c.type)&&c.type==='decimal'?Number(v).toLocaleString('en-IN'):v)}</td>`}).join('')}</tr>`).join('')}</tbody></table>${rows.length>shown.length?`<div class="muted" style="padding:8px 12px">Showing first ${fmt(shown.length)} of ${fmt(rows.length)}${q?' matching':''} rows.</div>`:''}${!rows.length?`<div class="muted" style="padding:14px">No rows${q?' match this search':''}.</div>`:''}`}
+
+/* ===== Chrome ===== */
+function viewRibbon(){return `<div class="ribbon"><b>UX PROTOTYPE</b><span>Sample retail data calculated in your browser. Nothing connects to a database and no credentials are used.</span><span class="sp"></span>
+ <button class="btn sm ghost" data-act="modal" data-arg="legend">What is real today?</button><button class="btn sm" data-act="menu" aria-expanded="${S.ui.menu}">${ic('gear')} Prototype controls</button></div>${S.ui.menu?viewMenu():''}`}
+function viewMenu(){return `<div class="menu" role="dialog" aria-label="Prototype controls"><b>Prototype controls</b><p class="muted" style="margin:4px 0 10px;font-size:12.5px">These only exist to help you review. They are not product features.</p>
+ <label class="row" style="margin-bottom:8px"><input type="checkbox" data-chg="failSim" ${S.ui.failSim?'checked':''} style="width:auto"> Make the next run fail (to see error handling)</label>
+ <div class="col" style="gap:6px">${btn('simStale','Simulate a Catalog re-scan (older table references)',{cls:'sm'})}${btn('modal','Keyboard shortcuts',{cls:'sm',arg:'keys'})}${btn('reset','Reset prototype',{cls:'sm danger'})}</div></div>`}
+function viewRail(){const it=(r,i,l,t)=>`<button class="nav ${S.route===r?'on':''}" data-act="go" data-arg="${r}">${ic(i)}<span>${l}</span>${t||''}</button>`;
+ return `<div class="brand"><i></i>Data Intelligence OS</div>${it('home','home','Home')}${it('catalog','catalog','Data Catalog')}${it('studio','flow','Pipelines',S.pipe.nodes.length?`<span class="t pill">${S.pipe.nodes.length}</span>`:'')}${it('runs','run','Runs')}${it('datasets','dataset','Datasets',S.datasets.length?`<span class="t pill ok">${S.datasets.length}</span>`:'')}
+ <h6>Later phases</h6>${it('migrate','migrate','Migration','<span class="t">'+tag('planned','Demo')+'</span>')}${it('monitor','bell','Monitoring & quality','<span class="t">'+tag('partial')+'</span>')}${it('settings','gear','Settings & admin','<span class="t">'+tag('planned')+'</span>')}
+ <div class="sp"></div><div class="muted" style="font-size:12px;padding:8px">Connections live inside <b>Data Catalog</b>. AutoML handoff lives inside <b>Datasets</b>. Lineage, history and validation live inside <b>Pipelines</b>.</div>`}
+
+/* ===== Home ===== */
+function viewHome(){const d=hasDraft(),last=S.runs[0];
+ return `<div class="page"><h1>What do you want to prepare?</h1><p class="sub">Describe the dataset you need. The assistant proposes a pipeline you can review, edit and reject before anything runs.</p>
+ <div class="grid2" style="grid-template-columns:1.5fr 1fr;align-items:start">
+ <div class="card"><label class="f" for="goal" style="margin-top:0">Business goal</label><textarea id="goal" rows="3" data-inp="goal">${esc(S.ui.goal||'Prepare a customer-level dataset showing customer details, total order value, order count, and latest order date for analysis.')}</textarea>
+  <div class="row" style="margin-top:12px">${btn('propose','Propose a pipeline',{cls:'pri',icon:'ai'})}<span class="muted" style="font-size:12.5px">${tag('sim','Scripted proposal')} Uses only the sample tables.</span></div>
+  <hr style="border:0;border-top:1px solid var(--line);margin:16px 0"><div class="muted" style="font-size:12.5px;margin-bottom:8px">Or start another way</div>
+  <div class="row" style="flex-wrap:wrap">${btn('go','Pick tables in the Catalog',{arg:'catalog',icon:'catalog'})}${d?btn('openDraft','Open saved draft',{icon:'history'}):btn('x','Open saved draft',{dis:1,title:'No draft saved yet'})}${btn('modal','Upload a requirements document',{arg:'brd',icon:'upload'})} ${tag('planned','Document upload planned')}</div></div>
+ <div class="col"><div class="card"><h3>Your data</h3><div class="row"><span class="sd fresh"></span><b>Retail Demo DB</b><span class="pill">SQL Server</span></div><p class="muted" style="margin-top:4px;font-size:12.5px">Read-only. 5 tables scanned. ${tag('sim')}</p><div style="margin-top:10px">${btn('go','Open Data Catalog',{arg:'catalog',cls:'sm'})}</div></div>
+ <div class="card"><h3>Recent pipelines</h3>${d||S.pipe.nodes.length?`<div class="step"><span>${ic('flow')}</span><div style="flex:1"><b>${esc(S.name)}</b><div class="muted" style="font-size:12.5px">${S.pipe.nodes.length} steps · ${S.versions.length} saved version${S.versions.length===1?'':'s'}</div></div>${btn('go','Open',{arg:'studio',cls:'sm'})}</div>`:`<p class="muted">No pipelines yet. Your first one will appear here.</p>`}</div>
+ ${last?`<div class="card"><h3>Latest run</h3><p>${last.state==='done'?'Completed':'Failed'} · ${last.when}</p><div style="margin-top:8px">${btn('go','See runs',{arg:'runs',cls:'sm'})}</div></div>`:''}</div></div>
+ <div class="card" style="margin-top:14px"><h3>The path through the product</h3><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:8px">${['Choose data','Join','Transform','Validate','Run and publish','Use in AutoML'].map((s,i)=>`<span class="pill info">${i+1}. ${s}</span>`).join('<span class="muted">→</span>')}</div></div></div>`}
+
+/* ===== AI proposal ===== */
+function proposalItems(){const j=S.ui.joinTypes||{};return[
+ {id:'tables',title:'Use the tables customers, orders and order_items',why:'Your goal mentions customer details (customers), order count and latest order date (orders), and order value (order_items.line_total).',ev:'Matched on column names: customer_name, order_date, line_total.',conf:'High'},
+ {id:'j1',title:'Join customers to orders on customer_id',why:'orders.customer_id is a declared foreign key to customers.customer_id. A LEFT join keeps customers who have not ordered yet.',ev:`Declared relationship. ${(REL[0].match*100).toFixed(1)}% of order customer_ids exist in customers.`,conf:'High',joinKey:'j1',edit:true,warn:'Each customer repeats once per order (one-to-many). The Aggregate step returns to one row per customer.'},
+ {id:'j2',title:'Join those rows to order_items on order_id',why:'order_items.order_id is a declared foreign key to orders.order_id. Line totals give the true order value.',ev:`Declared relationship. ${(REL[1].match*100).toFixed(1)}% matched.`,conf:'High',joinKey:'j2',edit:true,warn:'Each order repeats once per item. Summing orders.total_amount here would overcount; this plan sums line_total and counts distinct orders instead.'},
+ {id:'agg',title:'Aggregate to one row per customer',why:'You asked for a customer-level dataset: order count, total order value and latest order date.',ev:'count_distinct(order_id), sum(line_total), max(order_date), grouped by customer.',conf:'High',planned:true},
+ {id:'out',title:'Write the result as customer_order_summary',why:'The Output step marks the dataset this pipeline produces.',ev:'Expected columns: customer_id, customer_name, email, city, segment, order_count, total_order_value, latest_order_date.',conf:'High'},
+ {id:'val',title:'Plan to validate: key uniqueness, totals vs order lines, empty values, row grain',why:'These checks catch the most common mistakes in joined customer data. Nothing is marked passed without evidence.',ev:'Runs only when you press Run validation.',conf:'Medium'}]}
+function viewPropose(){const items=proposalItems();const on=id=>S.ui.propChecked[id]!==false;
+ return `<div class="page"><div class="row"><button class="btn ghost sm" data-act="go" data-arg="home">← Back</button><h1 style="margin:0">Proposed pipeline</h1>${tag('sim','Scripted proposal')}</div>
+ <p class="sub" style="margin-top:8px">Goal: <i>${esc(S.ui.goal||'Prepare a customer-level dataset showing customer details, total order value, order count, and latest order date for analysis.')}</i></p>
+ <div class="notice info" style="margin-bottom:14px">${ic('info')}<div class="b">Review each suggestion. Untick anything you do not want. Nothing runs until you build the pipeline and run it yourself. A real assistant would cite the same kind of evidence from your schema and data.</div></div>
+ <div class="col">${items.map(it=>`<div class="card" style="padding:12px 14px"><div class="row" style="align-items:flex-start"><input type="checkbox" data-chg="prop" data-arg="${it.id}" ${on(it.id)?'checked':''} style="width:auto;margin-top:4px" aria-label="Accept ${esc(it.title)}">
+ <div style="flex:1"><div class="row"><b>${esc(it.title)}</b>${it.planned?tag('planned','Not in product yet'):''}<span class="pill ${it.conf==='High'?'ok':'warn'}">${it.conf} confidence</span></div>
+ <div class="t2" style="margin-top:3px">${esc(it.why)}</div><div class="mono muted" style="margin-top:3px">${esc(it.ev)}</div>
+ ${it.warn?`<div class="row" style="margin-top:6px;color:var(--warn)">${ic('warn')}<span>${esc(it.warn)}</span></div>`:''}
+ ${it.edit?`<div class="row" style="margin-top:8px"><label class="muted" style="font-size:12.5px">Join type</label><select data-chg="jtype" data-arg="${it.joinKey}" style="width:auto"><option value="left" ${(S.ui.joinTypes||{})[it.joinKey]!=='inner'?'selected':''}>LEFT (recommended: keep every row from the left side)</option><option value="inner" ${(S.ui.joinTypes||{})[it.joinKey]==='inner'?'selected':''}>INNER (drops rows without a match)</option></select></div>`:''}</div></div></div>`).join('')}</div>
+ <div class="row" style="margin-top:16px">${btn('buildProposal','Build on canvas',{cls:'pri',icon:'flow'})}<span class="muted">Creates the accepted steps. You can edit every one afterwards.</span></div></div>`}
+
+/* ===== Catalog ===== */
+function viewCatalog(){const c=S.catalog,names=Object.keys(TABLES).filter(n=>n.includes(c.q.toLowerCase()));const t=TABLES[c.active];
+ const left=`<div class="list"><div style="padding:12px"><div class="row"><span class="sd fresh"></span><b>Retail Demo DB</b><span class="pill">SQL Server</span></div><div class="muted" style="font-size:12.5px;margin:3px 0 8px">Read-only · scanned just now ${tag('sim')}</div>
+ <div class="row">${btn('modal','Connections',{arg:'conn',cls:'sm',icon:'link'})}${btn('toast','Re-scan',{arg:'Scan is simulated. Nothing was read.',cls:'sm'})}</div>
+ <input type="search" placeholder="Search tables" aria-label="Search tables" data-inp="catq" value="${esc(c.q)}" style="margin-top:10px"></div>
+ ${names.map(n=>`<div class="li ${c.active===n?'on':''}" data-act="catPick" data-arg="${n}"><input type="checkbox" data-chg="catSel" data-arg="${n}" ${c.sel.includes(n)?'checked':''} aria-label="Select ${n}" onclick="event.stopPropagation()"><div style="flex:1;min-width:0"><b>${n}</b><div class="muted" style="font-size:12px">${fmt(tableCount(n))} rows · ${TABLES[n].cols.length} columns</div></div></div>`).join('')||'<div class="muted" style="padding:14px">No table matches.</div>'}</div>`;
+ const stats=colStats(c.active);const rels=REL.filter(r=>r.from.startsWith(c.active+'.')||r.to.startsWith(c.active+'.'));
+ const body=c.tab==='schema'?`<table class="g"><thead><tr><th>Column</th><th>Type</th><th>Key</th><th>Empty</th><th>Distinct</th></tr></thead><tbody>${stats.map(s=>`<tr><td>${esc(s.name)}</td><td>${s.type}</td><td>${s.pk?'<span class="pill info">'+ic('key')+' primary</span>':''}${s.fk?`<span class="pill">→ ${s.fk}</span>`:''}</td><td class="${s.nulls?'null':''}">${s.nulls?fmt(s.nulls)+' ('+(100*s.nulls/t.rows.length).toFixed(1)+'%)':'0'}</td><td>${fmt(s.distinct)}${s.pk&&s.distinct<t.rows.length?` <span class="pill err">${t.rows.length-s.distinct} repeated</span>`:''}</td></tr>`).join('')}</tbody></table>`
+  :c.tab==='data'?`<div class="sim-banner">Actual first rows of the sample table. ${tag('sim')}</div>${grid({cols:t.cols.map(x=>({name:x.name,type:x.type})),rows:t.rows},{limit:50})}`
+  :`<div style="padding:14px" class="col">${rels.length?rels.map(r=>`<div class="card"><div class="row"><b class="mono">${r.from}</b>${ic('arrow')}<b class="mono">${r.to}</b><span class="pill ${r.kind==='declared'?'ok':'warn'}">${r.kind==='declared'?'Declared':'Inferred'}</span>${r.conf?`<span class="pill">confidence ${Math.round(r.conf*100)}%</span>`:''}</div>
+  <div class="t2" style="margin-top:4px">${r.kind==='declared'?'A foreign key is defined in the database.':esc(r.why)}</div><div class="mono muted" style="margin-top:4px">${(r.match*100).toFixed(1)}% of ${r.from.split('.')[0]} values exist in ${r.to.split('.')[0]}${r.kind==='inferred'?' · not declared, review before relying on it':''}</div></div>`).join(''):'<p class="muted">No relationships found for this table.</p>'}</div>`;
+ const right=`<div class="col" style="min-width:0;min-height:0;height:100%"><div style="padding:14px 18px 0"><div class="row"><h1 style="margin:0">${t.name}</h1><span class="pill">${fmt(t.rows.length)} rows</span><span class="pill">${t.cols.length} columns</span></div><p class="sub" style="margin:2px 0 8px">${t.desc}</p></div>
+ <div class="tabs" style="padding:0 12px">${[['schema','Schema'],['data','Data'],['rel','Relationships']].map(([k,l])=>`<button class="tab ${c.tab===k?'on':''}" data-act="catTab" data-arg="${k}">${l}</button>`).join('')}</div><div class="scroll" style="flex:1">${body}</div></div>`;
+ const selTray=`<div class="row" style="padding:10px 16px;border-top:1px solid var(--line);background:var(--bg2)"><div style="flex:1">${c.sel.length?`<b>${c.sel.length} table${c.sel.length>1?'s':''} selected:</b> <span class="t2">${c.sel.join(', ')}</span> <span class="muted">· source: Retail Demo DB (SQL Server)</span>`:'<span class="muted">Tick the tables you want in your pipeline. A pipeline reads from one data source; joins across sources are blocked.</span>'}</div>${btn('addSel','Add to pipeline',{cls:'pri',dis:!c.sel.length,icon:'flow'})}</div>`;
+ return `<div style="display:flex;flex-direction:column;height:100%;min-height:0"><div class="ml" style="flex:1">${left}${right}</div>${selTray}</div>`}
+
+/* ===== Runs ===== */
+function viewRuns(){const rs=S.runs,A=S.ui.cmpA!=null?rs.find(r=>r.id===S.ui.cmpA):null,B=S.ui.cmpB!=null?rs.find(r=>r.id===S.ui.cmpB):null;
+ return `<div class="page"><h1>Runs</h1><p class="sub">Every execution of a pipeline, newest first. This is different from <b>edit history</b> (undo/redo while editing) and <b>versions</b> (saved snapshots), both found inside a pipeline.</p>
+ <div class="notice warning" style="margin-bottom:14px">${ic('warn')}<div class="b">All runs here are simulated. The current Visual ETL Builder cannot execute a pipeline yet. Schedules, monitoring and alerts exist in the product for earlier pipelines and are not demonstrated here.</div></div>
+ ${rs.length?`<div class="card" style="padding:0;overflow:hidden"><table class="g"><thead><tr><th>Run</th><th>Pipeline</th><th>Version</th><th>Status</th><th>Duration</th><th>Rows out</th><th>When</th><th>Compare</th></tr></thead><tbody>${rs.map(r=>`<tr><td>#${r.id}${r.sample?' '+tag('sim','Sample'):''}</td><td style="font-family:var(--sans)">${esc(r.name)}</td><td>${r.version||'-'}</td><td style="font-family:var(--sans)"><span class="pill ${r.state==='done'?'ok':r.state==='cancelled'?'':'err'}">${{done:'Completed',failed:'Failed',cancelled:'Cancelled'}[r.state]}</span></td><td>${r.dur?r.dur+' s':'-'}</td><td class="n">${r.rowsOut!=null?fmt(r.rowsOut):'-'}</td><td style="font-family:var(--sans)">${r.when}</td>
+ <td style="font-family:var(--sans)"><label><input type="radio" name="ca" data-chg="cmpA" data-arg="${r.id}" ${S.ui.cmpA===r.id?'checked':''} style="width:auto"> A</label> <label><input type="radio" name="cb" data-chg="cmpB" data-arg="${r.id}" ${S.ui.cmpB===r.id?'checked':''} style="width:auto"> B</label></td></tr>${r.error?`<tr><td></td><td colspan="7" style="font-family:var(--sans);color:var(--err)">${esc(r.error.step)}: ${esc(r.error.msg)}</td></tr>`:''}`).join('')}</tbody></table></div>
+ ${A&&B&&A!==B?`<div class="card" style="margin-top:14px"><h3>Run #${A.id} compared with run #${B.id}</h3><dl class="kv"><dt>Status</dt><dd>${A.state} → ${B.state}</dd><dt>Rows out</dt><dd>${A.rowsOut!=null?fmt(A.rowsOut):'-'} → ${B.rowsOut!=null?fmt(B.rowsOut):'-'} ${A.rowsOut!=null&&B.rowsOut!=null?`(${B.rowsOut-A.rowsOut>=0?'+':''}${fmt(B.rowsOut-A.rowsOut)})`:''}</dd><dt>Duration</dt><dd>${A.dur||'-'} s → ${B.dur||'-'} s</dd><dt>Pipeline version</dt><dd>${A.version||'-'} → ${B.version||'-'}</dd></dl></div>`:'<p class="muted" style="margin-top:10px">Pick run A and run B to compare them.</p>'}`
+ :`<div class="card" style="text-align:center;padding:36px"><h3>No runs yet</h3><p>Build and validate a pipeline, then start a run from the Final dataset stage.</p><div style="margin-top:12px">${btn('go','Go to Pipelines',{arg:'studio'})}</div></div>`}</div>`}
+
+/* ===== Datasets + AutoML handoff ===== */
+function viewDatasets(){const ds=S.datasets,sel=ds.find(d=>d.id===S.ui.dsSel)||ds[0];
+ if(!ds.length)return `<div class="page"><h1>Datasets</h1><p class="sub">Trusted datasets published from validated pipelines, ready to be used downstream.</p><div class="card" style="text-align:center;padding:36px;max-width:620px"><h3>Nothing published yet</h3><p>A dataset appears here after a pipeline has validated, run successfully and been published. The AutoML handoff starts from here.</p><div style="margin-top:12px">${btn('go','Go to Pipelines',{arg:'studio'})}</div></div></div>`;
+ const tabs=[['overview','Overview'],['automl','Use in AutoML'],['dest','Destinations']];
+ return `<div style="display:flex;height:100%;min-height:0"><div class="list" style="width:260px;flex:none">${ds.map(d=>`<div class="li ${sel.id===d.id?'on':''}" data-act="dsPick" data-arg="${d.id}">${ic('dataset')}<div><b>${esc(d.name)}</b><div class="muted" style="font-size:12px">v${d.version} · ${fmt(d.rows)} rows</div></div></div>`).join('')}</div>
+ <div class="col" style="flex:1;min-width:0;min-height:0"><div style="padding:16px 20px 0"><div class="row"><h1 style="margin:0">${esc(sel.name)}</h1><span class="pill ok">Published v${sel.version}</span>${tag('sim','Simulated store')}</div><p class="sub" style="margin:2px 0 8px">Snapshot of run #${sel.runId} · pipeline version ${sel.pipelineVersion} · ${sel.when}</p></div>
+ <div class="tabs" style="padding:0 14px">${tabs.map(([k,l])=>`<button class="tab ${S.ui.dsTab===k?'on':''}" data-act="dsTab" data-arg="${k}">${l}</button>`).join('')}</div><div class="scroll" style="flex:1;padding:16px 20px">${S.ui.dsTab==='overview'?dsOverview(sel):S.ui.dsTab==='automl'?dsAutoml(sel):dsDest()}</div></div></div>`}
+function dsOverview(d){return `<div class="grid3" style="margin-bottom:14px"><div class="card"><div class="muted">Rows</div><h1>${fmt(d.rows)}</h1></div><div class="card"><div class="muted">Columns</div><h1>${d.cols.length}</h1></div><div class="card"><div class="muted">Quality at publish</div><p>${d.quality}</p></div></div>
+ <div class="card" style="margin-bottom:14px"><h3>Where it came from</h3><div class="row" style="flex-wrap:wrap;gap:8px"><span class="pill">customers</span><span class="pill">orders</span><span class="pill">order_items</span>${ic('arrow')}<span class="pill info">Pipeline "${esc(d.pipelineName)}" ${d.pipelineVersion}</span>${ic('arrow')}<span class="pill info">Run #${d.runId}</span>${ic('arrow')}<span class="pill ok">${esc(d.name)} v${d.version}</span>${ic('arrow')}<span class="pill">AutoML ${d.handedOff?'(sent)':'(not sent)'}</span></div></div>
+ <div class="card" style="padding:0;overflow:hidden"><div class="sim-banner">Preview of the published snapshot. ${tag('sim')}</div>${grid({cols:d.cols,rows:d.sample},{limit:15})}</div>`}
+function dsAutoml(d){const targets=d.cols.filter(c=>isNum(c.type)&&!/_id$/.test(c.name));const t=S.ui.target||(targets[0]&&targets[0].name);const feats=d.cols.filter(c=>c.name!==t&&!/_id$/.test(c.name)&&c.name!=='email');
+ const nulls=d.cols.map(c=>({n:c.name,k:d.sample.filter(r=>r[c.name]==null).length})).filter(x=>x.k);
+ return `<div class="notice warning" style="margin-bottom:14px">${ic('warn')}<div class="b">Proposed handoff. The existing training flow can start from a dataset, but a published dataset snapshot and one-click handoff from the Visual ETL Builder do not exist yet.</div></div>
+ <div class="grid2"><div class="card"><h3>1. Dataset snapshot</h3><dl class="kv"><dt>Dataset</dt><dd>${esc(d.name)} v${d.version}</dd><dt>Snapshot</dt><dd>Run #${d.runId} · ${d.when}</dd><dt>Size</dt><dd>${fmt(d.rows)} rows × ${d.cols.length} columns</dd><dt>Traceable to</dt><dd>Pipeline "${esc(d.pipelineName)}" ${d.pipelineVersion}</dd></dl>
+ <h3 style="margin-top:14px">2. Readiness</h3>${[[d.rows>=100,`Enough rows to train (${fmt(d.rows)}, minimum 100)`],[!!targets.length,`Numeric target candidates found (${targets.map(x=>x.name).join(', ')})`],[true,'Validation passed with no errors when published'],[!nulls.length,nulls.length?`Empty values to handle: ${nulls.map(x=>x.n+' ('+x.k+')').join(', ')}`:'No empty values']].map(([ok,t])=>`<div class="row" style="padding:3px 0"><span style="color:var(--${ok?'ok':'warn'})">${ic(ok?'passed':'warn')}</span><span>${t}</span></div>`).join('')}</div>
+ <div class="card"><h3>3. Choose what to predict</h3><p class="muted" style="margin-bottom:8px">You choose the target. The ranking only helps.</p>${targets.map((c,i)=>`<label class="row" style="padding:6px 0"><input type="radio" name="tg" data-chg="target" data-arg="${c.name}" ${t===c.name?'checked':''} style="width:auto"><b>${c.name}</b><span class="muted">${i===0?'Suggested: continuous value, no empty values':'Count-type value'}</span></label>`).join('')}
+ <h3 style="margin-top:14px">Columns that would be used</h3><div class="row" style="flex-wrap:wrap;gap:6px">${feats.map(c=>`<span class="pill">${c.name}</span>`).join('')}</div><p class="muted" style="margin-top:6px;font-size:12.5px">Not used: identifiers (customer_id) and free text (email).</p>
+ <div style="margin-top:14px">${btn('automl','Open in AutoML training',{cls:'pri',icon:'model'})}</div></div></div>
+ ${S.ui.automlOpen?`<div class="card" style="margin-top:14px"><h3>What would be handed over ${tag('sim')}</h3><div class="sqlbox">${esc(JSON.stringify({dataset:d.name,version:d.version,snapshot_of_run:d.runId,pipeline_version:d.pipelineVersion,rows:d.rows,target:t,feature_columns:feats.map(c=>c.name),credentials:'never included'},null,2))}</div><p class="muted" style="margin-top:8px">In the product this would open the existing training flow with these values filled in. The prototype stops here.</p></div>`:''}`}
+function dsDest(){return `<div class="col" style="max-width:640px"><div class="card"><div class="row"><b>Dataset store</b>${tag('sim','Prototype only')}</div><p class="muted">Where this prototype keeps the published snapshot.</p></div>
+ ${[['Database table','Write the dataset to a table in a destination database'],['Power BI dataset','Expose the prepared data to Power BI. No Power BI connector exists in the repository today.'],['API endpoint','Serve the dataset through an authenticated API']].map(([n,d])=>`<div class="card" style="opacity:.8"><div class="row"><b>${n}</b>${tag('planned')}</div><p class="muted">${d}</p></div>`).join('')}
+ <p class="muted">Publishing prepared data, exposing a dataset and generating a report are three different capabilities. Each needs its own design and backend work.</p></div>`}
+
+/* ===== Migration (demonstration) ===== */
+const MIG=[{c:'OLE DB Source',m:'Copy activity / dataset (source)',s:'ok',n:'Direct equivalent.'},{c:'Derived Column',m:'Mapping data flow: Derived Column',s:'ok',n:'Expression syntax differs; expressions are listed for review.'},{c:'Lookup',m:'Mapping data flow: Lookup',s:'part',n:'No-match behaviour must be confirmed.'},{c:'Conditional Split',m:'Mapping data flow: Conditional Split',s:'ok',n:'Direct equivalent.'},{c:'Sort',m:'Mapping data flow: Sort',s:'ok',n:'Direct equivalent.'},{c:'Script Task (C#)',m:'No automatic equivalent',s:'manual',n:'Custom code. Rewrite as an Azure Function or notebook activity.'},{c:'Execute SQL Task',m:'Script / Stored procedure activity',s:'part',n:'Check connection strings and parameters.'},{c:'OLE DB Destination',m:'Copy activity sink',s:'ok',n:'Direct equivalent.'}];
+function viewMigrate(){const st=S.ui.migStep;const done=st>=1;const cnt=k=>MIG.filter(x=>x.s===k).length;
+ return `<div class="page"><div class="row"><h1 style="margin:0">Pipeline migration assessment</h1>${tag('planned','Demonstration only')}</div><p class="sub" style="margin-top:6px">A future capability. It starts with assessment and transparent reporting. It does not claim to migrate every SSIS package automatically.</p>
+ <div class="notice warning" style="margin-bottom:14px">${ic('warn')}<div class="b">Nothing here reads a real package. The package, mappings and findings below are illustrative sample content to show the intended review experience.</div></div>
+ <div class="card"><div class="row"><div style="flex:1"><b>Sample package: LoadCustomerDim.dtsx</b><div class="muted" style="font-size:12.5px">SSIS project "RetailWarehouse" (illustrative)</div></div>${btn('migRun',done?'Assess again':'Analyse package',{cls:'pri'})}</div></div>
+ ${done?`<div class="grid3" style="margin:14px 0"><div class="card"><div class="muted">Recognised, direct equivalent</div><h1 style="color:var(--ok)">${cnt('ok')}</h1></div><div class="card"><div class="muted">Partly supported, review needed</div><h1 style="color:var(--warn)">${cnt('part')}</h1></div><div class="card"><div class="muted">Manual work required</div><h1 style="color:var(--err)">${cnt('manual')}</h1></div></div>
+ <div class="card" style="padding:0;overflow:hidden"><table class="g"><thead><tr><th>SSIS component</th><th>Proposed Azure Data Factory equivalent</th><th>Status</th><th>Notes and limits</th></tr></thead><tbody>${MIG.map(x=>`<tr><td style="font-family:var(--sans)">${x.c}</td><td style="font-family:var(--sans)">${x.m}</td><td style="font-family:var(--sans)"><span class="pill ${{ok:'ok',part:'warn',manual:'err'}[x.s]}">${{ok:'Supported',part:'Partial',manual:'Manual'}[x.s]}</span></td><td style="font-family:var(--sans);white-space:normal">${x.n}</td></tr>`).join('')}</tbody></table></div>
+ <div class="grid2" style="margin-top:14px"><div class="card"><h3>Source structure</h3><div class="mono t2">OLE DB Source → Derived Column → Lookup → Conditional Split → Sort → OLE DB Destination<br>Script Task, Execute SQL Task (control flow)</div></div><div class="card"><h3>Proposed target structure</h3><div class="mono t2">Copy → Data flow [Derived Column → Lookup → Split → Sort] → Sink<br><span class="diff-del">Script Task: no equivalent (manual)</span></div></div></div>
+ <div class="card" style="margin-top:14px"><h3>Compare results</h3><p class="muted">A result comparison between the old and new pipeline is only valid when both read the same inputs. It is not simulated here and would need its own technical investigation.</p></div>
+ <div class="card" style="margin-top:14px"><h3>Assessment decision</h3><label class="row"><input type="checkbox" data-chg="migReviewed" ${S.migDecisions.reviewed?'checked':''} style="width:auto"> I reviewed the unsupported and partial items</label><label class="f">Decision note (kept in this browser only)</label><input type="text" data-chg="migNote" value="${esc(S.migDecisions.note||'')}" placeholder="e.g. Approve for a pilot, rewrite the Script Task first">
+ <div class="row" style="margin-top:10px">${btn('migApprove','Record decision',{cls:'pri',dis:!S.migDecisions.reviewed})}${S.migDecisions.recorded?`<span class="pill ok">Recorded ${S.migDecisions.recorded}</span>`:''}</div></div>`:`<div class="card" style="margin-top:14px;text-align:center;padding:30px"><p class="muted">Analyse the sample package to see recognised operations, mappings and manual work.</p></div>`}</div>`}
+function viewPlanned(r){const o={monitor:{t:'Monitoring and data quality',s:'partial',d:'Run trends, schedules and alerts already exist in the product for earlier pipelines (Pipeline Operations). Data-quality monitoring over time for Visual ETL datasets is a later phase.',w:['Run success and failure trends','Schedules and alerts','Freshness and volume checks on published datasets']},settings:{t:'Settings and administration',s:'planned',d:'Workspace settings, roles and access control. Not part of the first release of this redesign.',w:['Users and roles','Connection policies','Audit log']}}[r];
+ return `<div class="page"><div class="row"><h1 style="margin:0">${o.t}</h1>${tag(o.s)}</div><p class="sub" style="margin-top:6px">${o.d}</p><div class="card" style="max-width:560px"><h3>What it would contain</h3><ul class="t2">${o.w.map(x=>`<li>${x}</li>`).join('')}</ul><p class="muted" style="margin-top:8px">This page is intentionally empty. It is not hidden or faked, so that the navigation shows where these capabilities will live.</p></div></div>`}
+
+/* ===== Modals ===== */
+function viewModal(){const m=S.ui.modal;if(!m)return '';let h='';
+ if(m==='legend')h=`<h2>What is real today?</h2><p class="muted">Labels used across this prototype.</p><div class="col" style="margin:10px 0">${[['live','Works in the current product (verified in the code).'],['partial','Partly implemented in the current product.'],['planned','Does not exist yet. Shown to demonstrate the intended experience.'],['sim','Calculated in this browser on sample data to demonstrate behaviour.']].map(([k,t])=>`<div class="row">${tag(k)}<span>${t}</span></div>`).join('')}</div>
+ <b>Right now, in the real product</b><ul class="t2" style="margin:6px 0 0"><li>Catalog: read-only connections, scan, previews, relationships. ${tag('live')}</li><li>Visual ETL Builder: canvas, joins, filter, drop, rename, remove duplicates, missing values, Output. Validate, preview and measure joins on real data. ${tag('live')}</li><li>Aggregate and Create column steps. ${tag('planned')}</li><li>Run, save and publish a Visual ETL pipeline, versions of it. ${tag('planned')}</li><li>Pipeline run history, schedules, alerts, AutoML readiness for earlier pipelines. ${tag('partial')}</li><li>Power BI, API publishing, SSIS migration. ${tag('planned')}</li></ul><p class="muted" style="margin-top:8px">Cross-source joins stay blocked: every pipeline reads from one data source.</p><div style="margin-top:12px">${btn('closeModal','Close')}</div>`;
+ if(m==='conn')h=`<h2>Connections</h2><div class="card" style="margin-bottom:12px"><div class="row"><span class="sd fresh"></span><b>Retail Demo DB</b><span class="pill">SQL Server</span><span class="muted">read-only</span></div></div><b>Add a connection</b>
+ <div class="grid2"><div><label class="f">Type</label><select><option>SQL Server</option><option>PostgreSQL</option></select></div><div><label class="f">Port</label><input type="text" value="1433"></div></div><label class="f">Host</label><input type="text" placeholder="server name"><label class="f">Database</label><input type="text" placeholder="database name"><label class="f">Username</label><input type="text" placeholder="read-only user">
+ <p class="muted" style="margin-top:10px;font-size:12.5px">${ic('lock')} The password is asked for when connecting, kept only in server memory for a limited time and never saved in a pipeline, URL or handoff. This prototype stores nothing and has no password field.</p>
+ <div class="row" style="margin-top:12px">${btn('toast','Test connection',{arg:'Simulated: no connection was attempted.'})}${tag('sim')}<span class="sp"></span>${btn('closeModal','Close')}</div><p class="muted" style="font-size:12.5px;margin-top:10px">CSV and Excel upload ${tag('planned')}</p>`;
+ if(m==='brd')h=`<h2>Requirements document</h2>${tag('planned','Planned: document processing')}<p class="muted" style="margin:8px 0">No document is read. This shows the intended experience using a sample extract.</p><div class="sqlbox">BRD-14 Customer value report\n• Need customer name, city and segment\n• Need total value of all orders and number of orders\n• Need the date of the latest order\n• One row per customer</div>
+ <div class="row" style="margin-top:12px">${btn('brdUse','Use these requirements',{cls:'pri'})}${btn('closeModal','Cancel')}</div>`;
+ if(m==='keys')h=`<h2>Keyboard shortcuts</h2><dl class="kv" style="margin-top:8px"><dt><kbd>Delete</kbd></dt><dd>Remove the selected step</dd><dt><kbd>Ctrl</kbd> <kbd>Z</kbd> / <kbd>Y</kbd></dt><dd>Undo / redo</dd><dt><kbd>F</kbd></dt><dd>Fit the pipeline in view</dd><dt><kbd>T</kbd></dt><dd>Tidy the layout</dd><dt>Mouse wheel</dt><dd>Zoom</dd><dt>Drag empty space</dt><dd>Pan</dd><dt>Drag from a dot on the right edge of a step to a dot on another step</dt><dd>Connect</dd></dl><div style="margin-top:12px">${btn('closeModal','Close')}</div>`;
+ if(m==='handoff')h=`<h2>You already have a pipeline draft</h2><p class="t2" style="margin:6px 0 12px">${S.catalog.sel.length} table${S.catalog.sel.length>1?'s':''} selected in the Catalog. Your draft "${esc(S.name)}" has ${S.pipe.nodes.length} steps. What should happen?</p><div class="col">${btn('hoAdd','Add to current draft',{cls:'pri'})}<span class="muted" style="font-size:12.5px">Keeps your steps and positions. New tables are placed beside them.</span>${btn('hoNew','Start a new pipeline')}<span class="muted" style="font-size:12.5px">Your current draft is kept so you can swap back.</span>${btn('closeModal',"Don't add them")}</div>`;
+if(typeof modalExtra==='function')h+=modalExtra(m);
+ return `<div class="modal-bg" data-act="closeModalBg"><div class="modal" role="dialog" aria-modal="true">${h}</div></div>`}
+
+/* ===== Studio: toolbar, guide, notices, palette, canvas ===== */
+const SD={queued:'q',running:'run',done:'done',failed:'fail',ready:'ready',fresh:'fresh',stale:'stale',warn:'warn',err:'err'};
+const PALETTE=[['Data',['source']],['Combine',['join']],['Clean and reshape',['filter','drop_columns','rename_columns']],['Summarise and create',['aggregate','derive']],['Finish',['output']]];
+function recommended(G){const{srcs,joins,out}=G;if(!srcs.length)return 'source';if(srcs.length>1&&joins.length<srcs.length-1)return 'join';if(!out&&(!srcs.length>1||joins.length>=srcs.length-1))return 'output';return null}
+function portPos(n,port){const ps=portsOf(n.type);const y=ps.length===2?(port===ps[0]?26:66):NH/2;return{x:n.x,y:n.y+y}}
+function nodeHtml(n){const t=NT[n.type],st=nodeState(n),sel=S.ui.sel===n.id;const ps=portsOf(n.type);
+ const inP=ps.map(p=>{const y=ps.length===2?(p===ps[0]?26:66):NH/2;return `<span class="port in" data-port="${p}" data-node="${n.id}" style="top:${y-6}px" title="${ps.length===2?p+' input':'Input'}"></span>`}).join('');
+ const outP=n.type!=='output'?`<span class="port out" data-out="${n.id}" style="top:${NH/2-6}px" title="Drag to another step to connect"></span>`:'';
+ const title=n.type==='source'&&n.config.table?n.config.table:n.id;
+ return `<div class="node t-${n.type} ${sel?'sel':''} ${t.live?'':'planned'}" data-node="${n.id}" tabindex="0" role="button" aria-label="${t.label} ${n.id}. ${st.t}" style="left:${n.x}px;top:${n.y}px">${inP}${outP}
+ <div class="h">${ic(n.type)}${t.label}<span class="st"><i class="sd ${SD[st.k]||'ready'}"></i></span></div><div class="ti">${esc(title)}</div><div class="su">${esc(n.type==='source'&&n.config.table?TABLES[n.config.table].schema+'.'+n.config.table:nodeSummary(P(),n))}</div>
+ <div class="ft"><span>${esc(st.t)}</span>${t.live?'':tag('planned')}${n.type==='source'&&(n.config.fixes||[]).filter(f=>f.kind!=='keep').length?`<span class="pill ok" title="Fixes applied to this table. Select the table to see or undo them.">${(n.config.fixes||[]).filter(f=>f.kind!=='keep').length} fix${(n.config.fixes||[]).filter(f=>f.kind!=='keep').length>1?'es':''}</span>`:''}</div></div>`}
+function edgesHtml(){return P().edges.map((e,i)=>{const a=nodeById(P(),e.from),b=nodeById(P(),e.to);if(!a||!b)return '';const x1=a.x+NW,y1=a.y+NH/2,pp=portPos(b,e.port),x2=pp.x,y2=pp.y,dx=Math.max(50,Math.abs(x2-x1)/2);
+ const cls=(a.type==='join'&&joinStatus(a)==='review')?'warn':nodeState(a).k==='stale'?'stale':'';
+ return `<path class="edge ${cls}" d="M${x1} ${y1}C${x1+dx} ${y1} ${x2-dx} ${y2} ${x2} ${y2}"/><g class="edgex" data-act="rmEdge" data-arg="${i}" transform="translate(${(x1+x2)/2} ${(y1+y2)/2})" role="button" aria-label="Disconnect ${e.from} from ${e.to}"><title>Disconnect ${e.from} → ${e.to}</title><circle r="9"/><text>×</text></g>`}).join('')}
+let MM=null;
+function miniHtml(){const ns=P().nodes;if(!ns.length||!S.ui.mini)return '';const box=$('#cv'),vw=box?box.clientWidth:900,vh=box?box.clientHeight:500,v=S.ui.view;
+ const vx=-v.x/v.k,vy=-v.y/v.k,vwk=vw/v.k,vhk=vh/v.k;const xs=[...ns.map(n=>n.x),vx],ys=[...ns.map(n=>n.y),vy],xe=[...ns.map(n=>n.x+NW),vx+vwk],ye=[...ns.map(n=>n.y+NH),vy+vhk];
+ const minx=Math.min(...xs),miny=Math.min(...ys),w=Math.max(...xe)-minx,h=Math.max(...ye)-miny,W=170,H=104,s=Math.min((W-8)/w,(H-8)/h),ox=(W-w*s)/2,oy=(H-h*s)/2;MM={s,ox,oy,minx,miny};
+ const X=x=>ox+(x-minx)*s,Y=y=>oy+(y-miny)*s;
+ return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-mini aria-label="Pipeline overview. Click to move the view." role="img">${ns.map(n=>`<rect x="${X(n.x)}" y="${Y(n.y)}" width="${NW*s}" height="${NH*s}" rx="2" fill="${n.id===S.ui.sel?'#3d9bff':'#4a607e'}"/>`).join('')}<rect x="${X(vx)}" y="${Y(vy)}" width="${vwk*s}" height="${vhk*s}" fill="rgba(61,155,255,.12)" stroke="#3d9bff" stroke-width="1"/></svg>`}
+function canvasHtml(){const ns=P().nodes,v=S.ui.view;
+ return `<div class="canvaswrap" id="cv" tabindex="-1" aria-label="Pipeline canvas"><div id="world" style="transform:translate(${v.x}px,${v.y}px) scale(${v.k})"><svg id="edges" width="1" height="1">${edgesHtml()}</svg>${ns.map(nodeHtml).join('')}</div>
+ ${ns.length?'':`<div class="cvempty"><div class="card"><h3>Your pipeline is empty</h3><p>Pick tables in the Catalog, or add a Source step from the palette on the left.</p><div class="row" style="justify-content:center;margin-top:12px">${btn('go','Pick tables in the Catalog',{arg:'catalog',icon:'catalog'})}</div></div></div>`}
+ <div class="cvtools" role="toolbar" aria-label="Canvas tools">${btn('zoom','',{arg:'out',cls:'ghost',icon:'minus',title:'Zoom out',aria:'Zoom out'})}<span class="muted" style="align-self:center;min-width:42px;text-align:center" id="zl">${Math.round(v.k*100)}%</span>${btn('zoom','',{arg:'in',cls:'ghost',icon:'plus',title:'Zoom in',aria:'Zoom in'})}<span class="vsep"></span>${btn('fit','Fit',{cls:'ghost',icon:'fit',title:'Fit the pipeline in view (F)'})}${btn('tidy','Tidy up',{cls:'ghost',icon:'tidy',title:'Arrange steps neatly (T)'})}<span class="vsep"></span>${btn('mini','',{cls:'ghost',icon:'eye',title:'Show or hide the overview map',aria:'Show or hide the overview map'})}</div>
+ <div class="mini" id="mini" style="${S.ui.mini&&ns.length?'':'display:none'}">${miniHtml()}</div>
+ ${ns.length?`<div class="hint">Drag steps to move · drag from a step's right dot to another step to connect · scroll to zoom · drag empty space to pan</div>`:''}</div>`}
+
+function viewToolbar(){const h=S.hist;return `<div class="tbar"><input class="name" data-chg="pname" value="${esc(S.name)}" aria-label="Pipeline name">
+ ${S.dirty?'<span class="pill warn" title="Changes since the last saved draft or version">Unsaved</span>':'<span class="pill ok">Saved</span>'}${S.ui.saved?`<span class="muted" style="font-size:12px">Draft saved ${S.ui.saved} (this browser only)</span>`:''}
+ <span class="sp"></span>${btn('undo','Undo',{cls:'sm',icon:'undo',dis:!h.past.length,title:h.past.length?'Undo: '+h.cur+' (Ctrl+Z)':'Nothing to undo'})}${btn('redo','Redo',{cls:'sm',icon:'redo',dis:!h.future.length,title:'Redo (Ctrl+Y)'})}<span class="vsep"></span>
+ ${btn('saveDraft','Save draft',{cls:'sm',icon:'save',title:'Keep a copy in this browser. Prototype only.'})}${btn('saveVersion','Save version',{cls:'sm',icon:'history',title:'Create a named snapshot you can restore later'})}<span class="vsep"></span>
+ ${btn('togglePalette','',{cls:'sm ghost',icon:'panel',title:'Show or hide the step palette',aria:'Show or hide the step palette'})}${btn('toggleRight','',{cls:'sm ghost',icon:'panel',title:'Show or hide the side panel',aria:'Show or hide the side panel'})}</div>`}
+
+function viewGuide(G){const stage=S.ui.stage||autoStage(G.st),g=guideFor(stage,G);
+ const cls=s=>({complete:'complete',optional:'complete',not_needed:'complete',invalid:'invalid',blocked:'blocked',review_required:'review',measurement_required:'review',measurement_outdated:'review',outdated:'review'}[s]||'');
+ const chips=STAGE_ORDER.map((s,i)=>{const c=cls(G.st[s]);return `<button class="stg ${stage===s?'on':''} ${c}" data-act="stage" data-arg="${s}" aria-current="${stage===s?'step':'false'}"><span class="n">${c==='complete'?ic('check',12):i+1}</span>${STAGE_LABEL[s]}</button>`}).join('<span class="stg-sep"></span>');
+ return `<div class="guide"><div class="stages" role="navigation" aria-label="Pipeline stages">${chips}</div><div class="ginst"><div class="msg"><b>${STAGE_LABEL[stage]}.</b> ${esc(g.msg)}</div>${g.primary?btn(g.primary.act,g.primary.label,{arg:g.primary.arg,cls:'pri',id:'primary'}):''}</div></div>`}
+
+function noticeList(G){const L=[];const r=S.run;
+ if(r&&r.state==='failed'&&r.sig===pipeSig())L.push({k:'error',t:`Run #${r.id} failed at ${r.error.step}: ${r.error.msg}`,acts:[['selNode','Open step',r.error.step]]});
+ if(S.catalog.stale&&!S.ui.dismissed.stale)L.push({k:'warning',t:'The Catalog was re-scanned and table definitions changed. Earlier previews, measurements and validation no longer apply, so each step shows as out of date until you repeat them.',acts:[['dismiss','Dismiss','stale']]});
+ const rv=G.joins.filter(j=>joinStatus(j)==='review').length;if(rv)L.push({k:'warning',t:`${rv} join${rv>1?'s repeat':' repeats'} rows and ${rv>1?'need':'needs'} your review before validation.`,acts:[['selNode','Review',G.joins.find(j=>joinStatus(j)==='review').id]]});
+ const pl=P().nodes.filter(n=>!NT[n.type].live||(n.type==='source'&&(n.config.fixes||[]).some(isPlannedFix)));if(pl.length&&!S.ui.dismissed.planned)L.push({k:'info',t:`${pl.length} step${pl.length>1?'s use':' uses'} operations that the current product cannot execute yet (marked Planned). They work in this prototype only.`,acts:[['dismiss','Got it','planned']]});
+ const rank={error:0,action:1,warning:2,info:3};return L.sort((a,b)=>rank[a.k]-rank[b.k])}
+function viewNotices(G){const L=noticeList(G);if(!L.length)return '';const shown=S.ui.showAllInfo?L:L.slice(0,2);
+ return `<div class="notices" role="status">${shown.map(n=>`<div class="notice ${n.k}">${ic(n.k==='error'?'error':n.k==='warning'?'warn':'info')}<div class="b">${esc(n.t)}</div><div class="acts">${(n.acts||[]).map(a=>btn(a[0],a[1],{arg:a[2],cls:'sm'})).join('')}</div></div>`).join('')}${L.length>shown.length?`<button class="btn sm ghost" data-act="moreNotices">${L.length-shown.length} more notice${L.length-shown.length>1?'s':''}</button>`:S.ui.showAllInfo&&L.length>2?'<button class="btn sm ghost" data-act="moreNotices">Show fewer</button>':''}</div>`}
+
+function viewPalette(G){const rec=recommended(G);
+ return `<div class="palette ${S.ui.palette?'':'col1'}" aria-label="Steps"><div class="muted" style="font-size:12px;padding:0 4px 4px">Click a step to add it to the canvas.</div><div class="muted" style="font-size:12px;padding:0 4px 8px">Empty values and duplicates are fixed inside each table: select a table card and open <b>Data health</b>.</div>${PALETTE.map(([h,ts])=>`<h6>${h}</h6>${ts.map(t=>`<button class="pal ${rec===t?'rec':''}" data-act="addType" data-arg="${t}" title="${esc(NT[t].desc)}">${ic(t)}<span>${NT[t].label}</span>${NT[t].live?'':tag('planned')}</button>`).join('')}`).join('')}</div>`}
+
+function viewStudio(){const G=computeStages();S._G=G;const dh={min:38,normal:240,big:430}[S.ui.dockSize];
+ return `<div class="studio">${viewToolbar()}${viewGuide(G)}${viewNotices(G)}
+ <div class="work" style="margin-top:8px">${viewPalette(G)}<div class="center">${canvasHtml()}<div class="dock" style="height:${dh}px">${viewDock(G)}</div></div><aside class="right ${S.ui.rightOpen?'':'col1'}" aria-label="Side panel">${viewRight(G)}</aside></div></div>`}
+
+/* ===== Right panel: Settings (inspector) and Assistant ===== */
+const inCols=(n,i)=>{const s=inputsOf(P(),n.id)[i];return s?resultOf(P(),s).cols:[]};
+const opt=(v,l,cur)=>`<option value="${esc(v)}" ${String(cur)===String(v)?'selected':''}>${esc(l)}</option>`;
+const colSel=(cols,cur,attrs)=>`<select ${attrs}><option value="">Choose a column…</option>${cols.map(c=>opt(c.name,`${c.name} (${c.type})`,cur)).join('')}</select>`;
+function viewRight(G){const tabs=[['settings','Settings'],['assistant','Assistant']];const sg=suggestions(G).length;
+ return `<div class="tabs" role="tablist">${tabs.map(([k,l])=>`<button class="tab ${S.ui.right===k?'on':''}" role="tab" aria-selected="${S.ui.right===k}" data-act="rtab" data-arg="${k}">${k==='assistant'?ic('ai',14):''}${l}${k==='assistant'&&sg?`<span class="pill info" style="padding:0 6px">${sg}</span>`:''}</button>`).join('')}<span class="sp"></span>${btn('toggleRight','',{cls:'ghost sm',icon:'x',aria:'Close side panel',title:'Close side panel'})}</div>
+ <div class="rbody">${S.ui.right==='assistant'?viewAssistant(G):viewInspector(G)}</div>`}
+
+function viewInspector(G){const n=S.ui.sel&&nodeById(P(),S.ui.sel);
+ if(!n){return `<h3 style="margin:0 0 4px">Pipeline</h3><p class="muted" style="margin:0 0 10px">Select a step on the canvas to edit it. Every step is visible here; nothing is hidden.</p>
+  <div class="sect"><h4>Data source</h4><div class="row"><span class="sd fresh"></span><b>Retail Demo DB</b><span class="pill">SQL Server</span></div><p class="muted" style="font-size:12.5px;margin-top:4px">Read-only. All steps read from this one source; joins across sources are blocked.</p></div>
+  <div class="sect"><h4>Steps (${P().nodes.length})</h4>${P().nodes.length?`<div class="col" style="gap:4px">${topo(P()).map(id=>{const m=nodeById(P(),id),st=nodeState(m);return `<button class="pal" data-act="selNode" data-arg="${id}">${ic(m.type)}<span><b>${id}</b> <span class="muted">${esc(nodeSummary(P(),m))}</span></span><i class="sd ${SD[st.k]||'ready'}" style="margin-left:auto"></i></button>`}).join('')}</div>`:'<p class="muted">No steps yet.</p>'}</div>`}
+ const t=NT[n.type],c=n.config,ins=inputsOf(P(),n.id),issues=nodeIssues(P(),n);
+ let h=`<div class="row"><span style="color:var(--accent)">${ic(n.type,20)}</span><div style="flex:1;min-width:0"><b>${t.label}</b> <span class="muted mono">${n.id}</span></div>${t.live?tag('live'):tag('planned')}${btn('delNode','',{arg:n.id,cls:'ghost sm danger',icon:'trash',aria:'Remove step '+n.id,title:'Remove this step (Delete)'})}</div><p class="muted" style="margin:4px 0 10px">${t.desc}</p>`;
+ if(!t.live)h+=`<div class="notice info" style="margin-bottom:10px">${ic('info')}<div class="b">The current backend cannot execute this step yet. It is calculated here in your browser so you can review the experience.</div></div>`;
+ if(issues.length)h+=`<div class="notice action" style="margin-bottom:10px">${ic('info')}<div class="b">${issues.map(esc).join('<br>')}</div></div>`;
+ if(portsOf(n.type).length){const others=P().nodes.filter(x=>x.id!==n.id&&x.type!=='output'&&!wouldCycle(P(),x.id,n.id));
+  h+=`<div class="sect"><h4>Inputs</h4>${portsOf(n.type).map((p,i)=>`<label class="f" style="margin-top:${i?8:0}px">${p==='in'?'Takes data from':p==='left'?'Left input':'Right input'}</label><select data-chg="cfgInput" data-n="${n.id}" data-port="${p}" aria-label="${p} input"><option value="">Not connected</option>${others.map(o=>opt(o.id,`${o.id} · ${o.type==='source'&&o.config.table?o.config.table:NT[o.type].label}`,ins[i])).join('')}</select>`).join('')}<p class="muted" style="font-size:12px;margin-top:6px">You can also drag a line between steps on the canvas.</p></div>`}
+ h+=`<div class="sect"><h4>Settings</h4>${inspectorForm(n)}</div>`;
+ if(n.type==='source')h+=viewHealth(n);
+ if(n.type==='join')h+=viewMeasure(n);
+ return h}
+
+function inspectorForm(n){const c=n.config,id=n.id,A=`data-n="${id}"`;
+ switch(n.type){
+ case 'source':return `<label class="f" style="margin-top:0">Table</label><select data-chg="cfgTable" ${A} aria-label="Table">${'<option value="">Choose a table…</option>'+Object.keys(TABLES).map(k=>opt(k,`retail.${k} (${fmt(tableCount(k))} rows)`,c.table)).join('')}</select><p class="muted" style="font-size:12.5px;margin-top:6px">Source: Retail Demo DB (SQL Server), read-only. ${tag('sim')}</p>`;
+ case 'join':{const L=inCols(n,0),R=inCols(n,1);return `<label class="f" style="margin-top:0">Join type</label><select data-chg="cfgJoinType" ${A} aria-label="Join type">${[['left','LEFT: keep every left row, add matches'],['inner','INNER: keep only rows that match'],['right','RIGHT: keep every right row'],['full','FULL: keep everything from both sides']].map(([v,l])=>opt(v,l,c.type)).join('')}</select>
+  <label class="f">Matching columns</label>${c.pairs.map((q,i)=>`<div class="row" style="margin-bottom:6px">${colSel(L,q.l,`data-chg="cfgPair" ${A} data-i="${i}" data-side="l" aria-label="Left column ${i+1}"`)}<span class="muted">=</span>${colSel(R,q.r,`data-chg="cfgPair" ${A} data-i="${i}" data-side="r" aria-label="Right column ${i+1}"`)}${c.pairs.length>1?btn('delPair','',{arg:id+'|'+i,cls:'ghost sm',icon:'x',aria:'Remove column pair'}):''}</div>`).join('')}<button class="btn sm" data-act="addPair" data-arg="${id}">${ic('plus')}Add column pair</button>`}
+ case 'filter':{const I=inCols(n,0);return c.conds.map((q,i)=>`<div class="col" style="gap:5px;margin-bottom:8px">${colSel(I,q.col,`data-chg="cfgCond" ${A} data-i="${i}" data-f="col" aria-label="Filter column"`)}<div class="row"><select data-chg="cfgCond" ${A} data-i="${i}" data-f="op" aria-label="Filter operator">${Object.entries(OPS).map(([k,l])=>opt(k,l,q.op)).join('')}</select>${['is_null','is_not_null'].includes(q.op)?'':`<input type="text" data-chg="cfgCond" ${A} data-i="${i}" data-f="value" value="${esc(q.value)}" placeholder="value" aria-label="Filter value">`}${c.conds.length>1?btn('delCond','',{arg:id+'|'+i,cls:'ghost sm',icon:'x',aria:'Remove condition'}):''}</div></div>`).join('')+`<button class="btn sm" data-act="addCond" data-arg="${id}">${ic('plus')}Add condition</button><p class="muted" style="font-size:12px;margin-top:6px">All conditions must be true.</p>`}
+ case 'drop_columns':{const I=inCols(n,0);return I.length?`<div class="col" style="gap:3px">${I.map(k=>`<label class="row"><input type="checkbox" data-chg="cfgDrop" ${A} data-c="${esc(k.name)}" ${c.cols.includes(k.name)?'checked':''} style="width:auto"> ${esc(k.name)} <span class="muted">${k.type}</span></label>`).join('')}</div>`:'<p class="muted">Connect an input to choose columns.</p>'}
+ case 'rename_columns':{const I=inCols(n,0);return I.length?`<div class="col" style="gap:5px">${I.map(k=>`<div class="row"><span style="width:42%;overflow:hidden;text-overflow:ellipsis" title="${esc(k.name)}">${esc(k.name)}</span><span class="muted">→</span><input type="text" data-chg="cfgRename" ${A} data-c="${esc(k.name)}" value="${esc(c.map[k.name]||'')}" placeholder="new name" aria-label="New name for ${esc(k.name)}"></div>`).join('')}</div>`:'<p class="muted">Connect an input to rename columns.</p>'}
+ case 'remove_duplicates':{const I=inCols(n,0);return `<p class="t2" style="margin:0 0 6px">Keeps the first row for each combination of the chosen columns. Choose none to compare whole rows.</p>${I.length?`<div class="col" style="gap:3px">${I.map(k=>`<label class="row"><input type="checkbox" data-chg="cfgDedupe" ${A} data-c="${esc(k.name)}" ${c.cols.includes(k.name)?'checked':''} style="width:auto"> ${esc(k.name)}</label>`).join('')}</div>`:'<p class="muted">Connect an input to choose columns.</p>'}`}
+ case 'handle_missing':{const I=inCols(n,0);return `<label class="f" style="margin-top:0">Column</label>${colSel(I,c.col,`data-chg="cfgMissing" ${A} data-f="col" aria-label="Column"`)}<label class="f">What to do with empty values</label><select data-chg="cfgMissing" ${A} data-f="action" aria-label="Action">${opt('drop_rows','Remove those rows',c.action)}${opt('fill','Fill with a value',c.action)}</select>${c.action==='fill'?`<label class="f">Value</label><input type="text" data-chg="cfgMissing" ${A} data-f="value" value="${esc(c.value)}" aria-label="Fill value">`:''}`}
+ case 'aggregate':{const I=inCols(n,0);return `<label class="f" style="margin-top:0">Group by (one output row per combination)</label>${I.length?`<div class="col" style="gap:3px">${I.map(k=>`<label class="row"><input type="checkbox" data-chg="cfgBy" ${A} data-c="${esc(k.name)}" ${c.by.includes(k.name)?'checked':''} style="width:auto"> ${esc(k.name)}</label>`).join('')}</div>`:'<p class="muted">Connect an input first.</p>'}
+  <label class="f">Calculations</label>${c.metrics.map((m,i)=>`<div class="col" style="gap:5px;margin-bottom:8px;padding:8px;border:1px solid var(--line);border-radius:7px"><div class="row"><select data-chg="cfgMetric" ${A} data-i="${i}" data-f="fn" aria-label="Function">${[['count','count rows'],['count_distinct','count distinct'],['sum','sum'],['avg','average'],['min','minimum'],['max','maximum']].map(([v,l])=>opt(v,l,m.fn)).join('')}</select>${colSel(I,m.col,`data-chg="cfgMetric" ${A} data-i="${i}" data-f="col" aria-label="Column"`)}</div><div class="row"><span class="muted">name</span><input type="text" data-chg="cfgMetric" ${A} data-i="${i}" data-f="as" value="${esc(m.as)}" aria-label="Result name">${c.metrics.length>1?btn('delMetric','',{arg:id+'|'+i,cls:'ghost sm',icon:'x',aria:'Remove calculation'}):''}</div></div>`).join('')}<button class="btn sm" data-act="addMetric" data-arg="${id}">${ic('plus')}Add calculation</button>`}
+ case 'derive':{const I=inCols(n,0);return `<label class="f" style="margin-top:0">New column name</label><input type="text" data-chg="cfgDerive" ${A} data-f="name" value="${esc(c.name)}" aria-label="New column name"><label class="f">Calculation</label><div class="col" style="gap:5px">${colSel(I,c.a,`data-chg="cfgDerive" ${A} data-f="a" aria-label="First column"`)}<select data-chg="cfgDerive" ${A} data-f="op" aria-label="Operator">${[['mul','× multiply'],['add','+ add'],['sub','− subtract'],['div','÷ divide']].map(([v,l])=>opt(v,l,c.op)).join('')}</select>${colSel(I,c.b,`data-chg="cfgDerive" ${A} data-f="b" aria-label="Second column"`)}</div>`}
+ case 'output':return `<label class="f" style="margin-top:0">Dataset name</label><input type="text" data-chg="cfgOut" ${A} value="${esc(c.name)}" aria-label="Dataset name"><p class="muted" style="font-size:12.5px;margin-top:6px">This marks the dataset the pipeline produces. Publishing happens from the guide above, after validation and a run.</p>`}
+ return ''}
+
+
+/* Data health (per table) */
+const hState=(nid,f)=>{S.ui.hc=S.ui.hc||{};const k=nid+':'+f.id;return S.ui.hc[k]||(S.ui.hc[k]={choice:recommend(f).pick,val:''})};
+function viewHealth(n){const c=n.config;if(!c.table)return '';const fixes=c.fixes||[],H=tableHealth(c.table,fixes),F=H.findings.filter(f=>!f.reviewed),done=fixes.map((fx,i)=>({fx,i}));
+ let h=`<div class="sect" id="health"><h4>Data health ${tag('sim','Calculated on sample data')}</h4><p class="t2" style="margin:0 0 8px">${fmt(H.rows)} rows · ${H.cols} columns after fixes. ${F.length?`<b style="color:var(--warn)">${F.length} thing${F.length>1?'s':''} to look at.</b>`:'<b style="color:var(--ok)">Nothing left to fix.</b>'}</p>`;
+ if(!F.length&&!done.length)h+=`<p class="muted" style="margin:0">No empty values or repeated keys were found in this table.</p>`;
+ F.forEach(f=>{const rec=recommend(f),st=hState(n.id,f),opts=optionsFor(f);if(!opts.includes(st.choice))st.choice=rec.pick;
+  const ready=!(st.choice==='value'&&!String(st.val||'').trim()),fx=mkFix(f,st.choice,st.val),ef=ready?fixEffect(c.table,fixes,fx):null;
+  h+=`<div class="hf"><div class="row"><b class="mono">${esc(f.col)}</b><span class="sp"></span><span class="pill warn">${f.kind==='dup'?`${f.keys} repeated value${f.keys>1?'s':''} · ${f.extra} extra row${f.extra>1?'s':''}`:`${fmt(f.n)} of ${fmt(f.total)} empty (${(100*f.pct).toFixed(1)}%)`}</span></div>
+  <div class="ai">${ic('ai',14)}<div><b>Suggested: ${esc(CHOICE_LABEL[rec.pick])}.</b> ${esc(rec.why)}<div class="muted" style="font-size:11.5px;margin-top:3px">Rule-based suggestion in this prototype. You decide.</div></div></div>
+  <label class="f">Your choice (★ = suggested)</label><select data-chg="hChoice" data-k="${esc(n.id+':'+f.id)}" aria-label="Treatment for ${esc(f.col)}">${opts.map(o=>opt(o,CHOICE_LABEL[o]+(o===rec.pick?' ★':''),st.choice)).join('')}</select>
+  ${st.choice==='value'?`<input type="text" data-chg="hVal" data-k="${esc(n.id+':'+f.id)}" value="${esc(st.val)}" placeholder="Type the value" aria-label="Fill value for ${esc(f.col)}" style="margin-top:6px">`:''}
+  <div class="eff">${ef?`<b>Result if you apply this</b>${PLANNED_FILL.includes(st.choice)?' '+tag('planned'):''}<div>Rows: ${fmt(ef.rowsBefore)} → ${fmt(ef.rowsAfter)}${ef.colGone?'':f.kind==='null'||ef.emptyBefore?` · Empty in ${esc(f.col)}: ${fmt(ef.emptyBefore)} → ${fmt(ef.emptyAfter)}`:''}${ef.colGone?` · Column ${esc(f.col)} removed`:''}${ef.fillv!=null&&st.choice!=='value'?` · Fill value: <b>${esc(ef.fillv)}</b>`:''}</div>${ef.sample.map(s=>`<div class="muted mono" style="font-size:11.5px">${esc(s)}</div>`).join('')}`:'<span class="muted">Type a value to see the result.</span>'}</div>
+  <div class="row" style="margin-top:8px">${btn('hApply',st.choice==='keep'?'Keep blank':'Apply fix',{arg:n.id+'|'+f.id,cls:'pri sm',dis:!ready})}</div></div>`});
+ if(done.length)h+=`<h4 style="margin:10px 0 4px">Applied to this table</h4>${done.map(({fx,i})=>`<div class="row" style="margin-bottom:4px">${ic('check',14)}<span style="flex:1;min-width:0">${esc(fixText(fx))}${isPlannedFix(fx)?' '+tag('planned'):''}</span>${btn('hUndo','Undo',{arg:n.id+'|'+i,cls:'ghost sm',title:'Remove this fix. Then choose again if you want a different one.'})}</div>`).join('')}`;
+ return h+'</div>'}
+
+/* join measurement */
+function viewMeasure(j){const st=joinStatus(j),m=S.meas[j.id],sg=SG(),busy=S.ui.busy['m:'+j.id];
+ let h=`<div class="sect"><h4>Join measurement ${tag('sim','Calculated on sample data')}</h4>`;
+ if(st==='setup')return h+`<p class="muted">Finish the join settings first. Then you can measure how the two inputs match on the real rows.</p></div>`;
+ if(busy)return h+`<div class="row"><span class="spin"></span> Measuring both inputs…</div></div>`;
+ if(!m||m.sig!==sg[j.id]){h+=`<p class="t2">${m?'<b style="color:var(--warn)">Out of date.</b> This join or its inputs changed after the last measurement.':'Not measured yet.'} Measuring counts matches, unmatched rows and repeated rows using the actual data, so you can see the effect before trusting the join.</p><div style="margin-top:8px">${btn('measure',m?'Measure again':'Measure join',{arg:j.id,cls:'pri',id:'measure'})}</div></div>`;return h}
+ const x=m.m,pct=v=>(100*v/(x.leftRows||1)).toFixed(1)+'%';
+ h+=`<dl class="kv"><dt>Left rows</dt><dd>${fmt(x.leftRows)}</dd><dt>Right rows</dt><dd>${fmt(x.rightRows)}</dd><dt>Left rows with a match</dt><dd>${fmt(x.matched)} (${pct(x.matched)})</dd><dt>Left rows without a match</dt><dd>${fmt(x.unmatchedLeft)}</dd><dt>Right rows never used</dt><dd>${fmt(x.rightUnmatched)}</dd><dt>Relationship</dt><dd>${x.cardinality} (up to ${x.maxPerKey} right rows per key)</dd><dt>Output rows</dt><dd><b>${fmt(x.out)}</b> (from ${fmt(x.baseRows)})</dd></dl>
+ <div class="bar ${x.matched/x.leftRows>.95?'ok':''}" style="margin-top:8px" aria-hidden="true"><i style="width:${pct(x.matched)}"></i></div>`;
+ if(x.fanOut){const ack=S.acks[j.id]===m.sig;h+=`<div class="notice ${ack?'info':'warning'}" style="margin-top:10px">${ic('warn')}<div class="b"><b>Rows are repeated.</b> ${fmt(x.baseRows)} rows became ${fmt(x.out)} (+${fmt(x.extra)}). ${x.leftDupRows?`${fmt(x.leftDupRows)} left rows share a key with another left row, which multiplies matches. `:''}A later step (such as Aggregate) must return the data to the grain you want, or totals will be overcounted.</div></div>
+  ${ack?`<div class="row" style="margin-top:8px"><span class="pill ok">You accepted this</span>${btn('unack','Withdraw',{arg:j.id,cls:'sm ghost'})}</div>`:`<label class="row" style="margin-top:8px;align-items:flex-start"><input type="checkbox" id="ackchk" style="width:auto;margin-top:3px" data-chg="ackTick" ${S.ui.ackTick?'checked':''}> <span>I understand that rows are repeated and I will bring the data back to the right grain in a later step.</span></label><div style="margin-top:8px">${btn('ack','Accept repeated rows',{arg:j.id,cls:'pri',id:'ackbtn',dis:!S.ui.ackTick})}</div>`}`}
+ else h+=`<div class="notice info" style="margin-top:10px">${ic('passed')}<div class="b">No repeated rows from this join. ${x.unmatchedLeft?`${fmt(x.unmatchedLeft)} left rows have no match; with a ${j.config.type.toUpperCase()} join they ${j.config.type==='inner'?'are dropped':'are kept with empty values'}.`:''}</div></div>`;
+ return h+`<div style="margin-top:8px">${btn('measure','Measure again',{arg:j.id,cls:'sm ghost'})}</div></div>`}
+
+/* ===== Assistant ===== */
+function suggestions(G){G=G||S._G||computeStages();const out=[],p=P(),dis=S.ui.dismissed;
+ const tablesOf=id=>{const s=new Set();const w=i=>{const n=nodeById(p,i);if(!n)return;if(n.type==='source'&&n.config.table)s.add(n.config.table);inputsOf(p,i).forEach(x=>x&&w(x))};w(id);return s};
+ const used=new Set(p.edges.map(e=>e.from));const front=p.nodes.filter(n=>!['output'].includes(n.type)&&!used.has(n.id)&&(n.type!=='source'||n.config.table));
+ // 1. join suggestions between loose pieces
+ for(let a=0;a<front.length;a++)for(let b=0;b<front.length;b++){if(a===b)continue;const A=front[a],B=front[b];const ta=tablesOf(A.id),tb=tablesOf(B.id);
+  const rel=REL.find(r=>{const[f]=r.from.split('.'),[t]=r.to.split('.');return ta.has(t)&&tb.has(f)});if(!rel)continue;const key='join:'+A.id+'>'+B.id;if(dis[key])continue;if(out.some(o=>o.pairKey===[A.id,B.id].sort().join()))continue;
+  const[,fc]=rel.from.split('.'),[,tc]=rel.to.split('.');out.push({id:key,pairKey:[A.id,B.id].sort().join(),kind:'join',title:`Join ${A.id} to ${B.id} on ${tc} = ${fc}`,why:rel.kind==='declared'?'A foreign key is declared in the database between these tables. A LEFT join keeps every row of the left side.':rel.why,ev:`${rel.from} → ${rel.to}: ${(rel.match*100).toFixed(1)}% of values match${rel.kind==='declared'?' · declared relationship':' · inferred, not declared'}`,conf:rel.kind==='declared'?'High':'Medium',warn:rel.kind==='inferred'?'Inferred relationship. Check the match rate before relying on it.':null,args:{a:A.id,b:B.id,l:tc,r:fc}})}
+ // 3. aggregate suggestion for the customer goal
+ const j=p.nodes.filter(n=>n.type==='join'),lastJ=j.find(n=>!p.edges.some(e=>e.from===n.id&&nodeById(p,e.to).type!=='output'));
+ const hasAgg=p.nodes.some(n=>n.type==='aggregate');
+ if(lastJ&&!hasAgg&&!dis.agg&&G.joins.every(x=>!nodeIssues(p,x).length)&&tablesOf(lastJ.id).has('order_items')&&tablesOf(lastJ.id).has('customers'))out.push({id:'agg',kind:'agg',title:'Aggregate to one row per customer',why:'Your goal is a customer-level dataset. After the joins each customer appears once per order line. Grouping by customer returns one row per customer with the order count, total order value and latest order date.',ev:'count_distinct(order_id), sum(line_total), max(order_date), grouped by customer fields',conf:'High',planned:true,args:{after:lastJ.id}});
+ // 4. output
+ if(!G.out&&!dis.out&&(hasAgg||(lastJ&&G.st.join==='complete'&&false))){const last=p.nodes.find(n=>!['output'].includes(n.type)&&!p.edges.some(e=>e.from===n.id));if(last)out.push({id:'out',kind:'out',title:'Add the Output dataset step',why:'The Output step marks the dataset this pipeline produces. Validation and the run need it.',ev:'Connects after '+last.id,conf:'High',args:{after:last.id}})}
+ return out}
+function viewAssistant(G){const sg=suggestions(G);
+ return `<div class="row"><b>Suggestions</b>${tag('sim','Scripted, evidence-based')}</div><p class="muted" style="font-size:12.5px;margin:4px 0 10px">The assistant looks at your pipeline and the data, then proposes steps. Nothing is applied until you press Accept, and every change appears on the canvas where you can edit or undo it.</p>
+ ${sg.length?sg.map(s=>`<div class="sugg" data-sugg="${esc(s.id)}"><h5>${ic('ai',14)}${esc(s.title)}${s.planned?tag('planned','Not in product yet'):''}<span class="pill ${s.conf==='High'?'ok':'warn'}" style="margin-left:auto">${s.conf}</span></h5><div class="why">${esc(s.why)}</div><div class="ev">${esc(s.ev)}</div>${s.warn?`<div class="row" style="color:var(--warn);margin-top:5px;font-size:12.5px">${ic('warn')}<span>${esc(s.warn)}</span></div>`:''}
+  <div class="acts">${btn('suggAccept','Accept',{arg:s.id,cls:'sm pri'})}${s.kind==='join'?btn('suggEdit','Accept and edit',{arg:s.id,cls:'sm'}):''}${btn('suggReject','Reject',{arg:s.id,cls:'sm ghost'})}</div></div>`).join(''):`<div class="muted" style="padding:6px 0 12px">No suggestions right now. ${P().nodes.length?'Keep building, or run validation to get fixes based on measured problems.':'Add tables to get join suggestions.'}</div>`}
+ <hr style="border:0;border-top:1px solid var(--line);margin:12px 0"><b>Ask a question</b>
+ <div class="row" style="flex-wrap:wrap;gap:6px;margin:8px 0">${['Why are rows repeated?','What does LEFT join do?','Is it safe to publish?','Which tables do I need?'].map(q=>btn('ask',q,{arg:q,cls:'sm'})).join('')}</div>
+ <div class="row"><input type="text" id="askin" placeholder="Ask about joins, repeated rows, grain…" aria-label="Ask the assistant" data-inp="askin"><button class="btn sm pri" data-act="askTyped">Ask</button></div>
+ <div class="col" style="margin-top:10px">${S.chat.map(m=>`<div class="sect" style="margin:0;${m.r==='me'?'background:var(--accentbg)':''}"><div class="muted" style="font-size:11.5px">${m.r==='me'?'You':'Assistant'}</div>${esc(m.t)}</div>`).join('')}</div>`}
+const QA=[[/repeat|fan|multipl|more rows|inflat|overcount/i,()=>{const j=P().nodes.filter(n=>n.type==='join').map(n=>({n,m:S.meas[n.id]})).filter(x=>x.m&&x.m.m);return 'A join repeats rows when one left row matches several right rows (for example one customer with many orders). That is often correct, but totals then need care. '+(j.length?j.map(x=>`${x.n.id}: ${fmt(x.m.m.baseRows)} → ${fmt(x.m.m.out)} rows.`).join(' ')+' ':'Measure a join to see exactly how many rows it adds. ')+'Also check the key: if customer_id repeats in the customers table itself, every matching order is repeated again.'}],
+ [/left|inner|join type/i,()=>'A LEFT join keeps every row from the left input and adds matching data from the right; unmatched rows get empty values. An INNER join keeps only rows that match on both sides, so customers without orders disappear. For a customer-level dataset, LEFT keeps customers who have not ordered yet.'],
+ [/safe|publish|trust/i,()=>{const v=S.val&&S.val.sig===pipeSig()?S.val:null;return v?`Validation ran on the current settings: ${v.checks.filter(c=>c.level==='error').length} errors, ${v.checks.filter(c=>c.level==='warning').length} warnings, ${v.checks.filter(c=>c.level==='passed').length} passed. Publishing is only offered when no errors remain, and it always needs your approval.`:'Not yet. Run validation first; publishing needs a validation with no errors, a successful run and your approval.'}],
+ [/table|need/i,()=>'For customer details, order count, total value and latest order date you need customers (who), orders (when, how many) and order_items (line values). The Catalog shows the declared relationships between them.'],
+ [/aggregate|grain|one row/i,()=>'Grain means what one row represents. After joining customers, orders and items, one row is an order line. Aggregating by customer returns the grain to one row per customer.'],
+ [/automl|model|train/i,()=>'After you publish a validated dataset it appears under Datasets, where you choose a target column and open the AutoML training flow. You make that choice; the assistant only ranks candidates.']];
+
+/* ===== Dock: Preview, SQL, Validation, Run, Final dataset, History and lineage ===== */
+const DOCK=[['preview','Preview'],['sql','SQL'],['validation','Validation'],['run','Run'],['final','Final dataset'],['history','History and lineage']];
+function targetNode(){const p=P();return (S.ui.sel&&nodeById(p,S.ui.sel))||outputNode()||(p.nodes.length?nodeById(p,topo(p).slice(-1)[0]):null)}
+function valState(){if(!S.val)return null;return S.val.sig===pipeSig()?'current':'old'}
+function viewDock(G){const dot=k=>{if(k==='validation'){const v=S.val;if(!v)return '';const w=v.checks.some(c=>c.level==='error')?'err':v.checks.some(c=>c.level==='warning')?'warn':'ok';return `<i class="dot ${w}"></i>`}if(k==='run'&&S.run)return `<i class="dot ${S.run.state==='failed'?'err':S.run.state==='done'?'ok':'info'}"></i>`;return ''};
+ const head=`<div class="dh"><div class="tabs" style="flex:1;border:0" role="tablist">${DOCK.map(([k,l])=>`<button class="tab ${S.ui.dock===k?'on':''}" role="tab" aria-selected="${S.ui.dock===k}" data-act="dock" data-arg="${k}">${dot(k)}${l}</button>`).join('')}</div>${S.ui.dockSize==='min'?btn('dockSize','',{arg:'normal',cls:'ghost sm',icon:'plus',aria:'Expand bottom panel'}):`${btn('dockSize','',{arg:S.ui.dockSize==='big'?'normal':'big',cls:'ghost sm',icon:'fit',aria:S.ui.dockSize==='big'?'Make the bottom panel smaller':'Make the bottom panel larger',title:'Resize'})}${btn('dockSize','',{arg:'min',cls:'ghost sm',icon:'minus',aria:'Collapse bottom panel'})}`}</div>`;
+ if(S.ui.dockSize==='min')return head;
+ const k=S.ui.dock;const body={preview:dockPreview,sql:dockSql,validation:dockValidation,run:dockRun,final:dockFinal,history:dockHistory}[k](G);
+ return head+`<div class="db">${body}</div>`}
+
+function dockPreview(){const n=targetNode();if(!n)return '<div class="muted" style="padding:16px">Nothing to preview yet. Add tables to the canvas first.</div>';
+ const sg=SG(),pv=S.previews[n.id],busy=S.ui.busy['p:'+n.id],issues=nodeIssues(P(),n);
+ const bar=(extra)=>`<div class="row" style="padding:8px 12px;border-bottom:1px solid var(--line)"><b>${esc(n.id)}</b><span class="muted">${esc(NT[n.type].label)}</span>${tag('sim','Calculated on sample data')}${NT[n.type].live?'':tag('planned')}<span class="sp"></span>${extra||''}</div>`;
+ if(issues.length)return bar()+`<div class="muted" style="padding:16px">This step cannot be previewed yet: ${esc(issues[0])}</div>`;
+ if(busy)return bar()+`<div class="row" style="padding:16px"><span class="spin"></span> Reading rows…</div>`;
+ if(!pv)return bar()+`<div style="padding:16px"><p class="t2" style="margin:0 0 10px">A preview shows the actual rows this step produces. Nothing is loaded until you ask.</p>${btn('previewNode','Preview this step',{arg:n.id,cls:'pri',id:'previewbtn'})}</div>`;
+ const stale=pv.sig!==sg[n.id],res=pv.res;
+ return bar(`<span class="pill">${fmt(res.rows.length)} rows</span><span class="pill">${res.cols.length} columns</span><input type="search" data-inp="pq" value="${esc(S.ui.pq||'')}" placeholder="Search rows" aria-label="Search preview rows" style="width:160px">${stale?btn('previewNode','Refresh preview',{arg:n.id,cls:'sm pri'}):''}`)
+  +(stale?`<div class="stale-banner">${ic('warn')} Preview is out of date. This step or something before it changed. The rows below are from before the change.</div>`:'')+grid(res,{limit:60,q:S.ui.pq})}
+
+function dockSql(){const n=targetNode();if(!n)return '<div class="muted" style="padding:16px">No steps yet.</div>';const p=P();
+ let full='';if(outputNode()){const ids=topo(p).filter(id=>id===outputNode().id||ancestors(outputNode().id).has(id));full='WITH\n'+ids.map(id=>`${id} AS (\n  ${nodeSql(p,nodeById(p,id)).replace(/\n/g,'\n  ')}\n)`).join(',\n')+`\nSELECT * FROM ${outputNode().id};`}
+ return `<div class="grid2" style="padding:12px"><div><div class="row" style="margin-bottom:6px"><b>${esc(n.id)}</b>${tag('sim','Illustrative SQL')}</div><div class="sqlbox">${esc(nodeSql(p,n))}</div><p class="muted" style="font-size:12.5px;margin-top:6px">Read-only. The real product compiles each step into a SELECT in the data source's own dialect and never changes your database.${NT[n.type].live?'':' This step type is planned: its SQL is shown for explanation only.'}</p></div>
+ <div><b>Whole pipeline</b><div class="sqlbox" style="margin-top:6px;max-height:190px;overflow:auto">${esc(full||'-- Add an Output step to see the full query.')}</div></div></div>`}
+
+function dockValidation(G){const v=S.val,st=valState();
+ if(!v)return `<div style="padding:16px"><p class="t2" style="margin:0 0 8px">Validation checks the final dataset against the real data: key uniqueness, repeated rows, totals against the source, grain, empty values and business rules. Nothing is marked as passed without evidence.</p><p class="muted">Run it from the <b>Validate</b> stage in the guide above.</p><div style="margin-top:8px">${btn('stage','Go to the Validate stage',{arg:'validate',cls:'sm'})}</div></div>`;
+ const c=v.checks,cnt=l=>c.filter(x=>x.level===l).length;
+ return `${st==='old'?`<div class="stale-banner">${ic('warn')} Out of date. Something changed after this validation ran. Use the Validate stage in the guide to run it again.</div>`:''}
+ <div class="row" style="padding:8px 12px;border-bottom:1px solid var(--line)"><span class="pill err">${cnt('error')} errors</span><span class="pill warn">${cnt('warning')} warnings</span><span class="pill info">${cnt('info')} notes</span><span class="pill ok">${cnt('passed')} passed</span><span class="muted" style="margin-left:auto;font-size:12px">Ran ${v.when} on current sample data ${tag('sim')}</span></div>
+ ${c.map(x=>`<div class="chk ${x.level}" data-check="${esc(x.id)}">${ic(x.level==='passed'?'passed':x.level==='error'?'error':x.level==='warning'?'warn':'info')}<div class="b"><b>${esc(x.title)}</b><div class="t2">${esc(x.plain)}</div><div class="ev">Evidence: ${esc(x.evidence)}</div></div><div class="col" style="gap:5px;align-items:flex-end">${x.node&&nodeById(P(),x.node)?btn('selNode','Show step '+x.node,{arg:x.node,cls:'sm'}):''}${x.fixKey&&x.fixKey.type==='remove_duplicates'&&x.level==='error'&&st==='current'?btn('applyFix','Add suggested fix',{arg:x.id,cls:'sm pri',title:'Adds a fix to the table card '+x.fixKey.after+' (keep one row per value). You can undo it there.'}):''}${x.healthNode&&nodeById(P(),x.healthNode)&&st==='current'?btn('selNode','Open Data health',{arg:x.healthNode,cls:'sm'}):''}</div></div>`).join('')}`}
+
+function runSteps(){const out=outputNode();if(!out)return[];const A=ancestors(out.id);return topo(P()).filter(id=>id===out.id||A.has(id))}
+function dockRun(G){const r=S.run&&S.run.sig===pipeSig()?S.run:null,ids=runSteps();
+ if(!ids.length)return '<div class="muted" style="padding:16px">Add an Output step to define what a run produces.</div>';
+ const stText={queued:'Waiting',running:'Running',done:'Done',failed:'Failed'};
+ return `<div style="padding:12px"><div class="notice warning" style="margin-bottom:10px">${ic('warn')}<div class="b">Simulated run. The current Visual ETL Builder can validate and preview but cannot execute or save a pipeline yet. This shows the intended step-by-step status.</div></div>
+ <div class="row" style="margin-bottom:8px"><b>${r?`Run #${r.id}`:'What will run'}</b>${r?`<span class="pill ${r.state==='done'?'ok':r.state==='failed'?'err':'info'}">${{running:'Running',done:'Completed',failed:'Failed'}[r.state]}</span>${r.state!=='running'?`<span class="muted">${r.dur} s · ${r.when}</span>`:''}`:'<span class="muted">Start the run from the Final dataset stage in the guide.</span>'}</div>
+ <div class="steps">${ids.map((id,i)=>{const n=nodeById(P(),id),s=r?r.steps[id]:'queued';return `<div class="step" data-runstep="${id}"><span class="muted" style="width:18px">${i+1}</span><i class="sd ${SD[s]||'q'}"></i><div style="flex:1;min-width:0"><b>${id}</b> <span class="muted">${esc(NT[n.type].label)} · ${esc(nodeSummary(P(),n))}</span>${r&&r.error&&r.error.step===id?`<div style="color:var(--err)">${esc(r.error.msg)}</div>`:''}</div><span class="muted" style="font-size:12.5px">${r?stText[s]:'Waiting'}</span>${r&&s==='failed'?btn('selNode','Open step',{arg:id,cls:'sm'}):''}</div>`}).join('')}</div></div>`}
+
+function dockFinal(G){const out=outputNode();if(!out)return '<div class="muted" style="padding:16px">Add an Output step to define the final dataset.</div>';
+ if(G.st.validate==='incomplete')return '<div class="muted" style="padding:16px">The final dataset appears here after the pipeline is complete.</div>';
+ const R=resultOf(P(),out.id,SG()),r=S.run&&S.run.sig===pipeSig()?S.run:null,ds=r&&S.datasets.find(d=>d.runId===r.id);
+ return `<div class="row" style="padding:8px 12px;border-bottom:1px solid var(--line)"><b>${esc(out.config.name)}</b><span class="pill">${fmt(R.rows.length)} rows</span><span class="pill">${R.cols.length} columns</span>${ds?`<span class="pill ok">Published v${ds.version}</span>`:r&&r.state==='done'?'<span class="pill info">Run complete, not published</span>':'<span class="pill">Not run yet</span>'}${tag('sim','Calculated on sample data')}<span class="muted" style="margin-left:auto;font-size:12px">${valState()==='current'?'Validated on current settings':'Not validated on current settings'}</span></div>${grid(R,{limit:40})}`}
+
+function pathTo(fromId,toId){const q=[[fromId]],seen=new Set([fromId]);while(q.length){const pth=q.shift(),last=pth[pth.length-1];if(last===toId)return pth;P().edges.filter(e=>e.from===last).forEach(e=>{if(!seen.has(e.to)){seen.add(e.to);q.push([...pth,e.to])}})}return null}
+function dockHistory(G){const t=S.ui.histTab;const tabs=[['lineage','Lineage'],['edits','Edit history'],['versions','Versions']];
+ let body='';
+ if(t==='lineage'){const out=outputNode();if(!out||G.st.validate==='incomplete')body='<div class="muted" style="padding:16px">Lineage appears once the pipeline reaches an Output step.</div>';
+  else{const R=resultOf(P(),out.id,SG()),sel=R.cols.find(c=>c.name===S.ui.lineageCol)||R.cols[0];const srcs=P().nodes.filter(n=>n.type==='source');
+   body=`<div class="ml" style="grid-template-columns:260px 1fr"><div class="list">${R.cols.map(c=>`<div class="li ${sel&&sel.name===c.name?'on':''}" data-act="lineageCol" data-arg="${esc(c.name)}"><div style="flex:1"><b>${esc(c.name)}</b><div class="muted" style="font-size:12px">${(c.origin||[]).join(', ')||'calculated'}</div></div></div>`).join('')}</div>
+   <div style="padding:14px;overflow:auto"><div class="row" style="margin-bottom:8px"><b>${esc(sel?sel.name:'')}</b>${sel&&sel.via?`<span class="pill info">${esc(sel.via)}</span>`:''}${tag('sim','Column-level lineage from this pipeline')}</div>
+   ${sel&&(sel.origin||[]).length?sel.origin.map(o=>{const[tn]=o.split('.');const sn=srcs.find(s=>s.config.table===tn);const pth=sn?pathTo(sn.id,out.id):null;return `<div class="sect"><div class="row" style="flex-wrap:wrap;gap:6px"><span class="pill">${o}</span>${(pth||[]).map(id=>`<span class="muted">→</span><button class="pill info" data-act="selNode" data-arg="${id}">${id}</button>`).join('')}<span class="muted">→</span><span class="pill ok">${esc(sel.name)}</span></div></div>`}).join(''):'<p class="muted">This column is not read directly from a source column.</p>'}
+   <p class="muted" style="font-size:12.5px">Table-level: ${srcs.map(s=>s.config.table).filter(Boolean).join(', ')} → ${P().nodes.length-srcs.length-1} steps → ${esc(out.config.name)}. Click a step to open it.</p></div></div>`}}
+ else if(t==='edits')body=`<div style="padding:12px"><p class="muted" style="margin:0 0 8px">Every change you make while editing. Use Undo and Redo in the toolbar to move through it. This is not the same as saved versions or run history.</p><div class="col" style="gap:4px">${S.hist.future.slice().reverse().map(e=>`<div class="step" style="opacity:.5"><span class="muted">redo</span><span>${esc(e.label)}</span></div>`).join('')}<div class="step" style="border-color:var(--accent)"><span class="pill info">now</span><b>${esc(S.hist.cur)}</b></div>${S.hist.past.slice().reverse().map(e=>`<div class="step"><span class="muted">before</span><span>${esc(e.label)}</span></div>`).join('')}</div></div>`;
+ else body=`<div style="padding:12px">${S.versions.length?`<div class="col">${S.versions.map(v=>`<div class="step"><b>${v.id}</b><span style="flex:1">${esc(v.label)} <span class="muted">· ${v.when} · ${v.pipe.nodes.length} steps</span></span>${btn('verCompare','Compare with current',{arg:v.id,cls:'sm'})}${btn('verRestore','Restore',{arg:v.id,cls:'sm'})}</div>`).join('')}</div>`:'<p class="muted">No saved versions yet. Use Save version in the toolbar to keep a snapshot you can restore.</p>'}${S.ui.verDiff?`<div class="sect" style="margin-top:10px"><h4>${S.ui.verDiff.id} compared with the current pipeline</h4>${S.ui.verDiff.lines.map(l=>`<div class="${l[0]}">${esc(l[1])}</div>`).join('')||'<span class="muted">No differences.</span>'}</div>`:''}</div>`;
+ return `<div class="tabs" style="padding-left:10px">${tabs.map(([k,l])=>`<button class="tab ${t===k?'on':''}" data-act="histTab" data-arg="${k}">${l}</button>`).join('')}</div>${body}`}
+
+/* publish approval modal */
+function modalExtra(m){
+ if(m==='publish'){const out=outputNode(),r=S.run,v=S.val;const w=v?v.checks.filter(c=>c.level==='warning').length:0,acc=P().nodes.filter(n=>n.type==='join'&&S.acks[n.id]).length;
+  return `<h2>Publish this dataset?</h2><p class="t2" style="margin:6px 0 10px">Publishing makes a read-only snapshot available under <b>Datasets</b> for AutoML and other uses. It does not change your source database.</p>
+  <dl class="kv"><dt>Dataset</dt><dd>${esc(out.config.name)}</dd><dt>Rows</dt><dd>${fmt(resultOf(P(),out.id,SG()).rows.length)}</dd><dt>From</dt><dd>Run #${r.id}</dd><dt>Validation</dt><dd>0 errors, ${w} warning${w===1?'':'s'}</dd><dt>Accepted repeats</dt><dd>${acc} join${acc===1?'':'s'}</dd></dl>
+  <label class="row" style="margin-top:12px;align-items:flex-start"><input type="checkbox" data-chg="pubTick" ${S.ui.pubTick?'checked':''} style="width:auto;margin-top:3px"> <span>I reviewed the validation results and the final preview, and I approve publishing.</span></label>
+  <div class="row" style="margin-top:14px">${btn('publish','Publish',{cls:'pri',dis:!S.ui.pubTick,id:'publishbtn'})}${btn('closeModal','Cancel')}</div>`}
+ return ''}
+
+/* ===== Rendering ===== */
+const now=()=>new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+let ptrDown=false,pending=false;
+function viewRoute(){switch(S.route){case 'home':return viewHome();case 'propose':return viewPropose();case 'catalog':return viewCatalog();case 'studio':return viewStudio();case 'runs':return viewRuns();case 'datasets':return viewDatasets();case 'migrate':return viewMigrate();default:return viewPlanned(S.route)}}
+function render(what){
+ if(what==='toast'){renderToast();return}
+ const a=document.activeElement;let fk=null;
+ if(a&&a!==document.body&&$('#app')&&$('#app').contains(a)&&/INPUT|TEXTAREA|SELECT/.test(a.tagName)){fk={id:a.id,inp:a.dataset.inp,chg:a.dataset.chg,n:a.dataset.n,i:a.dataset.i,f:a.dataset.f,c:a.dataset.c,s:a.selectionStart,e:a.selectionEnd}}
+ const sc=['.rbody','.db','.palette','.page','.scroll','.list'].map(s=>[...document.querySelectorAll('#app '+s)].map(el=>el.scrollTop));
+ $('#app').innerHTML=viewRibbon()+`<div class="shell"><nav class="rail" aria-label="Main navigation">${viewRail()}</nav><main>${viewRoute()}</main></div>`+viewModal();
+ ['.rbody','.db','.palette','.page','.scroll','.list'].forEach((s,k)=>[...document.querySelectorAll('#app '+s)].forEach((el,i)=>{if(sc[k][i])el.scrollTop=sc[k][i]}));
+ if(fk){let el=null;if(fk.id)el=document.getElementById(fk.id);else if(fk.inp)el=document.querySelector(`#app [data-inp="${fk.inp}"]`);if(el){el.focus();try{if(fk.s!=null&&el.setSelectionRange)el.setSelectionRange(fk.s,fk.e)}catch(e){}}}
+ if(S.route==='studio')updateMini();
+}
+function refresh(){if(ptrDown){pending=true;return}render()}
+function renderToast(){const t=S.toast,b=$('#toastbox');b.innerHTML=t?`<div class="toast" role="status">${esc(t.msg)}${t.act?`<button class="btn sm" data-act="toastAct" data-arg="${t.act.fn}">${esc(t.act.label)}</button>`:''}</div>`:''}
+function updateMini(){const m=$('#mini');if(m){m.innerHTML=miniHtml();m.style.display=S.ui.mini&&P().nodes.length?'':'none'}}
+function applyView(){const w=$('#world');if(!w)return;const v=S.ui.view;w.style.transform=`translate(${v.x}px,${v.y}px) scale(${v.k})`;const z=$('#zl');if(z)z.textContent=Math.round(v.k*100)+'%';updateMini()}
+function fitView(){const cv=$('#cv');if(!cv||!P().nodes.length)return;const ns=P().nodes,minx=Math.min(...ns.map(n=>n.x)),maxx=Math.max(...ns.map(n=>n.x+NW)),miny=Math.min(...ns.map(n=>n.y)),maxy=Math.max(...ns.map(n=>n.y+NH));
+ const w=cv.clientWidth,h=cv.clientHeight,bw=maxx-minx,bh=maxy-miny,k=Math.max(.3,Math.min(1.1,(w-90)/bw,(h-90)/bh));S.ui.view={k,x:(w-bw*k)/2-minx*k,y:(h-bh*k)/2-miny*k};applyView()}
+function centerOn(id){const cv=$('#cv'),n=nodeById(P(),id);if(!cv||!n)return;const v=S.ui.view;S.ui.view={k:v.k,x:cv.clientWidth/2-(n.x+NW/2)*v.k,y:cv.clientHeight/2-(n.y+NH/2)*v.k};applyView()}
+function zoomAt(f,cx,cy){const cv=$('#cv');if(!cv)return;const v=S.ui.view,k=Math.max(.25,Math.min(2,v.k*f));cx=cx==null?cv.clientWidth/2:cx;cy=cy==null?cv.clientHeight/2:cy;S.ui.view={k,x:cx-(cx-v.x)*(k/v.k),y:cy-(cy-v.y)*(k/v.k)};applyView()}
+
+/* ===== Batch history entry ===== */
+function batch(label,fn){const pre=snap();S.suspend=true;try{fn()}finally{S.suspend=false}commitPre(label,pre);refresh()}
+function rawNode(type,cfg,x,y){const id=nextId(type);S.pipe.nodes.push({id,type,x:x||0,y:y||0,config:cfg||defaultConfig(type)});return id}
+function wire(from,to,port){S.pipe.edges.push({from,to,port})}
+function relayout(){const T0=layoutNodes(P());P().nodes.forEach(n=>{n.x=T0[n.id].x;n.y=T0[n.id].y})}
+function clearDerived(){S.previews={};S.meas={};S.acks={};S.val=null;S.run=null;RCACHE.clear()}
+
+/* ===== Catalog to pipeline ===== */
+function doAddTables(mode){const sel=S.catalog.sel.slice();if(!sel.length)return;
+ const have=new Set(P().nodes.filter(n=>n.type==='source').map(n=>n.config.table));const fresh=sel.filter(t=>!have.has(t));
+ if(!fresh.length){toast('Those tables are already on the canvas.');S.route='studio';S.ui.modal=null;refresh();return}
+ const wasEmpty=!P().nodes.length;
+ batch(`Add ${fresh.length} table${fresh.length>1?'s':''} from Catalog`,()=>{const maxY=P().nodes.length?Math.max(...P().nodes.map(n=>n.y+NH)):0;fresh.forEach((t,i)=>rawNode('source',{table:t},40,wasEmpty?0:maxY+30+i*(NH+24)));if(wasEmpty)relayout()});
+ S.catalog.sel=[];S.ui.modal=null;S.ui.sel=null;S.route='studio';refresh();setTimeout(fitView,30);
+ toast(`Added ${fresh.length} table${fresh.length>1?'s':''} to the canvas.${fresh.length<sel.length?' Others were already there.':''}`)}
+function buildProposal(){const on=id=>S.ui.propChecked[id]!==false,jt=S.ui.joinTypes||{};if(!on('tables')){toast('Tick the tables suggestion first. Everything else builds on it.');return}
+ const hadDraft=P().nodes.length>0;if(hadDraft)S.backup={pipe:JSON.parse(JSON.stringify(S.pipe)),name:S.name};
+ clearDerived();
+ batch('Build pipeline from proposal',()=>{S.pipe=emptyPipe();S.name='Customer order summary';const c=rawNode('source',{table:'customers'}),o=rawNode('source',{table:'orders'}),it=rawNode('source',{table:'order_items'});let last=c;
+  if(on('j1')){const j=rawNode('join',{type:jt.j1||'left',pairs:[{l:'customer_id',r:'customer_id'}]});wire(c,j,'left');wire(o,j,'right');last=j
+   if(on('j2')){const j2=rawNode('join',{type:jt.j2||'left',pairs:[{l:'order_id',r:'order_id'}]});wire(last,j2,'left');wire(it,j2,'right');last=j2
+    if(on('agg')){const a=rawNode('aggregate',{by:['customer_id','customer_name','email','city','segment'],metrics:[{fn:'count_distinct',col:'order_id',as:'order_count'},{fn:'sum',col:'line_total',as:'total_order_value'},{fn:'max',col:'order_date',as:'latest_order_date'}]});wire(last,a,'in');last=a}}}
+  if(on('out')){const out=rawNode('output',{name:'customer_order_summary'});wire(last,out,'in')}
+  relayout()});
+ S.ui.sel=null;S.route='studio';S.ui.stage=null;refresh();setTimeout(fitView,40);toast(hadDraft?'Pipeline built. Your previous draft is kept.':'Pipeline built from the proposal. Edit anything you like.',hadDraft?{label:'Swap back',fn:'swapBack'}:null)}
+
+/* ===== Simulated work ===== */
+function doMeasure(id){const j=nodeById(P(),id);if(!j||S.ui.busy['m:'+id])return;S.ui.busy['m:'+id]=1;render();
+ setTimeout(()=>{const ins=inputsOf(P(),id),sg=SG();const L=resultOf(P(),ins[0],sg),R=resultOf(P(),ins[1],sg);S.meas[id]={sig:sg[id],m:measureJoin(L,R,j.config)};delete S.ui.busy['m:'+id];S.ui.ackTick=false;render()},650)}
+function doPreview(id){if(S.ui.busy['p:'+id])return;S.ui.busy['p:'+id]=1;render();setTimeout(()=>{const sg=SG();S.previews[id]={sig:sg[id],res:resultOf(P(),id,sg)};delete S.ui.busy['p:'+id];render()},500)}
+function doValidate(){if(S.ui.busy.val)return;S.ui.busy.val=1;toast('Running validation on the sample data…');
+ setTimeout(()=>{S.val={sig:pipeSig(),checks:runChecks(),when:now()};delete S.ui.busy.val;S.ui.dock='validation';if(S.ui.dockSize==='min')S.ui.dockSize='normal';const e=S.val.checks.filter(c=>c.level==='error').length;S.toast=null;render();toast(e?`Validation found ${e} error${e>1?'s':''}. See the Validation tab.`:'Validation finished with no errors.')},700)}
+let runTimer=null;
+function doRun(){const G=computeStages();if(!['ready','run_failed'].includes(G.st.final))return;const ids=runSteps(),id=(S.runSeq=(S.runSeq||0)+1);
+ const steps={};ids.forEach(i=>steps[i]='queued');const r={id,name:S.name,version:S.versions.length&&!S.dirty?S.versions[S.versions.length-1].id:'draft',state:'running',steps,sig:pipeSig(),when:'',dur:0,rowsOut:null,error:null};S.run=r;S.ui.dock='run';if(S.ui.dockSize==='min')S.ui.dockSize='normal';
+ const fail=S.ui.failSim;S.ui.failSim=false;let i=0;render();clearInterval(runTimer);
+ runTimer=setInterval(()=>{if(S.run!==r){clearInterval(runTimer);return}
+  if(r.sig!==pipeSig()){clearInterval(runTimer);r.state='cancelled';r.when=now();S.runs.unshift(r);render();return}
+  if(i>0&&r.steps[ids[i-1]]==='running')r.steps[ids[i-1]]='done';
+  if(i>=ids.length){clearInterval(runTimer);r.state='done';r.dur=+(ids.length*.8).toFixed(1);r.when=now();r.rowsOut=resultOf(P(),outputNode().id,SG()).rows.length;S.runs.unshift(r);render();toast(`Run #${r.id} completed. Review the Final dataset tab.`);return}
+  const nid=ids[i],n=nodeById(P(),nid);
+  if(fail&&(n.type==='join'||i===Math.min(1,ids.length-1))&&!r.error){r.steps[nid]='failed';r.state='failed';r.error={step:nid,msg:'Simulated failure: the source did not answer within the time limit. Nothing was written. Retrying may succeed.'};r.dur=+(i*.8+.4).toFixed(1);r.when=now();for(let k=i+1;k<ids.length;k++)r.steps[ids[k]]='queued';S.runs.unshift(r);clearInterval(runTimer);render();return}
+  r.steps[nid]='running';i++;render()},520)}
+function saveVersion(label){const id='v'+(S.versions.length+1);S.versions.push({id,label:label||('Version '+(S.versions.length+1)),when:now(),pipe:JSON.parse(JSON.stringify(S.pipe)),name:S.name});S.dirty=false;return id}
+function doPublish(){const out=outputNode(),r=S.run;if(!out||!r||r.state!=='done'||!S.ui.pubTick)return;const R=resultOf(P(),out.id,SG());const vid=S.dirty||!S.versions.length?saveVersion('Published'):S.versions[S.versions.length-1].id;
+ const same=S.datasets.filter(d=>d.name===out.config.name).length;const v=S.val;
+ S.datasets.unshift({id:'d'+(S.datasets.length+1),name:out.config.name,version:same+1,runId:r.id,pipelineVersion:vid,pipelineName:S.name,when:now(),rows:R.rows.length,cols:R.cols,sample:R.rows.slice(0,40),quality:v?`${v.checks.filter(c=>c.level==='passed').length} checks passed, ${v.checks.filter(c=>c.level==='error').length} errors, ${v.checks.filter(c=>c.level==='warning').length} warnings`:'-',handedOff:false});
+ S.ui.modal=null;S.ui.pubTick=false;S.ui.dsSel=S.datasets[0].id;render();toast(`Published ${out.config.name} v${same+1}.`,{label:'Open Datasets',fn:'goDatasets'})}
+
+/* ===== Actions ===== */
+function selectNode(id,center){if(!nodeById(P(),id))return;S.ui.sel=id;S.ui.right='settings';S.ui.rightOpen=true;S.route='studio';S.ui.pq='';render();if(center)centerOn(id)}
+function addTypeAct(type){const prev=S.ui.sel&&nodeById(P(),S.ui.sel);let auto=null;
+ if(prev&&prev.type!=='output'&&portsOf(type).length&&!P().edges.some(e=>e.from===prev.id)&&type!=='source')auto=prev;
+ batch('Add '+NT[type].label,()=>{const pos=auto?{x:auto.x+NW+60,y:auto.y}:posFor();const id=rawNode(type,defaultConfig(type),pos.x,pos.y);if(auto)wire(auto.id,id,portsOf(type)[0]);S.ui.sel=id;S.ui.right='settings';S.ui.rightOpen=true});
+ const id=S.ui.sel;if(auto)toast(`Connected after ${auto.id}. Select the line's × to disconnect.`)}
+function act(a,arg,el){
+ switch(a){
+ case 'go':S.route=arg;S.ui.menu=false;S.ui.modal=null;render();if(arg==='studio')setTimeout(fitView,20);break;
+ case 'modal':S.ui.modal=arg;S.ui.menu=false;render();break;
+ case 'closeModal':case 'closeModalBg':S.ui.modal=null;render();break;
+ case 'menu':S.ui.menu=!S.ui.menu;render();break;
+ case 'toast':toast(arg);break;
+ case 'toastAct':{const f=arg;S.toast=null;renderToast();if(f==='undo')undo();else if(f==='swapBack')swapBack();else if(f==='goDatasets'){S.route='datasets';render()}break}
+ case 'x':break;
+ case 'reset':resetAll();break;
+ case 'simStale':S.catalog.stale=true;S.ui.dismissed.stale=false;S.previews={};S.meas={};S.val=null;S.ui.menu=false;render();toast('Simulated: the Catalog was re-scanned. Open Pipelines to see how stale evidence is handled.');break;
+ case 'dismiss':S.ui.dismissed[arg]=true;render();break;
+ case 'moreNotices':S.ui.showAllInfo=!S.ui.showAllInfo;render();break;
+ // home / catalog / datasets
+ case 'propose':S.route='propose';render();break;
+ case 'brdUse':S.ui.goal='Customer name, city, segment, total value of all orders, number of orders and date of latest order. One row per customer.';S.ui.modal=null;S.route='propose';render();break;
+ case 'openDraft':if(loadDraft()){clearDerived();S.route='studio';render();setTimeout(fitView,30);toast('Opened the saved draft from this browser.')}else toast('No saved draft found.');break;
+ case 'buildProposal':buildProposal();break;
+ case 'catPick':S.catalog.active=arg;render();break;
+ case 'catTab':S.catalog.tab=arg;render();break;
+ case 'addSel':if(P().nodes.length){S.ui.modal='handoff';render()}else doAddTables();break;
+ case 'hoAdd':doAddTables('add');break;
+ case 'hoNew':S.backup={pipe:JSON.parse(JSON.stringify(S.pipe)),name:S.name};S.pipe=emptyPipe();S.name='Untitled pipeline';clearDerived();S.hist={past:[],future:[],cur:'Start'};doAddTables('new');toast('Started a new pipeline. Your previous draft is kept.',{label:'Swap back',fn:'swapBack'});break;
+ case 'dsPick':S.ui.dsSel=arg;render();break;
+ case 'dsTab':S.ui.dsTab=arg;render();break;
+ case 'automl':{const d=S.datasets.find(x=>x.id===S.ui.dsSel)||S.datasets[0];if(d){d.handedOff=true;S.ui.automlOpen=true;render();toast('Simulated handoff: nothing was sent. See what would be handed over below.')}break}
+ case 'dsOpen':{const d=S.datasets[0];S.ui.dsSel=d&&d.id;S.ui.dsTab='automl';S.route='datasets';render();break}
+ case 'migRun':S.ui.migStep=1;render();break;
+ case 'migApprove':S.migDecisions.recorded=now();render();toast('Decision recorded. It stays in this browser tab only.');break;
+ // studio toolbar
+ case 'undo':undo();break;case 'redo':redo();break;
+ case 'saveDraft':writeDraft();S.ui.saved=now();S.dirty=false;render();toast('Draft saved in this browser. Prototype only: nothing leaves your computer.');break;
+ case 'saveVersion':{const id=saveVersion();S.ui.dock='history';S.ui.histTab='versions';if(S.ui.dockSize==='min')S.ui.dockSize='normal';render();toast(`Saved ${id}. Restore it any time from History and lineage.`);break}
+ case 'togglePalette':S.ui.palette=!S.ui.palette;render();setTimeout(updateMini,0);break;
+ case 'toggleRight':S.ui.rightOpen=!S.ui.rightOpen;render();break;
+ case 'rtab':S.ui.right=arg;render();break;
+ case 'assistant':S.ui.right='assistant';S.ui.rightOpen=true;render();break;
+ case 'stage':S.ui.stage=arg;render();break;
+ case 'dock':S.ui.dock=arg;if(S.ui.dockSize==='min')S.ui.dockSize='normal';render();break;
+ case 'dockSize':S.ui.dockSize=arg;render();break;
+ case 'histTab':S.ui.histTab=arg;render();break;
+ case 'lineageCol':S.ui.lineageCol=arg;render();break;
+ // canvas
+ case 'zoom':zoomAt(arg==='in'?1.2:1/1.2);break;
+ case 'fit':fitView();break;
+ case 'tidy':tidy();break;
+ case 'mini':S.ui.mini=!S.ui.mini;updateMini();break;
+ case 'addType':addTypeAct(arg);break;
+ case 'selNode':selectNode(arg,true);break;
+ case 'delNode':removeNode(arg);break;
+ case 'rmEdge':removeEdge(+arg);break;
+ case 'addPair':setCfg(arg,c=>c.pairs.push({l:'',r:''}),'Add column pair');break;
+ case 'delPair':{const[n,i]=arg.split('|');setCfg(n,c=>c.pairs.splice(+i,1),'Remove column pair');break}
+ case 'addCond':setCfg(arg,c=>c.conds.push({col:'',op:'eq',value:''}),'Add condition');break;
+ case 'delCond':{const[n,i]=arg.split('|');setCfg(n,c=>c.conds.splice(+i,1),'Remove condition');break}
+ case 'addMetric':setCfg(arg,c=>c.metrics.push({fn:'sum',col:'',as:'metric_'+(c.metrics.length+1)}),'Add calculation');break;
+ case 'delMetric':{const[n,i]=arg.split('|');setCfg(n,c=>c.metrics.splice(+i,1),'Remove calculation');break}
+ // evidence
+ case 'measure':doMeasure(arg);break;
+ case 'ack':{const m=S.meas[arg];if(m&&S.ui.ackTick){S.acks[arg]=m.sig;S.ui.ackTick=false;render();toast('Accepted. It is recorded in the validation evidence and you can withdraw it.')}break}
+ case 'unack':delete S.acks[arg];render();break;
+ case 'previewNode':doPreview(arg);break;
+ case 'validate':doValidate();break;
+ case 'run':doRun();break;
+ case 'publishAsk':S.ui.modal='publish';S.ui.pubTick=false;render();break;
+ case 'publish':doPublish();break;
+ case 'applyFix':{const c=S.val&&S.val.checks.find(x=>x.id===arg);if(c&&c.fixKey&&nodeById(P(),c.fixKey.after)){const sid=c.fixKey.after,col=c.fixKey.cols[0];setCfg(sid,cf=>{cf.fixes=[...(cf.fixes||[]),{col,kind:'dedupe'}]},'Fix repeated '+col);toast(`Added a fix to table ${sid}: keep one row per ${col}. Validation is out of date; run it again.`,{label:'Undo',fn:'undo'})}break}
+ case 'hApply':{const[nid,fid]=arg.split('|');const nn=nodeById(P(),nid);if(!nn||!nn.config.table)break;const f=tableHealth(nn.config.table,nn.config.fixes).findings.find(x=>x.id===fid);if(!f)break;const st=hState(nid,f);if(st.choice==='value'&&!String(st.val||'').trim()){toast('Type the value to fill with.');break}
+  const fx=mkFix(f,st.choice,st.val);setCfg(nid,cf=>{cf.fixes=[...(cf.fixes||[]),fx]},'Fix '+f.col+' in '+nn.config.table);toast(`Applied: ${fixText(fx)}. Validation is out of date.`,{label:'Undo',fn:'undo'});break}
+ case 'hUndo':{const[nid,i]=arg.split('|');setCfg(nid,cf=>{cf.fixes=(cf.fixes||[]).filter((_,k)=>k!==+i)},'Remove table fix');break}
+ case 'verRestore':{const v=S.versions.find(x=>x.id===arg);if(v){commit('Restore '+arg);S.pipe=JSON.parse(JSON.stringify(v.pipe));S.name=v.name;S.ui.sel=null;refresh();setTimeout(fitView,20);toast(`Restored ${arg}. Undo brings your previous state back.`,{label:'Undo',fn:'undo'})}break}
+ case 'verCompare':{const v=S.versions.find(x=>x.id===arg);if(v){const a=Object.fromEntries(v.pipe.nodes.map(n=>[n.id,n])),b=Object.fromEntries(P().nodes.map(n=>[n.id,n])),L=[];Object.keys(b).forEach(k=>{if(!a[k])L.push(['diff-add','+ '+k+' added since '+arg]);else if(JSON.stringify(a[k].config)!==JSON.stringify(b[k].config))L.push(['diff-chg','~ '+k+' settings changed']);});Object.keys(a).forEach(k=>{if(!b[k])L.push(['diff-del','- '+k+' was removed'])});S.ui.verDiff={id:arg,lines:L};render()}break}
+ // assistant
+ case 'suggAccept':case 'suggEdit':{const s=suggestions().find(x=>x.id===arg);if(!s)break;
+  if(s.kind==='join'){const A=nodeById(P(),s.args.a),B=nodeById(P(),s.args.b);let jid;if(a==='suggEdit'){S.ui.right='settings';S.ui.rightOpen=true}batch('Accept suggested join',()=>{jid=rawNode('join',{type:'left',pairs:[{l:s.args.l,r:s.args.r}]},Math.max(A.x,B.x)+NW+60,(A.y+B.y)/2);wire(A.id,jid,'left');wire(B.id,jid,'right');S.ui.sel=jid});setTimeout(fitView,30);toast(a==='suggEdit'?`Added ${jid}. Adjust its settings in the panel.`:`Added ${jid}. Measure it before trusting it.`,{label:'Undo',fn:'undo'})}
+  else if(s.kind==='agg'){const id=insertAfter(s.args.after,'aggregate',{by:['customer_id','customer_name','email','city','segment'],metrics:[{fn:'count_distinct',col:'order_id',as:'order_count'},{fn:'sum',col:'line_total',as:'total_order_value'},{fn:'max',col:'order_date',as:'latest_order_date'}]},'Accept suggested Aggregate');toast(`Added ${id}. Review its calculations.`,{label:'Undo',fn:'undo'})}
+  else if(s.kind==='out'){batch('Accept suggested Output',()=>{const a=nodeById(P(),s.args.after),id=rawNode('output',{name:'customer_order_summary'},a.x+NW+60,a.y);wire(a.id,id,'in');S.ui.sel=id});toast('Added the Output step.',{label:'Undo',fn:'undo'})}
+  break}
+ case 'suggReject':S.ui.dismissed[arg]=true;render();toast('Suggestion rejected. It will not be shown again for this pipeline.');break;
+ case 'ask':askQ(arg);break;
+ case 'askTyped':{const i=$('#askin');if(i&&i.value.trim()){const v=i.value.trim();i.value='';askQ(v)}break}
+ }}
+function askQ(q){S.chat.push({r:'me',t:q});const hit=QA.find(x=>x[0].test(q));S.chat.push({r:'ai',t:hit?hit[1]():'This prototype only has a few scripted answers: repeated rows, join types, publishing, tables, grain and AutoML. A real assistant would answer from your schema and data.'});S.ui.right='assistant';render()}
+function swapBack(){if(!S.backup)return;const cur={pipe:JSON.parse(JSON.stringify(S.pipe)),name:S.name};commit('Swap drafts');S.pipe=S.backup.pipe;S.name=S.backup.name;S.backup=cur;clearDerived();S.ui.sel=null;refresh();setTimeout(fitView,20);toast('Swapped drafts.',{label:'Swap back',fn:'swapBack'})}
+
+/* ===== Change / input handlers ===== */
+function onChg(k,el){const v=el.type==='checkbox'?el.checked:el.value,d=el.dataset,n=d.n;
+ switch(k){
+ case 'failSim':S.ui.failSim=v;break;
+ case 'catSel':{const t=d.arg,i=S.catalog.sel.indexOf(t);if(v&&i<0)S.catalog.sel.push(t);if(!v&&i>=0)S.catalog.sel.splice(i,1);render();break}
+ case 'cmpA':S.ui.cmpA=+d.arg;render();break;case 'cmpB':S.ui.cmpB=+d.arg;render();break;
+ case 'jtype':S.ui.joinTypes=Object.assign({},S.ui.joinTypes,{[d.arg]:v});break;
+ case 'migNote':S.migDecisions.note=v;break;case 'migReviewed':S.migDecisions.reviewed=v;render();break;
+ case 'prop':S.ui.propChecked[d.arg]=v;break;
+ case 'target':S.ui.target=d.arg;render();break;
+ case 'pname':commit('Rename pipeline');S.name=v||'Untitled pipeline';refresh();break;
+ case 'ackTick':S.ui.ackTick=v;render();break;case 'pubTick':S.ui.pubTick=v;render();break;
+ case 'cfgInput':{if(!v){const i=P().edges.findIndex(e=>e.to===n&&e.port===d.port);if(i>=0)removeEdge(i);else render()}else{const err=connect(v,n,d.port);if(err){toast(err);render()}}break}
+ case 'hChoice':{S.ui.hc=S.ui.hc||{};S.ui.hc[d.k]=Object.assign(S.ui.hc[d.k]||{val:''},{choice:v});render();break}
+ case 'hVal':{S.ui.hc=S.ui.hc||{};S.ui.hc[d.k]=Object.assign(S.ui.hc[d.k]||{choice:'value'},{val:v});render();break}
+ case 'cfgTable':setCfg(n,c=>{c.table=v||null},v?'Choose table '+v:'Clear table');break;
+ case 'cfgJoinType':setCfg(n,c=>{c.type=v},'Change join type');break;
+ case 'cfgPair':setCfg(n,c=>{c.pairs[+d.i][d.side]=v},'Change join columns');break;
+ case 'cfgCond':setCfg(n,c=>{const q=c.conds[+d.i];q[d.f]=v;if(d.f==='op'&&/null/.test(v))q.value=''},'Change filter');break;
+ case 'cfgDrop':setCfg(n,c=>{const i=c.cols.indexOf(d.c);if(v&&i<0)c.cols.push(d.c);if(!v&&i>=0)c.cols.splice(i,1)},'Change dropped columns');break;
+ case 'cfgRename':setCfg(n,c=>{if(v.trim())c.map[d.c]=v.trim();else delete c.map[d.c]},'Rename column');break;
+ case 'cfgDedupe':setCfg(n,c=>{const i=c.cols.indexOf(d.c);if(v&&i<0)c.cols.push(d.c);if(!v&&i>=0)c.cols.splice(i,1)},'Change duplicate columns');break;
+ case 'cfgMissing':setCfg(n,c=>{c[d.f]=v},'Change missing-value handling');break;
+ case 'cfgBy':setCfg(n,c=>{const i=c.by.indexOf(d.c);if(v&&i<0)c.by.push(d.c);if(!v&&i>=0)c.by.splice(i,1)},'Change grouping');break;
+ case 'cfgMetric':setCfg(n,c=>{c.metrics[+d.i][d.f]=v},'Change calculation');break;
+ case 'cfgDerive':setCfg(n,c=>{c[d.f]=v},'Change calculation');break;
+ case 'cfgOut':setCfg(n,c=>{c.name=v},'Rename dataset');break;
+ }}
+
+/* ===== Event wiring ===== */
+document.addEventListener('click',e=>{const el=e.target.closest('[data-act]');if(el&&el.dataset.act==='closeModalBg'&&e.target!==el)return;if(el&&!el.disabled&&el.getAttribute('aria-disabled')!=='true'){e.stopPropagation();act(el.dataset.act,el.dataset.arg,el);return}
+ const mini=e.target.closest('[data-mini]');if(mini&&MM){const r=mini.getBoundingClientRect(),wx=(e.clientX-r.left-MM.ox)/MM.s+MM.minx,wy=(e.clientY-r.top-MM.oy)/MM.s+MM.miny,cv=$('#cv'),v=S.ui.view;S.ui.view={k:v.k,x:cv.clientWidth/2-wx*v.k,y:cv.clientHeight/2-wy*v.k};applyView()}});
+document.addEventListener('change',e=>{const el=e.target.closest('[data-chg]');if(el)onChg(el.dataset.chg,el)});
+document.addEventListener('input',e=>{const el=e.target.closest('[data-inp]');if(!el)return;const k=el.dataset.inp;if(k==='goal')S.ui.goal=el.value;else if(k==='catq'){S.catalog.q=el.value;render()}else if(k==='pq'){S.ui.pq=el.value;render()}});
+document.addEventListener('keydown',e=>{
+ if(e.key==='Escape'){if(S.ui.modal||S.ui.menu){S.ui.modal=null;S.ui.menu=false;render()}return}
+ if(e.key==='Enter'&&e.target.closest&&e.target.closest('.node')){selectNode(e.target.closest('.node').dataset.node);return}
+ if(e.key==='Enter'&&e.target.id==='askin'){act('askTyped');return}
+ const t=e.target;if(/INPUT|TEXTAREA|SELECT/.test(t.tagName))return;if(S.route!=='studio'||S.ui.modal)return;
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo();return}
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();redo();return}
+ if((e.key==='Delete'||e.key==='Backspace')&&S.ui.sel){e.preventDefault();removeNode(S.ui.sel);return}
+ if(e.key==='f'||e.key==='F')fitView();if(e.key==='t'||e.key==='T')tidy()});
+document.addEventListener('wheel',e=>{const cv=e.target.closest&&e.target.closest('#cv');if(!cv)return;e.preventDefault();const r=cv.getBoundingClientRect();zoomAt(Math.exp(-e.deltaY*.0015),e.clientX-r.left,e.clientY-r.top)},{passive:false});
+
+let drag=null;
+document.addEventListener('pointerdown',e=>{ptrDown=true;const cv=e.target.closest&&e.target.closest('#cv');if(!cv||e.button!==0)return;if(e.target.closest('.cvtools,.mini,.edgex,.cvempty .card,.hint'))return;
+ const out=e.target.closest('[data-out]');
+ if(out){drag={t:'conn',from:out.dataset.out};const tmp=document.createElementNS('http://www.w3.org/2000/svg','path');tmp.setAttribute('class','edge sel');tmp.id='tmp';$('#edges').appendChild(tmp);e.preventDefault();return}
+ const nd=e.target.closest('.node');
+ if(nd){const n=nodeById(P(),nd.dataset.node);if(!n)return;drag={t:'node',id:n.id,sx:e.clientX,sy:e.clientY,ox:n.x,oy:n.y,moved:false,pre:snap(),el:nd};e.preventDefault();return}
+ drag={t:'pan',sx:e.clientX,sy:e.clientY,vx:S.ui.view.x,vy:S.ui.view.y,moved:false};cv.classList.add('panning')});
+document.addEventListener('pointermove',e=>{if(!drag)return;const v=S.ui.view;
+ if(drag.t==='node'){const dx=e.clientX-drag.sx,dy=e.clientY-drag.sy;if(!drag.moved&&Math.hypot(dx,dy)<4)return;drag.moved=true;const n=nodeById(P(),drag.id);n.x=Math.round(drag.ox+dx/v.k);n.y=Math.round(drag.oy+dy/v.k);drag.el.style.left=n.x+'px';drag.el.style.top=n.y+'px';$('#edges').innerHTML=edgesHtml();updateMini()}
+ else if(drag.t==='pan'){S.ui.view={k:v.k,x:drag.vx+e.clientX-drag.sx,y:drag.vy+e.clientY-drag.sy};drag.moved=true;applyView()}
+ else if(drag.t==='conn'){const a=nodeById(P(),drag.from),cv=$('#cv').getBoundingClientRect(),wx=(e.clientX-cv.left-v.x)/v.k,wy=(e.clientY-cv.top-v.y)/v.k,x1=a.x+NW,y1=a.y+NH/2;const tmp=$('#tmp');if(tmp)tmp.setAttribute('d',`M${x1} ${y1}C${x1+60} ${y1} ${wx-60} ${wy} ${wx} ${wy}`)}});
+document.addEventListener('pointerup',e=>{const d=drag;drag=null;
+ if(d){const cv=$('#cv');if(cv)cv.classList.remove('panning');
+  if(d.t==='node'){if(d.moved){const n=nodeById(P(),d.id);if(n.x!==d.ox||n.y!==d.oy){commitPre('Move '+d.id,d.pre)}S.ui.sel=d.id;S.ui.right='settings';S.ui.rightOpen=true;pending=true}else{S.ui.sel=d.id;S.ui.right='settings';S.ui.rightOpen=true;S.ui.pq='';pending=true}}
+  else if(d.t==='conn'){const tmp=$('#tmp');if(tmp)tmp.remove();const t=document.elementFromPoint(e.clientX,e.clientY);let to=null,port=null;const pe=t&&t.closest('.port.in');
+   if(pe){to=pe.dataset.node;port=pe.dataset.port}else{const nd=t&&t.closest('.node');if(nd){to=nd.dataset.node;const tn=nodeById(P(),to);const ps=portsOf(tn.type);port=ps.find(p=>!P().edges.some(x=>x.to===to&&x.port===p))||ps[0]}}
+   if(to&&to!==d.from){const tn=nodeById(P(),to);if(!port){toast(tn.type==='source'?'A source table has no input to connect to.':'That step has no input.')}else{const err=connect(d.from,to,port);if(err)toast(err)}}}
+  else if(d.t==='pan'&&!d.moved){if(S.ui.sel){S.ui.sel=null;pending=true}}}
+ ptrDown=false;setTimeout(()=>{if(pending){pending=false;render()}},0)});
+
+function main(){document.body.insertAdjacentHTML('beforeend','<div id="toastbox"></div>');$('#app').setAttribute('data-ready','1');render();window.addEventListener('resize',()=>{if(S.route==='studio')updateMini()})}
+main();
+
+</script></body></html>

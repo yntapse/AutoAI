@@ -28,14 +28,14 @@ echo STEP 3 - python that will run the backend: %PY% >> "%LOG%"
 %PY% -c "import fastapi, uvicorn, openai, pyodbc; print('deps OK fastapi', fastapi.__version__, 'uvicorn', uvicorn.__version__)" >> "%LOG%" 2>&1
 
 echo STEP 4 - starting ONE backend in a new window >> "%LOG%"
-start "AutoAI backend" cmd /k %PY% -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+start "AutoAI backend" cmd /k %PY% -m uvicorn main:app --host localhost --port 8000 --reload
 
 timeout /t 25 /nobreak >nul
 
 echo STEP 5 - listeners on port 8000 after start >> "%LOG%"
 netstat -ano | findstr /R /C:":8000 .*LISTENING" >> "%LOG%" 2>&1
 echo STEP 6 - GET /__build >> "%LOG%"
-curl -s http://127.0.0.1:8000/__build >> "%LOG%" 2>&1
+curl -s http://localhost:8000/__build >> "%LOG%" 2>&1
 echo. >> "%LOG%"
 echo ==== done ==== >> "%LOG%"
 type "%LOG%"

@@ -246,7 +246,7 @@ export default function NewProjectPage() {
     resetPreviewState();
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/datasource/preview", {
+      const response = await fetch("http://localhost:8000/datasource/preview", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -288,7 +288,7 @@ export default function NewProjectPage() {
     resetPreviewState();
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/datasource/tables", {
+      const response = await fetch("http://localhost:8000/datasource/tables", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -341,7 +341,7 @@ export default function NewProjectPage() {
     resetPreviewState();
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/datasource/test", {
+      const response = await fetch("http://localhost:8000/datasource/test", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

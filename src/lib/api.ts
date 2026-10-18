@@ -1,4 +1,4 @@
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
 function buildUrl(endpoint: string): string {
   if (/^https?:\/\//i.test(endpoint)) {
@@ -7,6 +7,17 @@ function buildUrl(endpoint: string): string {
 
   const normalizedEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
   return `${API_BASE}${normalizedEndpoint}`;
+}
+
+/** An Error that also carries the HTTP status, so callers can react to e.g. 401. */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
 }
 
 export async function apiFetch<T = unknown>(
@@ -43,7 +54,7 @@ export async function apiFetch<T = unknown>(
         : `Request failed with status ${response.status}`) ||
       `Request failed with status ${response.status}`;
 
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
 
   return responseBody as T;

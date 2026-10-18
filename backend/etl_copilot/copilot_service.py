@@ -250,6 +250,71 @@ class ETLCopilot:
             user_request, connection_string, catalog
         )
 
+        return self._build_validated_spec(
+            spec,
+            issues,
+            connection_string,
+            dataset_name,
+            persist,
+        )
+
+    def create_dataset_from_spec(
+        self,
+        saved_spec: Dict[str, Any],
+        connection_string: str,
+        schema: Optional[str] = None,
+        dataset_name: str = "etl_copilot_dataset",
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        """Execute a saved specification without asking the LLM to re-plan."""
+        catalog = self.discover_schema(connection_string, schema=schema)
+        try:
+            spec_data = dict(saved_spec)
+            spec_data["db_type"] = catalog.db_type
+            spec_data["schema_name"] = catalog.schema_name
+            spec = DatasetSpec(**spec_data)
+        except (TypeError, ValidationError) as exc:
+            raise CopilotError(
+                "The saved pipeline specification is invalid: %s" % exc
+            ) from exc
+
+        verified_paths, verification_issues = self.verifier.verify_all(
+            connection_string,
+            catalog.db_type,
+            catalog.schema_name,
+            spec.join_paths,
+        )
+        spec.join_paths = verified_paths
+        issues = verification_issues + validate_spec(
+            spec,
+            catalog,
+            spec.join_paths,
+        )
+
+        blocking = errors_only(issues)
+        if blocking:
+            raise CopilotError(
+                "Saved pipeline specification could not be validated:\n"
+                + "\n".join("  - [%s] %s" % (i.code, i.message) for i in blocking),
+                issues,
+            )
+
+        return self._build_validated_spec(
+            spec,
+            issues,
+            connection_string,
+            dataset_name,
+            persist,
+        )
+
+    def _build_validated_spec(
+        self,
+        spec: DatasetSpec,
+        issues: List[ValidationIssue],
+        connection_string: str,
+        dataset_name: str,
+        persist: bool,
+    ) -> Dict[str, Any]:
         blocking = errors_only(issues)
         if blocking:
             raise CopilotError(
