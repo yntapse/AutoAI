@@ -517,6 +517,160 @@ export default function NodeConfigPanel(props: Props) {
     );
   }
 
+  function aggregateForm() {
+    const measures = asRows(cfg.measures);
+    const update = (next: Record<string, unknown>[]) => set({ measures: next });
+    return (
+      <>
+        <Label>Group by (optional)</Label>
+        <ColumnChecklist label="Group-by columns" columns={inputColumns} selected={asList(cfg.group_by)} onChange={(group_by) => set({ group_by })} />
+        <p className="mt-1 text-[11.5px] text-slate-500">Leave empty to get one row for the whole table. Columns you do not choose are dropped.</p>
+        <Label>Measures</Label>
+        <div className="space-y-2">
+          {measures.map((m, i) => {
+            const fn = String(m.function ?? "");
+            const patch = (p: Record<string, unknown>) => update(measures.map((x, j) => (j === i ? { ...x, ...p } : x)));
+            return (
+              <div key={i} className="rounded-lg border border-white/[0.08] p-1.5">
+                <div className="grid grid-cols-[1fr_auto] gap-1.5">
+                  <select className={field} aria-label={`Measure function ${i + 1}`} value={fn} onChange={(e) => patch({ function: e.target.value })}>
+                    <option value="">Choose a calculation…</option>
+                    <option value="sum">Sum</option>
+                    <option value="avg">Average</option>
+                    <option value="min">Smallest</option>
+                    <option value="max">Largest</option>
+                    <option value="count">Count</option>
+                  </select>
+                  <button className={smallBtn} aria-label={`Remove measure ${i + 1}`} onClick={() => update(measures.filter((_, j) => j !== i))}>
+                    ×
+                  </button>
+                </div>
+                <div className="mt-1.5">
+                  <ColumnSelect label={`Measure column ${i + 1}`} columns={inputColumns} value={String(m.column ?? "")} onChange={(v) => patch({ column: v })} />
+                  {fn === "count" && <p className="mt-1 text-[11.5px] text-slate-500">Leave the column empty to count rows.</p>}
+                </div>
+                <input
+                  className={`${field} mt-1.5`}
+                  aria-label={`Measure name ${i + 1}`}
+                  placeholder="Name of the new column"
+                  value={String(m.alias ?? "")}
+                  onChange={(e) => patch({ alias: e.target.value })}
+                />
+              </div>
+            );
+          })}
+        </div>
+        <button className={`${smallBtn} mt-2`} onClick={() => update([...measures, { function: "", column: "", alias: "" }])}>
+          + Add measure
+        </button>
+      </>
+    );
+  }
+
+  function changeTypeForm() {
+    const mappings = asRows(cfg.mappings);
+    const update = (next: Record<string, unknown>[]) => set({ mappings: next });
+    return (
+      <>
+        <Label>Conversions</Label>
+        <div className="space-y-2">
+          {mappings.map((m, i) => (
+            <div key={i} className="grid grid-cols-[1fr_auto_1fr_auto] items-center gap-1.5">
+              <ColumnSelect
+                label={`Column to convert ${i + 1}`}
+                columns={inputColumns}
+                value={String(m.column ?? "")}
+                onChange={(v) => update(mappings.map((x, j) => (j === i ? { ...x, column: v } : x)))}
+              />
+              <span className="text-slate-500">→</span>
+              <select
+                className={field}
+                aria-label={`New type ${i + 1}`}
+                value={String(m.to ?? "")}
+                onChange={(e) => update(mappings.map((x, j) => (j === i ? { ...x, to: e.target.value } : x)))}
+              >
+                <option value="">Choose a type…</option>
+                <option value="integer">Whole number</option>
+                <option value="decimal">Decimal number</option>
+                <option value="text">Text</option>
+                <option value="date">Date</option>
+              </select>
+              <button className={smallBtn} aria-label={`Remove conversion ${i + 1}`} onClick={() => update(mappings.filter((_, j) => j !== i))}>
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+        <button className={`${smallBtn} mt-2`} onClick={() => update([...mappings, { column: "", to: "" }])}>
+          + Add conversion
+        </button>
+        <p className="mt-2 text-[11.5px] text-amber-300">
+          Values that cannot be converted stop the run with a database error. Decimal to whole number is not available yet.
+        </p>
+      </>
+    );
+  }
+
+  function deriveForm() {
+    const operand = (side: "left" | "right") => {
+      const raw = cfg[side];
+      const spec = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+      const isColumn = "column" in spec;
+      const setSpec = (next: Record<string, unknown>) => set({ [side]: next });
+      return (
+        <div className="rounded-lg border border-white/[0.08] p-1.5">
+          <select
+            className={field}
+            aria-label={`${side === "left" ? "First" : "Second"} value type`}
+            value={isColumn ? "column" : "value"}
+            onChange={(e) => setSpec(e.target.value === "column" ? { column: "" } : { value: "" })}
+          >
+            <option value="column">A column</option>
+            <option value="value">A number</option>
+          </select>
+          <div className="mt-1.5">
+            {isColumn ? (
+              <ColumnSelect
+                label={`${side === "left" ? "First" : "Second"} column`}
+                columns={inputColumns}
+                value={String(spec.column ?? "")}
+                onChange={(v) => setSpec({ column: v })}
+              />
+            ) : (
+              <input
+                className={field}
+                aria-label={`${side === "left" ? "First" : "Second"} number`}
+                placeholder="Number"
+                value={String(spec.value ?? "")}
+                onChange={(e) => setSpec({ value: e.target.value })}
+              />
+            )}
+          </div>
+        </div>
+      );
+    };
+    return (
+      <>
+        <Label>New column name</Label>
+        <input className={field} aria-label="New column name" placeholder="For example: total_price" value={String(cfg.name ?? "")} onChange={(e) => set({ name: e.target.value })} />
+        <Label>Calculation</Label>
+        <div className="space-y-2">
+          {operand("left")}
+          <select className={field} aria-label="Operation" value={String(cfg.operation ?? "")} onChange={(e) => set({ operation: e.target.value })}>
+            <option value="add">plus (+)</option>
+            <option value="subtract">minus (−)</option>
+            <option value="multiply">times (×)</option>
+            <option value="divide">divided by (÷)</option>
+          </select>
+          {operand("right")}
+        </div>
+        <p className="mt-1 text-[11.5px] text-slate-500">
+          At least one side must be a column. An empty value gives an empty result. Dividing by zero gives an empty result, not an error.
+        </p>
+      </>
+    );
+  }
+
   function outputForm() {
     return (
       <>
@@ -552,6 +706,9 @@ export default function NodeConfigPanel(props: Props) {
     rename_columns: renameForm,
     remove_duplicates: dedupeForm,
     handle_missing: missingForm,
+    aggregate: aggregateForm,
+    change_type: changeTypeForm,
+    derive_column: deriveForm,
     output: outputForm,
   };
 

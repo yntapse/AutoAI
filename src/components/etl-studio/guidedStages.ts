@@ -140,7 +140,7 @@ export const STATUS_TEXT: Record<StageStatus, string> = {
   not_needed: "Not needed",
 };
 
-const TRANSFORMS = new Set(["filter", "drop_columns", "rename_columns", "remove_duplicates", "handle_missing"]);
+const TRANSFORMS = new Set(["filter", "drop_columns", "rename_columns", "remove_duplicates", "handle_missing", "aggregate", "change_type", "derive_column"]);
 const NEEDS_ATTENTION: ReadonlySet<StageStatus> = new Set([
   "incomplete",
   "invalid",

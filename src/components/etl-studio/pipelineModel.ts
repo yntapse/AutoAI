@@ -21,6 +21,9 @@ export type NodeType =
   | "rename_columns"
   | "remove_duplicates"
   | "handle_missing"
+  | "aggregate"
+  | "change_type"
+  | "derive_column"
   | "output";
 
 export const NODE_TYPES: readonly NodeType[] = [
@@ -31,6 +34,9 @@ export const NODE_TYPES: readonly NodeType[] = [
   "rename_columns",
   "remove_duplicates",
   "handle_missing",
+  "aggregate",
+  "change_type",
+  "derive_column",
   "output",
 ];
 
@@ -41,6 +47,9 @@ export const TRANSFORM_TYPES: readonly NodeType[] = [
   "rename_columns",
   "remove_duplicates",
   "handle_missing",
+  "aggregate",
+  "change_type",
+  "derive_column",
 ];
 
 export interface NodeMeta {
@@ -58,6 +67,9 @@ export const NODE_META: Record<NodeType, NodeMeta> = {
   rename_columns: { label: "Rename columns", hint: "Give columns new names", ports: ["in"] },
   remove_duplicates: { label: "Remove duplicates", hint: "Keep one row per duplicate group", ports: ["in"] },
   handle_missing: { label: "Handle missing values", hint: "Drop rows or fill empty values", ports: ["in"] },
+  aggregate: { label: "Group & summarise", hint: "Sum, average, count, min or max per group", ports: ["in"] },
+  change_type: { label: "Change column type", hint: "Convert columns to number, decimal, text or date", ports: ["in"] },
+  derive_column: { label: "Calculate new column", hint: "Add, subtract, multiply or divide to make a new column", ports: ["in"] },
   output: { label: "Output dataset", hint: "The result of the pipeline", ports: ["in"] },
 };
 
@@ -154,6 +166,12 @@ export function defaultConfig(type: NodeType): Config {
       return { columns: [] };
     case "handle_missing":
       return { strategy: "drop_rows", columns: [], value: "" };
+    case "aggregate":
+      return { group_by: [], measures: [] };
+    case "change_type":
+      return { mappings: [] };
+    case "derive_column":
+      return { name: "", operation: "multiply", left: { column: "" }, right: { value: "" } };
     case "output":
       return { name: "" };
   }
@@ -161,7 +179,7 @@ export function defaultConfig(type: NodeType): Config {
 
 export function newNodeId(nodes: readonly PipelineNode[], type: NodeType): string {
   const taken = new Set(nodes.map((n) => n.id));
-  const base = type === "drop_columns" ? "drop" : type === "rename_columns" ? "rename" : type === "remove_duplicates" ? "dedupe" : type === "handle_missing" ? "missing" : type;
+  const base = type === "drop_columns" ? "drop" : type === "rename_columns" ? "rename" : type === "remove_duplicates" ? "dedupe" : type === "handle_missing" ? "missing" : type === "change_type" ? "convert" : type === "derive_column" ? "calc" : type;
   for (let i = 1; i < 1000; i += 1) {
     const id = `${base}_${i}`;
     if (!taken.has(id)) return id;
@@ -223,6 +241,18 @@ export function nodeSummary(node: PipelineNode, tableLabel?: string): string {
       const how = c.strategy === "fixed" ? "fill with value" : c.strategy === "mean" ? "fill with mean" : "drop rows";
       return n === 0 ? "No columns chosen" : `${how} · ${n} column${n === 1 ? "" : "s"}`;
     }
+    case "aggregate": {
+      const n = Array.isArray(c.measures) ? c.measures.length : 0;
+      const g = list(c.group_by).length;
+      if (n === 0) return "No measures yet";
+      return `${n} measure${n === 1 ? "" : "s"} · ${g === 0 ? "one row overall" : `by ${g} column${g === 1 ? "" : "s"}`}`;
+    }
+    case "change_type": {
+      const n = Array.isArray(c.mappings) ? c.mappings.length : 0;
+      return n === 0 ? "No conversions yet" : `${n} conversion${n === 1 ? "" : "s"}`;
+    }
+    case "derive_column":
+      return typeof c.name === "string" && c.name ? `New column: ${c.name}` : "No new column yet";
     case "output":
       return typeof c.name === "string" && c.name ? c.name : "Unnamed dataset";
   }

@@ -247,6 +247,25 @@ test("node summaries describe the settings and handle empty ones", () => {
   assert.equal(m.nodeSummary(node("o", "output", { name: "" })), "Unnamed dataset");
 });
 
+test("the Group, Convert and Calculate steps are in the palette with sensible defaults and summaries", () => {
+  for (const t of ["aggregate", "change_type", "derive_column"] as const) {
+    assert.ok(m.TRANSFORM_TYPES.includes(t), `${t} is in the palette`);
+    assert.ok(m.NODE_TYPES.includes(t));
+    assert.deepEqual(m.inputPorts(t), ["in"]);
+  }
+  assert.deepEqual(m.defaultConfig("aggregate"), { group_by: [], measures: [] });
+  assert.deepEqual(m.defaultConfig("change_type"), { mappings: [] });
+  assert.equal(m.nodeSummary(node("g", "aggregate", { group_by: [], measures: [] })), "No measures yet");
+  assert.equal(m.nodeSummary(node("g", "aggregate", { group_by: ["r"], measures: [{}, {}] })), "2 measures · by 1 column");
+  assert.equal(m.nodeSummary(node("g", "aggregate", { group_by: [], measures: [{}] })), "1 measure · one row overall");
+  assert.equal(m.nodeSummary(node("c", "change_type", { mappings: [] })), "No conversions yet");
+  assert.equal(m.nodeSummary(node("c", "change_type", { mappings: [{}] })), "1 conversion");
+  assert.equal(m.nodeSummary(node("d", "derive_column", { name: "" })), "No new column yet");
+  assert.equal(m.nodeSummary(node("d", "derive_column", { name: "total" })), "New column: total");
+  assert.equal(m.newNodeId([], "change_type"), "convert_1");
+  assert.equal(m.newNodeId([], "derive_column"), "calc_1");
+});
+
 // ---- Catalog "Build Dataset" prefill
 
 const spotsFor = (count: number) => Array.from({ length: count }, (_, i) => ({ x: 40, y: 40 + i * 152 }));
