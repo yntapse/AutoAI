@@ -113,8 +113,8 @@ function ColumnChecklist({
             checked={selected.includes(c.name)}
             onChange={(e) => onChange(e.target.checked ? [...selected, c.name] : selected.filter((s) => s !== c.name))}
           />
-          <span className="truncate">{c.name}</span>
-          <span className="ml-auto shrink-0 text-[10.5px] text-slate-600">{c.data_type}</span>
+          <span className="max-w-[60%] shrink-0 truncate">{c.name}</span>
+          <span className="ml-auto min-w-0 truncate text-[10.5px] text-slate-600" title={c.data_type}>{c.data_type}</span>
         </label>
       ))}
       {missing.map((m) => (
