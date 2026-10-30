@@ -42,3 +42,47 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# ===== Added for GitHub upload =====
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.pytest_cache/
+
+# ---- Secrets (extra safety) ----
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+*.crt
+
+# ---- Logs, databases, generated data ----
+*.log
+logs/
+*.db
+*.db-journal
+*.sqlite3
+backend/uploads/
+backend/generated_datasets/
+
+# ---- Temporary / scratch ----
+_tmp/
+_to_delete/
+Claude outputs/
+backend/tmp_*
+backend/*_output.txt
+backend/*_out.txt
+backend/response_create*.json
+*.tgz
+*.bak*
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+Thumbs.db

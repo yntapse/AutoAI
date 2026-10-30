@@ -3,11 +3,31 @@
 import Navbar from "@/components/Navbar";
 import { useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { createProject } from "@/services/projectService";
+import {
+  createProject,
+  createProjectFromDatabase,
+  createProjectFromDataModel,
+} from "@/services/projectService";
+import type {
+  DataModelPreviewResponse,
+  DataModelSpec,
+} from "@/services/projectService";
+import MultiTableBuilder from "@/components/MultiTableBuilder";
+import EtlCopilotPanel from "@/components/EtlCopilotPanel";
 
 interface CreateProjectResponse {
   file_id: string;
   target_column: string;
+}
+
+// Response shape returned by POST /datasource/preview
+interface DatasourcePreviewResponse {
+  preview_rows: number;
+  has_more: boolean;
+  columns: number;
+  column_names: string[];
+  numeric_columns: string[];
+  sample_rows: Record<string, unknown>[];
 }
 
 interface DatasetInfo {
@@ -19,23 +39,78 @@ interface DatasetInfo {
 
 export default function NewProjectPage() {
   const router = useRouter();
+
   const [currentStep, setCurrentStep] = useState(1);
+
+  const [dataSource, setDataSource] = useState<"csv" | "database">("csv");
+  const [dbType, setDbType] = useState("postgresql");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("5432");
+  const [database, setDatabase] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+
   const [projectName, setProjectName] = useState("");
   const [projectDescription, setProjectDescription] = useState("");
   const [file, setFile] = useState<File | null>(null);
+
   const [datasetInfo, setDatasetInfo] = useState<DatasetInfo | null>(null);
   const [targetColumn, setTargetColumn] = useState("");
   const [targetColumns, setTargetColumns] = useState<string[]>([]);
+
   const [dragOver, setDragOver] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [connectionSuccess, setConnectionSuccess] = useState(false);
+  const [connectionError, setConnectionError] = useState("");
+  const [pendingCopilotTraining, setPendingCopilotTraining] = useState<{
+    fileId: string;
+    targetColumn: string;
+    projectId: string;
+  } | null>(null);
+
+  // --- Database: table list (POST /datasource/tables) -----------------------
+  const [isLoadingTables, setIsLoadingTables] = useState(false);
+  const [availableTables, setAvailableTables] = useState<string[]>([]);
+  const [selectedTable, setSelectedTable] = useState("");
+  const [tablesError, setTablesError] = useState("");
+
+  // --- Database: table preview (POST /datasource/preview) --------------------
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [previewColumns, setPreviewColumns] = useState<string[]>([]);
+  const [previewNumericColumns, setPreviewNumericColumns] = useState<string[]>(
+    [],
+  );
+  const [previewRows, setPreviewRows] = useState<Record<string, unknown>[]>([]);
+  const [previewRowCount, setPreviewRowCount] = useState(0);
+  const [previewHasMore, setPreviewHasMore] = useState(false);
+
+  // --- Database: single-table vs multi-table mode (Sprint 1) ----------------
+  // selectedTable belongs to the single-table flow only. The multi-table flow
+  // signals "I have a dataset" through hasDbDataset instead.
+  const [dbMode, setDbMode] = useState<
+  "single" | "multi" | "copilot"
+>("single");
+  const [hasDbDataset, setHasDbDataset] = useState(false);
+  const [dataModelSpec, setDataModelSpec] = useState<DataModelSpec | null>(
+    null,
+  );
+
+  // The database branch's single completion signal, used everywhere the page
+  // previously tested `selectedTable !== ""`.
+  const hasDatabaseDataset =
+    dataSource === "database" &&
+    (dbMode === "multi" ? hasDbDataset : selectedTable !== "");
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const extractCsvHeaders = async (csvFile: File): Promise<string[]> => {
     const raw = await csvFile.text();
     const firstLine = raw.split(/\r?\n/)[0] ?? "";
-    const normalized = firstLine.replace(/^\uFEFF/, "").trim();
+    const normalized = firstLine.replace(/^﻿/, "").trim();
     if (!normalized) {
       return [];
     }
@@ -63,7 +138,9 @@ export default function NewProjectPage() {
     });
 
     const numericCount = columnTypes.filter((t) => t === "numeric").length;
-    const categoricalCount = columnTypes.filter((t) => t === "categorical").length;
+    const categoricalCount = columnTypes.filter(
+      (t) => t === "categorical",
+    ).length;
 
     return {
       rows: lines.length - 1,
@@ -73,27 +150,30 @@ export default function NewProjectPage() {
     };
   };
 
-  const handleSelectedFile = useCallback(async (selectedFile: File) => {
-    setFile(selectedFile);
-    setTargetColumn("");
-    setSubmitError(null);
+  const handleSelectedFile = useCallback(
+    async (selectedFile: File) => {
+      setFile(selectedFile);
+      setTargetColumn("");
+      setSubmitError(null);
 
-    try {
-      const headers = await extractCsvHeaders(selectedFile);
-      setTargetColumns(headers);
+      try {
+        const headers = await extractCsvHeaders(selectedFile);
+        setTargetColumns(headers);
 
-      const info = await analyzeDataset(selectedFile);
-      setDatasetInfo(info);
+        const info = await analyzeDataset(selectedFile);
+        setDatasetInfo(info);
 
-      // Auto-advance to step 2
-      if (currentStep === 1) {
-        setCurrentStep(2);
+        // Auto-advance to step 2
+        if (currentStep === 1) {
+          setCurrentStep(2);
+        }
+      } catch {
+        setTargetColumns([]);
+        setDatasetInfo(null);
       }
-    } catch {
-      setTargetColumns([]);
-      setDatasetInfo(null);
-    }
-  }, [currentStep]);
+    },
+    [currentStep],
+  );
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -104,13 +184,190 @@ export default function NewProjectPage() {
         void handleSelectedFile(dropped);
       }
     },
-    [handleSelectedFile]
+    [handleSelectedFile],
   );
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
     if (selected && selected.name.endsWith(".csv")) {
       void handleSelectedFile(selected);
+    }
+  };
+
+  // Builds a single validated SELECT for the currently selected table.
+  // MSSQL uses bracket-quoted identifiers; PostgreSQL uses double quotes.
+  // Both dialects are handled since those are the only two db types the
+  // form (and the backend) supports.
+  const buildTableSelectQuery = (table: string) =>
+    dbType === "mssql"
+      ? `SELECT * FROM [${table}]`
+      : `SELECT * FROM "${table}"`;
+
+  const resetPreviewState = () => {
+    setPreviewError("");
+    setPreviewColumns([]);
+    setPreviewNumericColumns([]);
+    setPreviewRows([]);
+    setPreviewRowCount(0);
+    setPreviewHasMore(false);
+    setTargetColumns([]);
+    setTargetColumn("");
+    // Any re-connect, table reload or re-preview invalidates a built dataset.
+    setHasDbDataset(false);
+    setDataModelSpec(null);
+  };
+
+  // Reads a POST /datasource/preview response into component state, and
+  // feeds the existing Step 3 "target column" chip picker from the same
+  // column list (no separate columns endpoint needed).
+  const loadColumnsFromPreview = (data: DatasourcePreviewResponse) => {
+    const columnNames = Array.isArray(data.column_names)
+      ? data.column_names
+      : [];
+    setPreviewColumns(columnNames);
+    setTargetColumns(columnNames);
+    setPreviewNumericColumns(
+      Array.isArray(data.numeric_columns) ? data.numeric_columns : [],
+    );
+    setPreviewRows(Array.isArray(data.sample_rows) ? data.sample_rows : []);
+    setPreviewRowCount(
+      typeof data.preview_rows === "number" ? data.preview_rows : 0,
+    );
+    setPreviewHasMore(Boolean(data.has_more));
+  };
+
+  // POST /datasource/preview for one table. Called automatically as soon as
+  // a table is selected (either auto-selected after connecting, or picked
+  // manually from the dropdown).
+  const previewTable = async (table: string) => {
+    if (!table) return;
+
+    setIsLoadingPreview(true);
+    resetPreviewState();
+
+    try {
+      const response = await fetch("http://localhost:8000/datasource/preview", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          db_type: dbType,
+          host,
+          port: Number(port),
+          database,
+          username,
+          password,
+          query: buildTableSelectQuery(table),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        loadColumnsFromPreview(data as DatasourcePreviewResponse);
+      } else {
+        setPreviewError(
+          data.detail || "Could not load a preview for this table",
+        );
+      }
+    } catch (error) {
+      setPreviewError("Unable to load preview from server");
+    } finally {
+      setIsLoadingPreview(false);
+    }
+  };
+
+  // POST /datasource/tables. Runs after a successful test connection, lists
+  // the tables, auto-selects the first one, and kicks off its preview.
+  const loadTables = async () => {
+    setIsLoadingTables(true);
+    setTablesError("");
+    setAvailableTables([]);
+    setSelectedTable("");
+    resetPreviewState();
+
+    try {
+      const response = await fetch("http://localhost:8000/datasource/tables", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          db_type: dbType,
+          host,
+          port: Number(port),
+          database,
+          username,
+          password,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        const tables: string[] = Array.isArray(data.tables) ? data.tables : [];
+        setAvailableTables(tables);
+        if (tables.length > 0 && dbMode === "single") {
+          setSelectedTable(tables[0]);
+          void previewTable(tables[0]); // auto-load preview for the first table
+        }
+      } else {
+        setTablesError(data.detail || "Could not load tables");
+      }
+    } catch (error) {
+      setTablesError("Unable to load tables from server");
+    } finally {
+      setIsLoadingTables(false);
+    }
+  };
+
+  // User picked a different table from the dropdown: reselect + re-preview.
+  const handleTableChange = (table: string) => {
+    setSelectedTable(table);
+    void previewTable(table);
+  };
+
+  // FIX: this was previously declared *inside* handleFileChange, which made it
+  // unreachable from the JSX below and recreated on every file input change.
+  // Moved to component scope, unchanged otherwise (still hits the same endpoint).
+  const testConnection = async () => {
+    setIsTestingConnection(true);
+    setConnectionError("");
+    setConnectionSuccess(false);
+    setAvailableTables([]);
+    setSelectedTable("");
+    setTablesError("");
+    resetPreviewState();
+
+    try {
+      const response = await fetch("http://localhost:8000/datasource/test", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          db_type: dbType,
+          host,
+          port: Number(port),
+          database,
+          username,
+          password,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        setConnectionSuccess(true);
+        await loadTables(); // auto-load tables right after a successful connection
+      } else {
+        setConnectionError(data.detail || "Connection failed");
+      }
+    } catch (error) {
+      setConnectionError("Unable to connect to server");
+    } finally {
+      setIsTestingConnection(false);
     }
   };
 
@@ -122,13 +379,89 @@ export default function NewProjectPage() {
       return;
     }
 
-    if (!file) {
-      setSubmitError("Please upload a CSV file.");
+    if (!targetColumn) {
+      setSubmitError("Please select a target column.");
       return;
     }
 
-    if (!targetColumn) {
-      setSubmitError("Please select a target column.");
+    // --- CSV flow: unchanged from before ------------------------------------
+    if (dataSource === "csv") {
+      if (!file) {
+        setSubmitError("Please upload a CSV file.");
+        return;
+      }
+
+      setIsSubmitting(true);
+      setSubmitError(null);
+
+      try {
+        const response = (await createProject(
+          projectName.trim(),
+          targetColumn,
+          file,
+        )) as CreateProjectResponse;
+        console.log("Project created:", response);
+        router.push(
+          `/training/${encodeURIComponent(response.file_id)}?target_column=${encodeURIComponent(response.target_column)}`,
+        );
+      } catch (error) {
+        console.error("Create project failed:", error);
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while creating project.";
+        setSubmitError(message);
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+
+    // --- Database flow: multi-table (POST /datamodel/extract) ---------------
+    if (dbMode === "multi") {
+      if (!dataModelSpec) {
+        setSubmitError("Please preview the joined dataset first.");
+        return;
+      }
+
+      setIsSubmitting(true);
+      setSubmitError(null);
+
+      try {
+        const response = await createProjectFromDataModel({
+          dbType,
+          host,
+          port: Number(port),
+          database,
+          username,
+          password,
+          tables: dataModelSpec.tables,
+          baseTable: dataModelSpec.baseTable,
+          relationships: dataModelSpec.relationships,
+          selectedColumns: dataModelSpec.selectedColumns,
+          projectName: projectName.trim(),
+          targetColumn,
+        });
+        console.log("Project created from data model:", response);
+        router.push(
+          `/training/${encodeURIComponent(response.file_id)}?target_column=${encodeURIComponent(response.target_column)}`,
+        );
+      } catch (error) {
+        console.error("Create project from data model failed:", error);
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while creating project.";
+        setSubmitError(message);
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+
+    // --- Database flow: single table (POST /datasource/extract) -------------
+    if (!selectedTable) {
+      setSubmitError("Please select a table.");
       return;
     }
 
@@ -136,17 +469,23 @@ export default function NewProjectPage() {
     setSubmitError(null);
 
     try {
-      const response = (await createProject(
-        projectName.trim(),
+      const response = await createProjectFromDatabase({
+        dbType,
+        host,
+        port: Number(port),
+        database,
+        username,
+        password,
+        query: buildTableSelectQuery(selectedTable),
+        projectName: projectName.trim(),
         targetColumn,
-        file
-      )) as CreateProjectResponse;
-      console.log("Project created:", response);
+      });
+      console.log("Project created from database:", response);
       router.push(
-        `/training/${encodeURIComponent(response.file_id)}?target_column=${encodeURIComponent(response.target_column)}`
+        `/training/${encodeURIComponent(response.file_id)}?target_column=${encodeURIComponent(response.target_column)}`,
       );
     } catch (error) {
-      console.error("Create project failed:", error);
+      console.error("Create project from database failed:", error);
       const message =
         error instanceof Error
           ? error.message
@@ -158,10 +497,14 @@ export default function NewProjectPage() {
   };
 
   // AI suggestion logic
-  const suggestedTarget = targetColumns.length > 0 ? targetColumns[targetColumns.length - 1] : "";
-  const taskType = suggestedTarget.toLowerCase().includes("price") || suggestedTarget.toLowerCase().includes("salary") || suggestedTarget.toLowerCase().includes("value")
-    ? "regression"
-    : "classification";
+  const suggestedTarget =
+    targetColumns.length > 0 ? targetColumns[targetColumns.length - 1] : "";
+  const taskType =
+    suggestedTarget.toLowerCase().includes("price") ||
+    suggestedTarget.toLowerCase().includes("salary") ||
+    suggestedTarget.toLowerCase().includes("value")
+      ? "regression"
+      : "classification";
 
   return (
     <>
@@ -179,8 +522,18 @@ export default function NewProjectPage() {
           <div className="mx-auto max-w-7xl mb-8">
             <div className="flex items-start gap-4">
               <div className="flex h-14 w-14 flex-shrink-0 items-center justify-center rounded-2xl border border-violet-500/30 bg-gradient-to-br from-violet-600/20 to-cyan-600/20 shadow-[0_0_24px_rgba(139,92,246,0.3)]">
-                <svg className="h-7 w-7 text-violet-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                <svg
+                  className="h-7 w-7 text-violet-300"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M13 10V3L4 14h7v7l9-11h-7z"
+                  />
                 </svg>
               </div>
               <div className="flex-1">
@@ -188,7 +541,8 @@ export default function NewProjectPage() {
                   Create New AI Project
                 </h1>
                 <p className="text-[15px] text-slate-400 leading-relaxed max-w-2xl">
-                  Upload your dataset and PyrunAI will automatically train, compare, and optimize machine learning models.
+                  Upload your dataset and PyrunAI will automatically train,
+                  compare, and optimize machine learning models.
                 </p>
               </div>
             </div>
@@ -202,8 +556,18 @@ export default function NewProjectPage() {
                 <form onSubmit={handleSubmit} className="space-y-6">
                   {submitError && (
                     <div className="flex items-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3">
-                      <svg className="h-5 w-5 flex-shrink-0 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      <svg
+                        className="h-5 w-5 flex-shrink-0 text-rose-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
                       </svg>
                       <p className="text-[13px] text-rose-300">{submitError}</p>
                     </div>
@@ -232,11 +596,16 @@ export default function NewProjectPage() {
                       </div>
                       <div>
                         <label className="mb-2 block text-[13px] font-semibold text-slate-300">
-                          Description <span className="text-[11px] font-normal text-slate-500">(optional)</span>
+                          Description{" "}
+                          <span className="text-[11px] font-normal text-slate-500">
+                            (optional)
+                          </span>
                         </label>
                         <textarea
                           value={projectDescription}
-                          onChange={(e) => setProjectDescription(e.target.value)}
+                          onChange={(e) =>
+                            setProjectDescription(e.target.value)
+                          }
                           placeholder="What are you trying to predict?"
                           rows={3}
                           className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 placeholder-slate-500 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20 resize-none"
@@ -249,8 +618,18 @@ export default function NewProjectPage() {
                           className="mt-2 flex items-center gap-2 text-[13px] font-medium text-cyan-400 transition-colors hover:text-cyan-300"
                         >
                           Continue to Upload
-                          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
+                          <svg
+                            className="h-4 w-4"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M17 8l4 4m0 0l-4 4m4-4H3"
+                            />
                           </svg>
                         </button>
                       )}
@@ -262,150 +641,673 @@ export default function NewProjectPage() {
                     stepNumber={2}
                     title="Upload Dataset"
                     isActive={currentStep === 2}
-                    isCompleted={currentStep > 2 || file !== null}
+                    isCompleted={
+                      currentStep > 2 || file !== null || hasDatabaseDataset
+                    }
                   >
-                    <div
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        setDragOver(true);
-                      }}
-                      onDragLeave={() => setDragOver(false)}
-                      onDrop={handleDrop}
-                      onClick={() => fileInputRef.current?.click()}
-                      className={`group cursor-pointer rounded-2xl border-2 border-dashed px-8 py-12 text-center transition-all ${
-                        dragOver
-                          ? "border-cyan-400/60 bg-cyan-500/10 shadow-[0_0_32px_rgba(6,182,212,0.25)]"
-                          : file
-                          ? "border-emerald-400/50 bg-emerald-500/10"
-                          : "border-white/[0.08] hover:border-cyan-400/40 hover:bg-white/[0.03]"
-                      }`}
-                    >
-                      {file ? (
-                        <div className="flex flex-col items-center gap-3">
-                          <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-400/40 bg-emerald-500/15 shadow-[0_0_24px_rgba(52,211,153,0.3)]">
-                            <svg className="h-8 w-8 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            </svg>
+                    <div className="mb-6 flex gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDataSource("csv");
+                          setTargetColumn("");
+                          if (!file) {
+                            setTargetColumns([]);
+                          }
+                        }}
+                        className={`rounded-lg px-4 py-2 ${
+                          dataSource === "csv"
+                            ? "bg-cyan-600 text-white"
+                            : "bg-slate-800 text-slate-300"
+                        }`}
+                      >
+                        CSV Upload
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDataSource("database");
+                          setTargetColumn("");
+                          setTargetColumns(previewColumns);
+                        }}
+                        className={`rounded-lg px-4 py-2 ${
+                          dataSource === "database"
+                            ? "bg-cyan-600 text-white"
+                            : "bg-slate-800 text-slate-300"
+                        }`}
+                      >
+                        Database Connection
+                      </button>
+                    </div>
+
+                    {dataSource === "csv" ? (
+                      <div
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          setDragOver(true);
+                        }}
+                        onDragLeave={() => setDragOver(false)}
+                        onDrop={handleDrop}
+                        onClick={() => fileInputRef.current?.click()}
+                        className={`group cursor-pointer rounded-2xl border-2 border-dashed px-8 py-12 text-center transition-all ${
+                          dragOver
+                            ? "border-cyan-400/60 bg-cyan-500/10 shadow-[0_0_32px_rgba(6,182,212,0.25)]"
+                            : file
+                              ? "border-emerald-400/50 bg-emerald-500/10"
+                              : "border-white/[0.08] hover:border-cyan-400/40 hover:bg-white/[0.03]"
+                        }`}
+                      >
+                        {file ? (
+                          <div className="flex flex-col items-center gap-3">
+                            <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-400/40 bg-emerald-500/15 shadow-[0_0_24px_rgba(52,211,153,0.3)]">
+                              <svg
+                                className="h-8 w-8 text-emerald-400"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                                />
+                              </svg>
+                            </div>
+                            <div>
+                              <p className="text-[15px] font-semibold text-slate-100">
+                                {file.name}
+                              </p>
+                              <p className="text-[12px] text-slate-500 mt-1">
+                                {(file.size / 1024).toFixed(1)} KB
+                              </p>
+                            </div>
+                            {datasetInfo && (
+                              <div className="mt-4 grid grid-cols-3 gap-3 w-full max-w-md">
+                                <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                    Rows
+                                  </p>
+                                  <p className="mt-1 text-[18px] font-bold text-cyan-400">
+                                    {datasetInfo.rows.toLocaleString()}
+                                  </p>
+                                </div>
+                                <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                    Columns
+                                  </p>
+                                  <p className="mt-1 text-[18px] font-bold text-violet-400">
+                                    {datasetInfo.columns}
+                                  </p>
+                                </div>
+                                <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                    Features
+                                  </p>
+                                  <p className="mt-1 text-[12px] font-semibold text-slate-300">
+                                    {datasetInfo.numericCount}N /{" "}
+                                    {datasetInfo.categoricalCount}C
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+                            <div className="mt-3 flex items-center gap-3">
+                              <button
+                                type="button"
+                                disabled={isUploading}
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  if (!file) return;
+                                  setIsUploading(true);
+                                  setSubmitError(null);
+                                  try {
+                                    const API_BASE = (
+                                      process.env.NEXT_PUBLIC_API_BASE_URL ||
+                                      "http://localhost:8000"
+                                    ).replace(/\/$/, "");
+                                    const fd = new FormData();
+                                    fd.append("file", file);
+                                    const res = await fetch(
+                                      `${API_BASE}/upload-temp`,
+                                      { method: "POST", body: fd },
+                                    );
+                                    if (!res.ok) {
+                                      const err = await res
+                                        .json()
+                                        .catch(() => ({
+                                          detail: "Upload failed",
+                                        }));
+                                      throw new Error(
+                                        err.detail || "Upload failed",
+                                      );
+                                    }
+                                    const data = await res.json();
+                                    router.push(
+                                      `/training/${encodeURIComponent(data.file_id)}/transform`,
+                                    );
+                                  } catch (err) {
+                                    setSubmitError(
+                                      err instanceof Error
+                                        ? err.message
+                                        : "Upload failed",
+                                    );
+                                  } finally {
+                                    setIsUploading(false);
+                                  }
+                                }}
+                                className="group relative flex items-center gap-2 rounded-xl border border-violet-500/30 bg-gradient-to-r from-violet-600/20 to-fuchsia-600/20 px-4 py-2 text-[13px] font-semibold text-violet-300 shadow-[0_0_16px_rgba(139,92,246,0.2)] transition-all hover:border-violet-400/50 hover:shadow-[0_0_24px_rgba(139,92,246,0.35)] disabled:opacity-60"
+                              >
+                                {isUploading ? (
+                                  <svg
+                                    className="h-4 w-4 animate-spin"
+                                    fill="none"
+                                    viewBox="0 0 24 24"
+                                  >
+                                    <circle
+                                      className="opacity-25"
+                                      cx="12"
+                                      cy="12"
+                                      r="10"
+                                      stroke="currentColor"
+                                      strokeWidth="4"
+                                    />
+                                    <path
+                                      className="opacity-75"
+                                      fill="currentColor"
+                                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                                    />
+                                  </svg>
+                                ) : (
+                                  <svg
+                                    className="h-4 w-4"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    viewBox="0 0 24 24"
+                                  >
+                                    <path
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                      strokeWidth={2}
+                                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                    />
+                                  </svg>
+                                )}
+                                {isUploading
+                                  ? "Uploading…"
+                                  : "Transform Dataset"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setFile(null);
+                                  setDatasetInfo(null);
+                                  setTargetColumns([]);
+                                  setTargetColumn("");
+                                  setCurrentStep(2);
+                                }}
+                                className="text-[13px] font-medium text-rose-400 transition-colors hover:text-rose-300"
+                              >
+                                Remove file
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex flex-col items-center gap-3">
+                            <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.04] transition-all group-hover:border-cyan-400/40 group-hover:bg-cyan-500/10">
+                              <svg
+                                className="h-8 w-8 text-slate-500 transition-colors group-hover:text-cyan-400"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={1.5}
+                                  d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+                                />
+                              </svg>
+                              <div className="absolute -right-1 -top-1 h-3 w-3 rounded-full bg-cyan-400 opacity-0 shadow-[0_0_12px_rgba(6,182,212,0.8)] transition-opacity group-hover:opacity-100 animate-pulse" />
+                            </div>
+                            <div>
+                              <p className="text-[15px] font-semibold text-slate-200">
+                                Drop your CSV file here, or{" "}
+                                <span className="text-cyan-400">browse</span>
+                              </p>
+                              <p className="mt-1 text-[12px] text-slate-500">
+                                Maximum file size: 100MB
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept=".csv"
+                          className="hidden"
+                          onChange={handleFileChange}
+                        />
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Database Type
+                            </label>
+                            <select
+                              value={dbType}
+                              onChange={(e) => setDbType(e.target.value)}
+                              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                            >
+                              <option value="postgresql">PostgreSQL</option>
+                              <option value="mssql">SQL Server</option>
+                            </select>
                           </div>
                           <div>
-                            <p className="text-[15px] font-semibold text-slate-100">{file.name}</p>
-                            <p className="text-[12px] text-slate-500 mt-1">{(file.size / 1024).toFixed(1)} KB</p>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Host
+                            </label>
+                            <input
+                              type="text"
+                              value={host}
+                              onChange={(e) => setHost(e.target.value)}
+                              placeholder="e.g. localhost or db.example.com"
+                              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 placeholder-slate-500 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                            />
                           </div>
-                          {datasetInfo && (
-                            <div className="mt-4 grid grid-cols-3 gap-3 w-full max-w-md">
-                              <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
-                                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Rows</p>
-                                <p className="mt-1 text-[18px] font-bold text-cyan-400">{datasetInfo.rows.toLocaleString()}</p>
-                              </div>
-                              <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
-                                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Columns</p>
-                                <p className="mt-1 text-[18px] font-bold text-violet-400">{datasetInfo.columns}</p>
-                              </div>
-                              <div className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
-                                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Features</p>
-                                <p className="mt-1 text-[12px] font-semibold text-slate-300">
-                                  {datasetInfo.numericCount}N / {datasetInfo.categoricalCount}C
-                                </p>
-                              </div>
-                            </div>
-                          )}
-                          <div className="mt-3 flex items-center gap-3">
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Port
+                            </label>
+                            <input
+                              type="text"
+                              value={port}
+                              onChange={(e) => setPort(e.target.value)}
+                              placeholder="5432"
+                              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 placeholder-slate-500 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                            />
+                          </div>
+                          <div>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Database Name
+                            </label>
+                            <input
+                              type="text"
+                              value={database}
+                              onChange={(e) => setDatabase(e.target.value)}
+                              placeholder="e.g. production_db"
+                              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 placeholder-slate-500 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Username
+                            </label>
+                            <input
+                              type="text"
+                              value={username}
+                              onChange={(e) => setUsername(e.target.value)}
+                              placeholder="db_user"
+                              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 placeholder-slate-500 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                            />
+                          </div>
+                          <div>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Password
+                            </label>
+                            <input
+                              type="password"
+                              value={password}
+                              onChange={(e) => setPassword(e.target.value)}
+                              placeholder="••••••••"
+                              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 placeholder-slate-500 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                            />
+                          </div>
+                        </div>
+
+                        {connectionError && (
+                          <div className="flex items-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3">
+                            <p className="text-[13px] text-rose-300">
+                              {connectionError}
+                            </p>
+                          </div>
+                        )}
+                        {connectionSuccess && (
+                          <div className="flex items-center gap-3 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-4 py-3">
+                            <p className="text-[13px] text-emerald-300">
+                              Connection successful.
+                            </p>
+                          </div>
+                        )}
+
+                        {/* Single-table vs multi-table (Sprint 1) */}
+                        {connectionSuccess && (
+                          <div className="flex gap-2">
                             <button
                               type="button"
-                              disabled={isUploading}
-                              onClick={async (e) => {
-                                e.stopPropagation();
-                                if (!file) return;
-                                setIsUploading(true);
-                                setSubmitError(null);
-                                try {
-                                  const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
-                                  const fd = new FormData();
-                                  fd.append("file", file);
-                                  const res = await fetch(`${API_BASE}/upload-temp`, { method: "POST", body: fd });
-                                  if (!res.ok) {
-                                    const err = await res.json().catch(() => ({ detail: "Upload failed" }));
-                                    throw new Error(err.detail || "Upload failed");
-                                  }
-                                  const data = await res.json();
-                                  router.push(`/training/${encodeURIComponent(data.file_id)}/transform`);
-                                } catch (err) {
-                                  setSubmitError(err instanceof Error ? err.message : "Upload failed");
-                                } finally {
-                                  setIsUploading(false);
+                              onClick={() => {
+                                setDbMode("single");
+                                resetPreviewState();
+                                if (availableTables.length > 0) {
+                                  setSelectedTable(availableTables[0]);
+                                  void previewTable(availableTables[0]);
                                 }
                               }}
-                              className="group relative flex items-center gap-2 rounded-xl border border-violet-500/30 bg-gradient-to-r from-violet-600/20 to-fuchsia-600/20 px-4 py-2 text-[13px] font-semibold text-violet-300 shadow-[0_0_16px_rgba(139,92,246,0.2)] transition-all hover:border-violet-400/50 hover:shadow-[0_0_24px_rgba(139,92,246,0.35)] disabled:opacity-60"
+                              className={`rounded-lg px-3 py-1.5 text-[12px] font-medium ${
+                                dbMode === "single"
+                                  ? "bg-cyan-600 text-white"
+                                  : "bg-slate-800 text-slate-300"
+                              }`}
                             >
-                              {isUploading ? (
-                                <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                                </svg>
-                              ) : (
-                                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                                </svg>
-                              )}
-                              {isUploading ? "Uploading…" : "Transform Dataset"}
+                              Single table
                             </button>
                             <button
                               type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setFile(null);
-                                setDatasetInfo(null);
-                                setTargetColumns([]);
-                                setTargetColumn("");
-                                setCurrentStep(2);
+                              onClick={() => {
+                                setDbMode("multi");
+                                setSelectedTable("");
+                                resetPreviewState();
                               }}
-                              className="text-[13px] font-medium text-rose-400 transition-colors hover:text-rose-300"
+                              className={`rounded-lg px-3 py-1.5 text-[12px] font-medium ${
+                                dbMode === "multi"
+                                  ? "bg-cyan-600 text-white"
+                                  : "bg-slate-800 text-slate-300"
+                              }`}
                             >
-                              Remove file
+                              Multiple tables
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDbMode("copilot");
+                                setSelectedTable("");
+                                resetPreviewState();
+                              }}
+                              className={`rounded-lg px-3 py-1.5 text-[12px] font-medium ${
+                                dbMode === "copilot"
+                                  ? "bg-cyan-600 text-white"
+                                  : "bg-slate-800 text-slate-300"
+                              }`}
+                            >
+                              Copilot
                             </button>
                           </div>
-                        </div>
-                      ) : (
-                        <div className="flex flex-col items-center gap-3">
-                          <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.04] transition-all group-hover:border-cyan-400/40 group-hover:bg-cyan-500/10">
-                            <svg className="h-8 w-8 text-slate-500 transition-colors group-hover:text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                            </svg>
-                            <div className="absolute -right-1 -top-1 h-3 w-3 rounded-full bg-cyan-400 opacity-0 shadow-[0_0_12px_rgba(6,182,212,0.8)] transition-opacity group-hover:opacity-100 animate-pulse" />
-                          </div>
+                        )}
+
+                        {/* Table Selection (POST /datasource/tables) */}
+                        {connectionSuccess && dbMode === "single" && (
                           <div>
-                            <p className="text-[15px] font-semibold text-slate-200">
-                              Drop your CSV file here, or{" "}
-                              <span className="text-cyan-400">browse</span>
-                            </p>
-                            <p className="mt-1 text-[12px] text-slate-500">Maximum file size: 100MB</p>
+                            <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                              Select Table
+                            </label>
+
+                            {isLoadingTables ? (
+                              <p className="text-[13px] text-slate-500">
+                                Loading tables…
+                              </p>
+                            ) : tablesError ? (
+                              <div className="flex items-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3">
+                                <p className="text-[13px] text-rose-300">
+                                  {tablesError}
+                                </p>
+                              </div>
+                            ) : availableTables.length === 0 ? (
+                              <p className="text-[13px] text-slate-500">
+                                No tables found in this schema.
+                              </p>
+                            ) : (
+                              <select
+                                value={selectedTable}
+                                onChange={(e) =>
+                                  handleTableChange(e.target.value)
+                                }
+                                className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-[14px] text-slate-100 outline-none transition-all focus:border-cyan-400/40 focus:bg-white/[0.06] focus:ring-2 focus:ring-cyan-400/20"
+                              >
+                                {availableTables.map((t) => (
+                                  <option key={t} value={t}>
+                                    {t}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
                           </div>
-                        </div>
-                      )}
-                      <input
-                        ref={fileInputRef}
-                        type="file"
-                        accept=".csv"
-                        className="hidden"
-                        onChange={handleFileChange}
-                      />
-                    </div>
-                    {file && (
+                        )}
+
+                        {/* Data Preview (POST /datasource/preview) */}
+                        {connectionSuccess &&
+                          dbMode === "single" &&
+                          selectedTable && (
+                            <div>
+                              <label className="mb-2 block text-[13px] font-semibold text-slate-300">
+                                Preview: {selectedTable}
+                              </label>
+
+                              {isLoadingPreview ? (
+                                <p className="text-[13px] text-slate-500">
+                                  Loading preview…
+                                </p>
+                              ) : previewError ? (
+                                <div className="flex items-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3">
+                                  <p className="text-[13px] text-rose-300">
+                                    {previewError}
+                                  </p>
+                                </div>
+                              ) : previewColumns.length === 0 ? (
+                                <p className="text-[13px] text-slate-500">
+                                  No preview available.
+                                </p>
+                              ) : (
+                                <div className="overflow-x-auto rounded-xl border border-white/[0.08]">
+                                  <table className="w-full text-left text-[12px]">
+                                    <thead className="bg-white/[0.04]">
+                                      <tr>
+                                        {previewColumns.map((col) => (
+                                          <th
+                                            key={col}
+                                            className="whitespace-nowrap px-3 py-2 font-semibold text-slate-300"
+                                          >
+                                            {col}
+                                            {previewNumericColumns.includes(
+                                              col,
+                                            ) && (
+                                              <span className="ml-1 text-[10px] font-normal text-cyan-400">
+                                                #
+                                              </span>
+                                            )}
+                                          </th>
+                                        ))}
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {previewRows.map((row, idx) => (
+                                        <tr
+                                          key={idx}
+                                          className="border-t border-white/[0.06]"
+                                        >
+                                          {previewColumns.map((col) => (
+                                            <td
+                                              key={col}
+                                              className="whitespace-nowrap px-3 py-2 text-slate-400"
+                                            >
+                                              {String(row[col] ?? "")}
+                                            </td>
+                                          ))}
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                  <div className="border-t border-white/[0.06] px-3 py-2 text-[11px] text-slate-500">
+                                    Showing {previewRowCount} row
+                                    {previewRowCount === 1 ? "" : "s"}
+                                    {previewHasMore
+                                      ? " (more rows exist in the table)"
+                                      : ""}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                        {/* Multi-table dataset builder (Sprint 1) */}
+                        {connectionSuccess && dbMode === "multi" && (
+                          <MultiTableBuilder
+                            dbType={dbType}
+                            host={host}
+                            port={Number(port)}
+                            database={database}
+                            username={username}
+                            password={password}
+                            availableTables={availableTables}
+                            onDatasetReady={(
+                              spec: DataModelSpec,
+                              data: DataModelPreviewResponse,
+                            ) => {
+                              // Reuses the existing helper: /datamodel/preview
+                              // returns the same six fields as
+                              // /datasource/preview, so Step 3 is unchanged.
+                              loadColumnsFromPreview(data);
+                              setDataModelSpec(spec);
+                              setHasDbDataset(true);
+                            }}
+                            onReset={() => {
+                              setHasDbDataset(false);
+                              setDataModelSpec(null);
+                            }}
+                          />
+                        )}
+
+                        {/* ETL Copilot */}
+                        {connectionSuccess && dbMode === "copilot" && (
+                          <EtlCopilotPanel
+                            dbType={dbType}
+                            host={host}
+                            port={Number(port)}
+                            database={database}
+                            username={username}
+                            password={password}
+                            availableTables={availableTables}
+                            onDatasetReady={(
+                              fileId: string,
+                              projectId: string,
+                              targetColumn: string,
+                            ) => {
+                              console.log(
+                                "Copilot dataset ready",
+                                fileId,
+                                projectId,
+                                targetColumn,
+                              );
+                              setPendingCopilotTraining({
+                                fileId,
+                                targetColumn,
+                                projectId,
+                              });
+                            }}
+                            onReset={() => {
+                              setHasDbDataset(false);
+                            }}
+                          />
+                        )}
+
+                        {connectionSuccess &&
+                          dbMode === "copilot" &&
+                          pendingCopilotTraining && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => router.push("/dashboard")}
+                                className="rounded-xl border border-white/10 px-4 py-2.5 text-[13px] font-semibold text-slate-200 transition hover:bg-white/[0.06]"
+                              >
+                                View Projects
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  router.push(
+                                    `/training/${encodeURIComponent(pendingCopilotTraining.fileId)}?target_column=${encodeURIComponent(pendingCopilotTraining.targetColumn)}`,
+                                  )
+                                }
+                                className="rounded-xl bg-cyan-600 px-4 py-2.5 text-[13px] font-semibold text-white transition hover:bg-cyan-500"
+                              >
+                                Go To Training
+                              </button>
+                            </div>
+                          )}
+
+                        <button
+                          type="button"
+                          disabled={
+                            isTestingConnection ||
+                            !host ||
+                            !database ||
+                            !username
+                          }
+                          onClick={testConnection}
+                          className="flex items-center gap-2 rounded-xl border border-cyan-400/30 bg-cyan-500/10 px-4 py-2.5 text-[13px] font-semibold text-cyan-300 transition-all hover:border-cyan-400/50 hover:bg-cyan-500/15 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {isTestingConnection ? (
+                            <>
+                              <svg
+                                className="h-4 w-4 animate-spin"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                              >
+                                <circle
+                                  className="opacity-25"
+                                  cx="12"
+                                  cy="12"
+                                  r="10"
+                                  stroke="currentColor"
+                                  strokeWidth="4"
+                                />
+                                <path
+                                  className="opacity-75"
+                                  fill="currentColor"
+                                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                                />
+                              </svg>
+                              Testing…
+                            </>
+                          ) : (
+                            "Test Connection"
+                          )}
+                        </button>
+                      </div>
+                    )}
+                    {(file || hasDatabaseDataset) && (
                       <button
                         type="button"
                         onClick={() => setCurrentStep(3)}
                         className="mt-4 flex items-center gap-2 text-[13px] font-medium text-cyan-400 transition-colors hover:text-cyan-300"
                       >
                         Continue to Target Selection
-                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
+                        <svg
+                          className="h-4 w-4"
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M17 8l4 4m0 0l-4 4m4-4H3"
+                          />
                         </svg>
                       </button>
                     )}
                   </StepCard>
 
                   {/* Step 3: Target Column Selection */}
-                  {file && (
+                  {(file || hasDatabaseDataset) && (
                     <StepCard
                       stepNumber={3}
                       title="Select Target Column"
@@ -420,11 +1322,22 @@ export default function NewProjectPage() {
                         {/* AI Suggestion */}
                         {suggestedTarget && !targetColumn && (
                           <div className="flex items-center gap-2 rounded-xl border border-violet-500/25 bg-violet-500/10 px-4 py-2.5">
-                            <svg className="h-4 w-4 flex-shrink-0 text-violet-400" fill="currentColor" viewBox="0 0 20 20">
-                              <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
+                            <svg
+                              className="h-4 w-4 flex-shrink-0 text-violet-400"
+                              fill="currentColor"
+                              viewBox="0 0 20 20"
+                            >
+                              <path
+                                fillRule="evenodd"
+                                d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z"
+                                clipRule="evenodd"
+                              />
                             </svg>
                             <p className="text-[12px] text-violet-300">
-                              <span className="font-semibold">PyrunAI suggests:</span> {suggestedTarget} ({taskType})
+                              <span className="font-semibold">
+                                PyrunAI suggests:
+                              </span>{" "}
+                              {suggestedTarget} ({taskType})
                             </p>
                           </div>
                         )}
@@ -443,8 +1356,8 @@ export default function NewProjectPage() {
                                   isSelected
                                     ? "border-cyan-400/50 bg-cyan-500/15 text-cyan-300 shadow-[0_0_16px_rgba(6,182,212,0.25)]"
                                     : isSuggested
-                                    ? "border-violet-400/30 bg-violet-500/10 text-violet-300 hover:border-violet-400/50 hover:bg-violet-500/15"
-                                    : "border-white/[0.08] bg-white/[0.04] text-slate-300 hover:border-white/[0.15] hover:bg-white/[0.08] hover:text-slate-100"
+                                      ? "border-violet-400/30 bg-violet-500/10 text-violet-300 hover:border-violet-400/50 hover:bg-violet-500/15"
+                                      : "border-white/[0.08] bg-white/[0.04] text-slate-300 hover:border-white/[0.15] hover:bg-white/[0.08] hover:text-slate-100"
                                 }`}
                               >
                                 {isSelected && (
@@ -453,12 +1366,26 @@ export default function NewProjectPage() {
                                 <span className="relative flex items-center gap-2">
                                   {col}
                                   {isSelected && (
-                                    <svg className="h-3.5 w-3.5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                                    <svg
+                                      className="h-3.5 w-3.5 text-cyan-400"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      viewBox="0 0 24 24"
+                                    >
+                                      <path
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                        strokeWidth={2.5}
+                                        d="M5 13l4 4L19 7"
+                                      />
                                     </svg>
                                   )}
                                   {isSuggested && !isSelected && (
-                                    <svg className="h-3.5 w-3.5 text-violet-400" fill="currentColor" viewBox="0 0 20 20">
+                                    <svg
+                                      className="h-3.5 w-3.5 text-violet-400"
+                                      fill="currentColor"
+                                      viewBox="0 0 20 20"
+                                    >
                                       <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
                                     </svg>
                                   )}
@@ -483,16 +1410,41 @@ export default function NewProjectPage() {
                         <span className="relative flex items-center justify-center gap-2">
                           {isSubmitting ? (
                             <>
-                              <svg className="h-5 w-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                              <svg
+                                className="h-5 w-5 animate-spin"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                              >
+                                <circle
+                                  className="opacity-25"
+                                  cx="12"
+                                  cy="12"
+                                  r="10"
+                                  stroke="currentColor"
+                                  strokeWidth="4"
+                                />
+                                <path
+                                  className="opacity-75"
+                                  fill="currentColor"
+                                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                                />
                               </svg>
                               Creating Project...
                             </>
                           ) : (
                             <>
-                              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                              <svg
+                                className="h-5 w-5"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M13 10V3L4 14h7v7l9-11h-7z"
+                                />
                               </svg>
                               Start AutoML Training
                             </>
@@ -512,7 +1464,7 @@ export default function NewProjectPage() {
                 </form>
 
                 {/* What PyrunAI Will Do */}
-                {file && (
+                {(file || hasDatabaseDataset) && (
                   <div className="mt-8">
                     <AIAutomationPreview />
                   </div>
@@ -522,9 +1474,13 @@ export default function NewProjectPage() {
               {/* Right: Training Preview Card */}
               <div className="sticky top-6 w-[320px] flex-shrink-0">
                 <TrainingPreviewCard
-                  hasDataset={file !== null}
+                  hasDataset={file !== null || hasDatabaseDataset}
                   hasTarget={targetColumn !== ""}
-                  datasetRows={datasetInfo?.rows ?? 0}
+                  datasetRows={
+                    dataSource === "csv"
+                      ? (datasetInfo?.rows ?? 0)
+                      : previewRowCount
+                  }
                 />
               </div>
             </div>
@@ -555,8 +1511,8 @@ function StepCard({
         isActive
           ? "border-cyan-400/30 bg-[rgba(10,15,35,0.7)] shadow-[0_0_32px_rgba(6,182,212,0.15)]"
           : isCompleted
-          ? "border-emerald-400/20 bg-[rgba(10,15,35,0.5)]"
-          : "border-white/[0.06] bg-[rgba(10,15,35,0.4)]"
+            ? "border-emerald-400/20 bg-[rgba(10,15,35,0.5)]"
+            : "border-white/[0.06] bg-[rgba(10,15,35,0.4)]"
       }`}
     >
       {/* Step Header */}
@@ -566,13 +1522,23 @@ function StepCard({
             isCompleted
               ? "border-emerald-400/40 bg-emerald-500/15 text-emerald-400"
               : isActive
-              ? "border-cyan-400/40 bg-cyan-500/15 text-cyan-400 shadow-[0_0_16px_rgba(6,182,212,0.3)]"
-              : "border-white/[0.08] bg-white/[0.04] text-slate-500"
+                ? "border-cyan-400/40 bg-cyan-500/15 text-cyan-400 shadow-[0_0_16px_rgba(6,182,212,0.3)]"
+                : "border-white/[0.08] bg-white/[0.04] text-slate-500"
           }`}
         >
           {isCompleted ? (
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+            <svg
+              className="h-4 w-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2.5}
+                d="M5 13l4 4L19 7"
+              />
             </svg>
           ) : (
             stepNumber
@@ -581,7 +1547,11 @@ function StepCard({
         <div className="flex-1">
           <h3
             className={`text-[15px] font-semibold ${
-              isActive ? "text-white" : isCompleted ? "text-emerald-300" : "text-slate-400"
+              isActive
+                ? "text-white"
+                : isCompleted
+                  ? "text-emerald-300"
+                  : "text-slate-400"
             }`}
           >
             {title}
@@ -611,11 +1581,21 @@ function AIAutomationPreview() {
       <div className="border-b border-white/[0.06] px-6 py-4">
         <div className="flex items-center gap-2.5">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-violet-400/30 bg-violet-500/15">
-            <svg className="h-4 w-4 text-violet-400" fill="currentColor" viewBox="0 0 20 20">
-              <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
+            <svg
+              className="h-4 w-4 text-violet-400"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path
+                fillRule="evenodd"
+                d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z"
+                clipRule="evenodd"
+              />
             </svg>
           </div>
-          <h3 className="text-[15px] font-semibold text-white">What PyrunAI Will Do Automatically</h3>
+          <h3 className="text-[15px] font-semibold text-white">
+            What PyrunAI Will Do Automatically
+          </h3>
         </div>
       </div>
       <div className="px-6 py-5">
@@ -656,7 +1636,9 @@ function TrainingPreviewCard({
   return (
     <div className="overflow-hidden rounded-2xl border border-white/[0.08] bg-[rgba(10,15,35,0.7)] shadow-[0_4px_24px_rgba(0,0,0,0.3)]">
       <div className="border-b border-white/[0.06] px-5 py-4">
-        <h3 className="text-[14px] font-semibold text-white">Training Preview</h3>
+        <h3 className="text-[14px] font-semibold text-white">
+          Training Preview
+        </h3>
       </div>
       <div className="p-5 space-y-5">
         {/* Estimated Time */}
@@ -668,7 +1650,9 @@ function TrainingPreviewCard({
             <span className="text-[28px] font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-400">
               ~{estimatedMinutes}
             </span>
-            <span className="text-[14px] font-medium text-slate-400">minutes</span>
+            <span className="text-[14px] font-medium text-slate-400">
+              minutes
+            </span>
           </div>
         </div>
 
@@ -680,7 +1664,10 @@ function TrainingPreviewCard({
           <div className="space-y-2">
             <ChecklistItem label="Dataset uploaded" checked={hasDataset} />
             <ChecklistItem label="Target selected" checked={hasTarget} />
-            <ChecklistItem label="Ready to train" checked={hasDataset && hasTarget} />
+            <ChecklistItem
+              label="Ready to train"
+              checked={hasDataset && hasTarget}
+            />
           </div>
         </div>
 
@@ -705,11 +1692,20 @@ function TrainingPreviewCard({
         {/* Tip */}
         <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3">
           <div className="flex items-start gap-2">
-            <svg className="h-4 w-4 flex-shrink-0 text-cyan-400 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
-              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            <svg
+              className="h-4 w-4 flex-shrink-0 text-cyan-400 mt-0.5"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path
+                fillRule="evenodd"
+                d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z"
+                clipRule="evenodd"
+              />
             </svg>
             <p className="text-[11px] leading-relaxed text-cyan-300">
-              Larger datasets may take longer. You'll receive a notification when training completes.
+              Larger datasets may take longer. You&apos;ll receive a
+              notification when training completes.
             </p>
           </div>
         </div>
@@ -718,7 +1714,13 @@ function TrainingPreviewCard({
   );
 }
 
-function ChecklistItem({ label, checked }: { label: string; checked: boolean }) {
+function ChecklistItem({
+  label,
+  checked,
+}: {
+  label: string;
+  checked: boolean;
+}) {
   return (
     <div className="flex items-center gap-2.5">
       <div
@@ -728,12 +1730,25 @@ function ChecklistItem({ label, checked }: { label: string; checked: boolean }) 
             : "border-white/[0.12] bg-white/[0.04] text-transparent"
         }`}
       >
-        <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+        <svg
+          className="h-3 w-3"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2.5}
+            d="M5 13l4 4L19 7"
+          />
         </svg>
       </div>
-      <span className={`text-[13px] ${checked ? "text-slate-200" : "text-slate-500"}`}>{label}</span>
+      <span
+        className={`text-[13px] ${checked ? "text-slate-200" : "text-slate-500"}`}
+      >
+        {label}
+      </span>
     </div>
   );
 }
-

@@ -15,13 +15,38 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from pathlib import Path
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from dotenv import load_dotenv
+from routers.datamodel import router as datamodel_router
+from routers.etl_agent import router as etl_agent_router
+from routers.etl_copilot import router as etl_copilot_router
+from routers.pipelines import router as pipeline_router
+from routers.profiling import router as profiling_router
+from routers.quality import router as quality_router
+from routers.cleaning import router as cleaning_router
+from routers.catalog import router as catalog_router
+from routers.etl_studio import router as etl_studio_router
+from routers.plan import router as plan_router
+from routers.orchestration import router as orchestration_router
+from routers.etl_copilot import _trace
+
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Body, BackgroundTasks, Depends
+from etl_copilot.quality import compute_quality_score as _compute_quality_score
+from fastapi import (
+    FastAPI,
+    File,
+    Request,
+    Form,
+    UploadFile,
+    HTTPException,
+    Body,
+    BackgroundTasks,
+    Depends,
+)
+import traceback
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
@@ -41,11 +66,23 @@ from models.sandbox_job import SandboxJob
 from models.dataset_profile import DatasetProfile
 from models.experiment_memory import ExperimentMemory
 from models.project import Project
+from models.pipeline_definition import PipelineDefinition
+from models.pipeline_version import PipelineVersion
+from models.pipeline_run import PipelineRun
+from models.cleaning_rule import CleaningRule
+from models.transformation_rule import TransformationRule
+from models.agent_decision import AgentDecision
+from models.source_profile_snapshot import SourceProfileSnapshot
+from models.quality_rule import QualityRule
 from xgboost import XGBRegressor
 import numpy as np
 
 from database import Base, SessionLocal, engine
-from services.llm_service import get_hyperparameter_suggestions, validate_hyperparameters, SAFE_HYPERPARAMETERS
+from services.llm_service import (
+    get_hyperparameter_suggestions,
+    validate_hyperparameters,
+    SAFE_HYPERPARAMETERS,
+)
 from services.prompt_architect import (
     ENABLE_PROMPT_ARCHITECT,
     Blueprint,
@@ -70,7 +107,9 @@ app = FastAPI(title="PyrunAI Backend", version="1.0.0")
 
 cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS")
 if cors_origins_env:
-    allow_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    allow_origins = [
+        origin.strip() for origin in cors_origins_env.split(",") if origin.strip()
+    ]
 else:
     allow_origins = [
         "http://localhost:3000",
@@ -79,14 +118,142 @@ else:
         "http://127.0.0.1:3010",
     ]
 
+# Catch-all so an unhandled exception still returns a CORS-bearing JSON 500.
+#
+# Starlette runs ServerErrorMiddleware OUTSIDE CORSMiddleware, so an unhandled
+# exception produces a text/plain 500 with no access-control-allow-origin
+# header. The browser blocks it and fetch() rejects with "Failed to fetch",
+# hiding the real error from the UI permanently.
+#
+# @app.exception_handler(Exception) does NOT fix this - Starlette installs that
+# handler on ServerErrorMiddleware, which is still outside CORS (measured).
+# A plain http middleware registered BEFORE add_middleware(CORSMiddleware) ends
+# up INSIDE it, so its response travels back out through the CORS layer.
+# Registration order matters: the last middleware added is the outermost.
+@app.middleware("http")
+async def catch_unhandled_exceptions(request: Request, call_next):
+    # Everything that can raise is INSIDE the try, and nothing here writes to
+    # the console directly: a failing print() used to escape both middlewares
+    # and surface as a bare text/plain 500 with nothing logged.
+    trace_preview = request.url.path == "/etl-copilot/preview"
+    try:
+        if trace_preview:
+            _trace("[ETL preview trace] IN %s %s" % (request.method, request.url.path))
+        response = await call_next(request)
+        if trace_preview:
+            _trace("[ETL preview trace] OUT status=%s" % response.status_code)
+        return response
+    except Exception as exc:  # noqa: BLE001  (a 500 must not lose its CORS header)
+        _trace(
+            "[unhandled] %s %s -> %s: %s\n%s"
+            % (request.method, request.url.path, type(exc).__name__, exc,
+               traceback.format_exc())
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "message": "Internal server error.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "path": str(request.url.path),
+                }
+            },
+        )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
+    # Next.js moves to 3001/3002/... whenever 3000 is already taken, and an
+    # origin that is not on the list gets NO access-control-allow-origin
+    # header at all - which the browser reports as a CORS failure even on a
+    # 200. Any loopback dev port is allowed so a shifted port cannot cause it.
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# Outermost layer: added AFTER CORSMiddleware, so it wraps it. If anything
+# fails inside CORSMiddleware itself the response would otherwise leave the
+# app with no access-control-allow-origin header and the browser would hide
+# the real error behind "Failed to fetch". This guarantees the header.
+@app.middleware("http")
+async def guarantee_cors_header(request: Request, call_next):
+    origin = request.headers.get("origin")
+    try:
+        response = await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        _trace(
+            "[unhandled-outer] %s %s -> %s: %s\n%s"
+            % (request.method, request.url.path, type(exc).__name__, exc,
+               traceback.format_exc())
+        )
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "message": "Internal server error.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "path": str(request.url.path),
+                }
+            },
+        )
+
+    if origin and "access-control-allow-origin" not in response.headers:
+        response.headers["access-control-allow-origin"] = origin
+        response.headers["access-control-allow-credentials"] = "true"
+        response.headers["vary"] = "Origin"
+
+    return response
+
+
+# Which source is this process actually running? Open http://127.0.0.1:8000/__build
+# in a browser: if it 404s, the listening process started before these files
+# were last edited and is serving stale code - restart it.
+BUILD_STAMP = "etl-copilot-cors-fix-2"
+
+
+@app.get("/__build")
+def build_stamp():
+    import pathlib
+    import datetime
+
+    here = pathlib.Path(__file__).resolve().parent
+    watched = ["main.py", "routers/etl_copilot.py", "etl_copilot/copilot_service.py"]
+    files = {}
+    for name in watched:
+        f = here / name
+        files[name] = (
+            datetime.datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+            if f.exists()
+            else None
+        )
+
+    return {
+        "build_stamp": BUILD_STAMP,
+        "pid": os.getpid(),
+        "backend_dir": str(here),
+        "source_mtimes": files,
+        "etl_copilot_routes": sorted(
+            r.path for r in app.routes if getattr(r, "path", "").startswith("/etl-copilot")
+        ),
+    }
+
+app.include_router(datamodel_router)
+app.include_router(etl_agent_router)
+app.include_router(etl_copilot_router)
+app.include_router(pipeline_router)
+app.include_router(profiling_router)
+app.include_router(quality_router)
+app.include_router(cleaning_router)
+app.include_router(catalog_router)
+app.include_router(etl_studio_router)
+app.include_router(plan_router)
+app.include_router(orchestration_router)
 try:
     Base.metadata.create_all(bind=engine)
 except OperationalError as exc:
@@ -112,13 +279,23 @@ MAX_COLUMNS = 200
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 JOB_TTL_MINUTES = 10
 MAX_JOB_STATUS_SIZE = 100
-FINE_TUNE_USE_SANDBOX = os.getenv("FINE_TUNE_USE_SANDBOX", "true").lower() in {"true", "1", "yes"}
-FINE_TUNE_SANDBOX_TIMEOUT_SECONDS = max(30, int(os.getenv("FINE_TUNE_SANDBOX_TIMEOUT_SECONDS", "240")))
+FINE_TUNE_USE_SANDBOX = os.getenv("FINE_TUNE_USE_SANDBOX", "true").lower() in {
+    "true",
+    "1",
+    "yes",
+}
+FINE_TUNE_SANDBOX_TIMEOUT_SECONDS = max(
+    30, int(os.getenv("FINE_TUNE_SANDBOX_TIMEOUT_SECONDS", "240"))
+)
 FINE_TUNE_SANDBOX_INACTIVITY_TIMEOUT_SECONDS = max(
     20,
     int(os.getenv("FINE_TUNE_SANDBOX_INACTIVITY_TIMEOUT_SECONDS", "45")),
 )
-SANDBOX_AUTOSTART_WORKER = os.getenv("SANDBOX_AUTOSTART_WORKER", "true").lower() in {"true", "1", "yes"}
+SANDBOX_AUTOSTART_WORKER = os.getenv("SANDBOX_AUTOSTART_WORKER", "true").lower() in {
+    "true",
+    "1",
+    "yes",
+}
 SANDBOX_WORKER_BOOT_TIMEOUT_SECONDS = max(
     1,
     int(os.getenv("SANDBOX_WORKER_BOOT_TIMEOUT_SECONDS", "8")),
@@ -156,7 +333,9 @@ def _resolve_llm_client_standalone(
     requested = (force_provider or os.getenv("LLM_PROVIDER") or "").strip().lower()
     groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
     openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    gemini_key = (
+        os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    ).strip()
 
     if not groq_key and not openai_key and not gemini_key:
         return None, None, None
@@ -181,8 +360,14 @@ def _resolve_llm_client_standalone(
             use_gemini = True
 
     if use_groq:
-        model = os.getenv("GROQ_MODEL") or os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
-        client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=45.0)
+        model = (
+            os.getenv("GROQ_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "llama-3.3-70b-versatile"
+        )
+        client = OpenAI(
+            api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=45.0
+        )
         return client, model, "groq"
 
     if use_openai:
@@ -191,7 +376,9 @@ def _resolve_llm_client_standalone(
         return client, model, "openai"
 
     if use_gemini or gemini_key:
-        model = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
+        model = (
+            os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
+        )
         return None, model, "gemini"
 
     return None, None, None
@@ -205,7 +392,9 @@ def _call_gemini_text_standalone(
     model_override: Optional[str] = None,
 ) -> Optional[str]:
     """Call Gemini REST API at module level (no closure dependency)."""
-    gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    gemini_key = (
+        os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    ).strip()
     if not gemini_key:
         return None
 
@@ -213,7 +402,10 @@ def _call_gemini_text_standalone(
 
     payload = {
         "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_tokens),
+        },
     }
 
     import urllib.error
@@ -238,7 +430,9 @@ def _call_gemini_text_standalone(
     if not candidates:
         return None
     parts = (candidates[0].get("content") or {}).get("parts") or []
-    text_parts = [p["text"] for p in parts if isinstance(p.get("text"), str) and p["text"].strip()]
+    text_parts = [
+        p["text"] for p in parts if isinstance(p.get("text"), str) and p["text"].strip()
+    ]
     return "\n".join(text_parts).strip() if text_parts else None
 
 
@@ -254,14 +448,17 @@ def _update_job_status(
     """
     Update JOB_STATUS fields for a given job without overwriting unspecified keys.
     """
-    current = JOB_STATUS.get(job_id, {
-        "status": "pending",
-        "stage": "pending",
-        "progress": 0,
-        "result": None,
-        "error": None,
-        "completed_at": None,
-    })
+    current = JOB_STATUS.get(
+        job_id,
+        {
+            "status": "pending",
+            "stage": "pending",
+            "progress": 0,
+            "result": None,
+            "error": None,
+            "completed_at": None,
+        },
+    )
 
     if status is not None:
         current["status"] = status
@@ -320,7 +517,13 @@ def _parse_token_list(raw_value: Optional[Any]) -> List[str]:
 
 def _safe_float(value: Optional[Any]) -> Optional[float]:
     try:
-        return float(value) if value is not None else None
+        result = float(value) if value is not None else None
+
+        if result is not None and np.isnan(result):
+            return None
+
+        return result
+
     except (TypeError, ValueError):
         return None
 
@@ -405,7 +608,9 @@ def _build_iteration_log_index(logs: List[str]) -> Dict[int, Dict[str, Any]]:
     return indexed
 
 
-def _build_strategy_theme_summary(iterations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_strategy_theme_summary(
+    iterations: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     theme_counts: Dict[str, int] = {}
     for iteration in iterations:
         for token in iteration.get("preprocessing_tokens", []):
@@ -431,7 +636,10 @@ def _is_sandbox_worker_running() -> bool:
                 continue
             cmdline = proc.info.get("cmdline") or []
             cmdline_str = " ".join(str(arg) for arg in cmdline)
-            if "sandbox_worker.py" in cmdline_str and "check_sandbox_worker" not in cmdline_str:
+            if (
+                "sandbox_worker.py" in cmdline_str
+                and "check_sandbox_worker" not in cmdline_str
+            ):
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -555,16 +763,30 @@ def validate_dataset_limits(df: pd.DataFrame) -> None:
     """
     if len(df) > MAX_ROWS:
         raise HTTPException(
-            status_code=400,
-            detail="Dataset too large. Max 50,000 rows allowed."
+            status_code=400, detail="Dataset too large. Max 50,000 rows allowed."
         )
 
     if len(df.columns) > MAX_COLUMNS:
         raise HTTPException(
-            status_code=400,
-            detail="Too many columns. Max 200 allowed."
+            status_code=400, detail="Too many columns. Max 200 allowed."
         )
 
+
+# ---------------------------------------------------------------------------
+# Training readiness
+#
+# Moved to services/training_readiness.py so it can be imported without
+# booting this module. Re-exported here: every existing caller and test that
+# does `from main import assess_training_readiness` still works.
+# ---------------------------------------------------------------------------
+
+from services.training_readiness import (  # noqa: E402
+    DEFAULT_CV_FOLDS,
+    MIN_TRAINING_ROWS,
+    SMALL_DATASET_ROW_THRESHOLD,
+    TOO_SMALL_MESSAGE,
+    assess_training_readiness,
+)
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -592,7 +814,11 @@ def _build_dataset_profile(df: pd.DataFrame, target_column: str) -> Dict[str, An
         "median": 0.0,
     }
     if numeric_feature_df.shape[1] > 0:
-        variances = numeric_feature_df.var(numeric_only=True).replace([np.inf, -np.inf], np.nan).dropna()
+        variances = (
+            numeric_feature_df.var(numeric_only=True)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
         if len(variances) > 0:
             variance_stats = {
                 "min": _safe_float(variances.min(), 0.0),
@@ -601,13 +827,21 @@ def _build_dataset_profile(df: pd.DataFrame, target_column: str) -> Dict[str, An
                 "median": _safe_float(variances.median(), 0.0),
             }
 
-    target_mean = _safe_float(df[target_column].mean(), 0.0) if target_column in df else 0.0
-    target_std = _safe_float(df[target_column].std(), 0.0) if target_column in df else 0.0
-    target_skew = _safe_float(df[target_column].skew(), 0.0) if target_column in df else 0.0
+    target_mean = (
+        _safe_float(df[target_column].mean(), 0.0) if target_column in df else 0.0
+    )
+    target_std = (
+        _safe_float(df[target_column].std(), 0.0) if target_column in df else 0.0
+    )
+    target_skew = (
+        _safe_float(df[target_column].skew(), 0.0) if target_column in df else 0.0
+    )
 
     cardinality_by_column: Dict[str, int] = {}
     for column in categorical_feature_df.columns:
-        cardinality_by_column[column] = int(categorical_feature_df[column].nunique(dropna=True))
+        cardinality_by_column[column] = int(
+            categorical_feature_df[column].nunique(dropna=True)
+        )
 
     high_dimensional = num_features >= 80
     small_dataset = rows <= 1000
@@ -656,8 +890,8 @@ def _compute_dataset_fingerprint(profile: Dict[str, Any]) -> str:
     target_std = float(target_dist.get("std") or 0.0)
 
     # Bucket values for similarity tolerance
-    row_bucket = (rows // 500) * 500          # 500-row buckets
-    feat_bucket = num_features                 # exact
+    row_bucket = (rows // 500) * 500  # 500-row buckets
+    feat_bucket = num_features  # exact
     numeric_ratio = round(num_numeric / max(num_features, 1), 2)
     cat_ratio = round(num_categorical / max(num_features, 1), 2)
     missing_bucket = round(missing_ratio, 2)
@@ -708,7 +942,9 @@ def _retrieve_experiment_memory(
         else:
             d_rows = abs((rec.num_rows or 0) - cur_rows) / max(cur_rows, 1)
             d_feats = abs((rec.num_features or 0) - cur_feats) / max(cur_feats, 1)
-            d_numeric = abs((rec.num_numeric_features or 0) - cur_numeric) / max(cur_numeric, 1)
+            d_numeric = abs((rec.num_numeric_features or 0) - cur_numeric) / max(
+                cur_numeric, 1
+            )
             d_cat = abs((rec.num_categorical_features or 0) - cur_cat) / max(cur_cat, 1)
             d_missing = abs((rec.missing_value_ratio or 0.0) - cur_missing)
             d_std = abs((rec.target_std or 0.0) - cur_std) / max(cur_std, 1.0)
@@ -748,7 +984,9 @@ def _format_experiment_memory_for_prompt(memories: List[Dict[str, Any]]) -> str:
             f"strategy=\"{mem.get('strategy_summary', 'N/A')}\""
         )
     lines.append("")
-    lines.append("Use these past results to inform your strategy. Prefer approaches that worked well before.")
+    lines.append(
+        "Use these past results to inform your strategy. Prefer approaches that worked well before."
+    )
     return "\n".join(lines)
 
 
@@ -776,7 +1014,9 @@ def _insert_experiment_memory(
         record = ExperimentMemory(
             dataset_fingerprint=dataset_fingerprint,
             model_family=model_family,
-            preprocessing_tokens=",".join(preprocessing_tokens) if preprocessing_tokens else "",
+            preprocessing_tokens=(
+                ",".join(preprocessing_tokens) if preprocessing_tokens else ""
+            ),
             training_tokens=",".join(training_tokens) if training_tokens else "",
             strategy_summary=(strategy_summary or "")[:500],
             feature_count=num_features,
@@ -790,12 +1030,16 @@ def _insert_experiment_memory(
             num_features=num_features,
             num_numeric_features=int(dataset_profile.get("num_numeric_features") or 0),
             num_categorical_features=num_cat,
-            missing_value_ratio=float(dataset_profile.get("missing_value_ratio") or 0.0),
+            missing_value_ratio=float(
+                dataset_profile.get("missing_value_ratio") or 0.0
+            ),
             target_std=float(target_dist.get("std") or 0.0),
         )
         db.add(record)
         db.commit()
-        print(f"EXPERIMENT_MEMORY_INSERTED: model={model_family}, rmse_cv={rmse_cv}, fingerprint={dataset_fingerprint[:12]}...")
+        print(
+            f"EXPERIMENT_MEMORY_INSERTED: model={model_family}, rmse_cv={rmse_cv}, fingerprint={dataset_fingerprint[:12]}..."
+        )
     except Exception as mem_exc:
         db.rollback()
         print(f"EXPERIMENT_MEMORY_INSERT_FAILED: {mem_exc}")
@@ -808,14 +1052,22 @@ def _summarize_dataset_profile(dataset_profile: Optional[Dict[str, Any]]) -> str
     heuristics = dataset_profile.get("heuristics") or {}
     recommendations: List[str] = []
     if heuristics.get("small_dataset"):
-        recommendations.append("Small dataset detected: favor simpler and regularized models.")
+        recommendations.append(
+            "Small dataset detected: favor simpler and regularized models."
+        )
     if heuristics.get("high_dimensional"):
-        recommendations.append("High dimensional data: prioritize feature selection and dimensionality control.")
+        recommendations.append(
+            "High dimensional data: prioritize feature selection and dimensionality control."
+        )
     if heuristics.get("high_categorical_ratio"):
-        recommendations.append("High categorical ratio: prioritize robust encoding strategy.")
+        recommendations.append(
+            "High categorical ratio: prioritize robust encoding strategy."
+        )
 
     if not recommendations:
-        recommendations.append("Balanced dataset profile: use moderate preprocessing and stable tuning.")
+        recommendations.append(
+            "Balanced dataset profile: use moderate preprocessing and stable tuning."
+        )
 
     variance_stats = dataset_profile.get("feature_variance_stats") or {}
     target_stats = dataset_profile.get("target_distribution") or {}
@@ -830,8 +1082,12 @@ def _summarize_dataset_profile(dataset_profile: Optional[Dict[str, Any]]) -> str
     )
 
 
-def _ensure_project_dataset_profile(db: Session, project: Project, dataset_path: Path) -> Dict[str, Any]:
-    existing = db.query(DatasetProfile).filter(DatasetProfile.project_id == project.id).first()
+def _ensure_project_dataset_profile(
+    db: Session, project: Project, dataset_path: Path
+) -> Dict[str, Any]:
+    existing = (
+        db.query(DatasetProfile).filter(DatasetProfile.project_id == project.id).first()
+    )
     if existing and isinstance(existing.profile_json, dict) and existing.profile_json:
         return existing.profile_json
 
@@ -852,7 +1108,9 @@ def _ensure_project_dataset_profile(db: Session, project: Project, dataset_path:
     return profile_json
 
 
-def execute_training_with_timeout(func: Callable[[], Any], timeout_seconds: int = 30) -> Any:
+def execute_training_with_timeout(
+    func: Callable[[], Any], timeout_seconds: int = 30
+) -> Any:
     """
     Execute training logic with timeout protection.
 
@@ -930,12 +1188,16 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
         except Exception:
             project_columns = set()
 
-        def _project_select_expr(column_name: str, alias: str, fallback_sql: str) -> str:
+        def _project_select_expr(
+            column_name: str, alias: str, fallback_sql: str
+        ) -> str:
             if column_name in project_columns:
                 return f"{column_name} AS {alias}"
             return f"{fallback_sql} AS {alias}"
 
-        order_by_sql = "created_at DESC" if "created_at" in project_columns else "id DESC"
+        order_by_sql = (
+            "created_at DESC" if "created_at" in project_columns else "id DESC"
+        )
         project_query = text(
             "SELECT "
             + ", ".join(
@@ -992,7 +1254,9 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                     latest_run_by_project[key] = {
                         "status": run.status,
                         "r2": run.r2,
-                        "agent_run_id": str(run.agent_run_id) if run.agent_run_id else None,
+                        "agent_run_id": (
+                            str(run.agent_run_id) if run.agent_run_id else None
+                        ),
                     }
             except Exception:
                 latest_run_by_project = {}
@@ -1016,7 +1280,9 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                             TrainingRun.project_id,
                             func.max(ModelVersion.r2).label("best_r2"),
                         )
-                        .join(TrainingRun, ModelVersion.training_run_id == TrainingRun.id)
+                        .join(
+                            TrainingRun, ModelVersion.training_run_id == TrainingRun.id
+                        )
                         .filter(TrainingRun.project_id.in_(project_ids))
                         .group_by(TrainingRun.project_id)
                         .all()
@@ -1089,13 +1355,17 @@ async def get_dashboard_overview(db: Session = Depends(get_db)):
                     {
                         "project_id": project_id,
                         "file_id": str(project.get("file_id") or ""),
-                        "project_name": str(project.get("project_name") or "Untitled Project"),
+                        "project_name": str(
+                            project.get("project_name") or "Untitled Project"
+                        ),
                         "status": status,
                         "accuracy_percent": accuracy_percent,
                         "num_rows": num_rows,
                         "created_at": _serialize_created_at(project.get("created_at")),
                         "target_column": str(project.get("target_column") or ""),
-                        "agent_run_id": latest_run.get("agent_run_id") if latest_run else None,
+                        "agent_run_id": (
+                            latest_run.get("agent_run_id") if latest_run else None
+                        ),
                     }
                 )
             except Exception:
@@ -1147,16 +1417,28 @@ async def delete_project(project_id: str):
         ]
 
         if training_run_ids:
-            db.query(ModelVersion).filter(ModelVersion.training_run_id.in_(training_run_ids)).delete(
-                synchronize_session=False
-            )
+            db.query(ModelVersion).filter(
+                ModelVersion.training_run_id.in_(training_run_ids)
+            ).delete(synchronize_session=False)
 
-        db.query(SandboxJob).filter(SandboxJob.project_id == project_uuid).delete(synchronize_session=False)
-        db.query(TrainingRun).filter(TrainingRun.project_id == project_uuid).delete(synchronize_session=False)
-        db.query(AgentRun).filter(AgentRun.project_id == project_uuid).delete(synchronize_session=False)
-        db.query(DatasetProfile).filter(DatasetProfile.project_id == project_uuid).delete(synchronize_session=False)
-        db.query(ExperimentMemory).filter(ExperimentMemory.project_id == project_uuid).delete(synchronize_session=False)
-        db.query(Project).filter(Project.id == project_uuid).delete(synchronize_session=False)
+        db.query(SandboxJob).filter(SandboxJob.project_id == project_uuid).delete(
+            synchronize_session=False
+        )
+        db.query(TrainingRun).filter(TrainingRun.project_id == project_uuid).delete(
+            synchronize_session=False
+        )
+        db.query(AgentRun).filter(AgentRun.project_id == project_uuid).delete(
+            synchronize_session=False
+        )
+        db.query(DatasetProfile).filter(
+            DatasetProfile.project_id == project_uuid
+        ).delete(synchronize_session=False)
+        db.query(ExperimentMemory).filter(
+            ExperimentMemory.project_id == project_uuid
+        ).delete(synchronize_session=False)
+        db.query(Project).filter(Project.id == project_uuid).delete(
+            synchronize_session=False
+        )
 
         db.commit()
 
@@ -1198,13 +1480,13 @@ async def get_project_by_file_id(file_id: str, db: Session = Depends(get_db)):
 def generate_mutated_hyperparameters(previous_best: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generate improved hyperparameters using LLM suggestions.
-    
+
     Args:
         previous_best: Dictionary containing:
             - model_name: str
-            - rmse: float  
+            - rmse: float
             - hyperparameters: dict
-    
+
     Returns:
         Dictionary containing:
             - model_name: str
@@ -1247,8 +1529,12 @@ def generate_mutated_hyperparameters(previous_best: Dict[str, Any]) -> Dict[str,
             "improvement": _to_float(previous_best.get("improvement"), 0.0),
             "number_of_rows": previous_best.get("number_of_rows", "unknown"),
             "number_of_features": previous_best.get("number_of_features", "unknown"),
-            "numeric_feature_count": previous_best.get("numeric_feature_count", "unknown"),
-            "categorical_feature_count": previous_best.get("categorical_feature_count", "unknown"),
+            "numeric_feature_count": previous_best.get(
+                "numeric_feature_count", "unknown"
+            ),
+            "categorical_feature_count": previous_best.get(
+                "categorical_feature_count", "unknown"
+            ),
             "missing_value_count": previous_best.get("missing_value_count", "unknown"),
             "target_variance": previous_best.get("target_variance", "unknown"),
         }
@@ -1284,7 +1570,10 @@ def generate_mutated_hyperparameters(previous_best: Dict[str, Any]) -> Dict[str,
                         "hyperparameters": safe_original_hyperparameters,
                     }
         else:
-            if isinstance(suggested_model_name, str) and suggested_model_name != model_name:
+            if (
+                isinstance(suggested_model_name, str)
+                and suggested_model_name != model_name
+            ):
                 if suggested_model_name not in SAFE_HYPERPARAMETERS:
                     return {
                         "model_name": model_name,
@@ -1305,11 +1594,16 @@ def generate_mutated_hyperparameters(previous_best: Dict[str, Any]) -> Dict[str,
                 llm_response = {}
 
             second_model_name = llm_response.get("model_name")
-            if isinstance(second_model_name, str) and second_model_name in SAFE_HYPERPARAMETERS:
+            if (
+                isinstance(second_model_name, str)
+                and second_model_name in SAFE_HYPERPARAMETERS
+            ):
                 selected_model_name = second_model_name
 
         suggested_params = llm_response.get("hyperparameters", {})
-        validated_params = validate_hyperparameters(selected_model_name, suggested_params)
+        validated_params = validate_hyperparameters(
+            selected_model_name, suggested_params
+        )
 
         if selected_model_name == model_name:
             final_hyperparameters = dict(safe_original_hyperparameters)
@@ -1380,7 +1674,11 @@ def run_agent_loop(
     preferred_llm_provider: Optional[str] = None,
     preferred_llm_model: Optional[str] = None,
 ) -> None:
+    print("RUN_AGENT_LOOP STARTED")
     execution_mode = os.getenv("AGENT_EXECUTION_MODE", "native").strip().lower()
+    print("=" * 80)
+    print("AGENT EXECUTION MODE =", execution_mode)
+    print("=" * 80)
     if execution_mode not in {"native", "sandbox"}:
         execution_mode = "native"
 
@@ -1414,7 +1712,9 @@ def run_agent_loop(
     ) -> str:
         def _indent_block(code: str, prefix: str = "    ") -> str:
             lines = (code or "").splitlines() or [""]
-            return "\n".join((prefix + line) if line.strip() else prefix for line in lines)
+            return "\n".join(
+                (prefix + line) if line.strip() else prefix for line in lines
+            )
 
         template = (
             "import json\n"
@@ -1463,7 +1763,7 @@ def run_agent_loop(
             "__AUTONOMOUS_TRAINING_SECTION__\n"
             "except Exception:\n"
             "    if 'model' not in locals() or model is None:\n"
-            "        model = Ridge(alpha=1.0)\n"
+            "        raise ValueError('Model was not created')\n"
             "    model.fit(X_train, y_train)\n"
             "    predictions = model.predict(X_test)\n"
             "\n"
@@ -1594,11 +1894,16 @@ def run_agent_loop(
             "print(json.dumps({'result_json': result_json}))\n"
         )
         return (
-            template
-            .replace("__TARGET_COLUMN__", repr(target_column))
-            .replace("__AUTONOMOUS_PREPROCESSING_SECTION__", _indent_block((preprocessing_section or "").strip()))
+            template.replace("__TARGET_COLUMN__", repr(target_column))
+            .replace(
+                "__AUTONOMOUS_PREPROCESSING_SECTION__",
+                _indent_block((preprocessing_section or "").strip()),
+            )
             .replace("__SYSTEM_MODEL_SECTION__", (system_model_section or "").strip())
-            .replace("__AUTONOMOUS_TRAINING_SECTION__", _indent_block((training_section or "").strip()))
+            .replace(
+                "__AUTONOMOUS_TRAINING_SECTION__",
+                _indent_block((training_section or "").strip()),
+            )
         )
 
     def _fallback_training_section_with_model() -> str:
@@ -1609,14 +1914,57 @@ def run_agent_loop(
             "predictions = model.predict(X_test)\n"
         )
 
-    def _fallback_training_section_without_model() -> str:
+
+    def _fallback_training_section_without_model(model_family: str) -> str:
+        if model_family == "LinearRegression":
+            model_line = "model = LinearRegression()"
+        elif model_family == "Ridge":
+            model_line = "model = Ridge(alpha=1.0)"
+
+        elif model_family == "Lasso":
+            model_line = "model = Lasso(alpha=0.1, max_iter=10000)"
+
+        elif model_family == "ElasticNet":
+            model_line = "model = ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=10000)"
+
+        elif model_family == "RandomForestRegressor":
+            model_line = (
+                "model = RandomForestRegressor("
+                "n_estimators=100, "
+                "max_depth=6, "
+                "random_state=42)"
+            )
+
+        elif model_family == "XGBRegressor":
+            model_line = (
+                "model = XGBRegressor("
+                "n_estimators=100, "
+                "max_depth=6, "
+                "learning_rate=0.1, "
+                "random_state=42)"
+            )
+
+        else:
+            model_line = "model = Ridge(alpha=1.0)"
+
+
         return (
+            f"{model_line}\n"
             "hyperparams = {}\n"
             "model.fit(X_train, y_train)\n"
             "predictions = model.predict(X_test)\n"
         )
 
-    def _parse_sectioned_autonomous_output(raw_text: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+
+
+
+
+
+
+
+    def _parse_sectioned_autonomous_output(
+        raw_text: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
         cleaned = _sanitize_code_block(raw_text)
         if not cleaned:
             return None, None
@@ -1629,11 +1977,11 @@ def run_agent_loop(
 
         if pre_idx != -1 and train_idx != -1:
             if pre_idx < train_idx:
-                pre_block = cleaned[pre_idx + len(marker_pre):train_idx]
-                train_block = cleaned[train_idx + len(marker_train):]
+                pre_block = cleaned[pre_idx + len(marker_pre) : train_idx]
+                train_block = cleaned[train_idx + len(marker_train) :]
             else:
-                train_block = cleaned[train_idx + len(marker_train):pre_idx]
-                pre_block = cleaned[pre_idx + len(marker_pre):]
+                train_block = cleaned[train_idx + len(marker_train) : pre_idx]
+                pre_block = cleaned[pre_idx + len(marker_pre) :]
 
             pre_block = pre_block.lstrip(":\n# \t").strip()
             train_block = train_block.lstrip(":\n# \t").strip()
@@ -1780,7 +2128,9 @@ def run_agent_loop(
             "subsample",
         ]
 
-    def _list_absent_structural_keywords(previous_training_code: Optional[str]) -> List[str]:
+    def _list_absent_structural_keywords(
+        previous_training_code: Optional[str],
+    ) -> List[str]:
         previous_lower = (previous_training_code or "").lower()
         absent: List[str] = []
         for keyword in _structural_training_keywords():
@@ -1819,7 +2169,9 @@ def run_agent_loop(
                 "You must introduce structural change now. Minor parameter tweaks are insufficient."
             )
 
-        if previous_training_code and not _has_new_required_structural_keyword(previous_training_code, new_training_code):
+        if previous_training_code and not _has_new_required_structural_keyword(
+            previous_training_code, new_training_code
+        ):
             return True, (
                 "no NEW required structural training keyword was introduced from the mandated list. "
                 "You must introduce at least one new structural mechanism now."
@@ -1907,6 +2259,7 @@ def run_agent_loop(
     @dataclass
     class ContractValidationResult:
         """Result of script contract validation."""
+
         is_valid: bool
         errors: List[str]
         warnings: List[str]
@@ -1933,18 +2286,24 @@ def run_agent_loop(
 
         # ── Check 1: Required training calls ──
         if "model.fit(" not in script_content:
-            errors.append("CONTRACT_VIOLATION: script missing required 'model.fit(' call")
+            errors.append(
+                "CONTRACT_VIOLATION: script missing required 'model.fit(' call"
+            )
         prediction_assignment_pattern = re.compile(
             r"^\s*[A-Za-z_]\w*\s*=\s*model\.predict\s*\(",
             re.MULTILINE,
         )
         if not prediction_assignment_pattern.search(training_section or ""):
-            errors.append("CONTRACT_VIOLATION: training section missing prediction assignment from model.predict(...)")
+            errors.append(
+                "CONTRACT_VIOLATION: training section missing prediction assignment from model.predict(...)"
+            )
 
         # ── Check 2: No model instantiation in training section under locked modes ──
         if (exploration_mode or exploitation_lock) and training_section:
             model_instantiation_pattern = re.compile(
-                r"\bmodel\s*=\s*(" + "|".join(re.escape(m) for m in _ALLOWED_MODEL_CLASSES) + r")\s*\(",
+                r"\bmodel\s*=\s*("
+                + "|".join(re.escape(m) for m in _ALLOWED_MODEL_CLASSES)
+                + r")\s*\(",
                 re.IGNORECASE,
             )
             if model_instantiation_pattern.search(training_section):
@@ -1955,12 +2314,20 @@ def run_agent_loop(
 
         # ── Check 3: LLM cannot own result_json ──
         if training_section:
-            result_json_redef_pattern = re.compile(r"^\s*result_json\s*=", re.IGNORECASE | re.MULTILINE)
+            result_json_redef_pattern = re.compile(
+                r"^\s*result_json\s*=", re.IGNORECASE | re.MULTILINE
+            )
             if result_json_redef_pattern.search(training_section):
-                errors.append("CONTRACT_VIOLATION: training section attempts to define/override protected variable 'result_json'")
+                errors.append(
+                    "CONTRACT_VIOLATION: training section attempts to define/override protected variable 'result_json'"
+                )
 
-        result_json_assignment_pattern = re.compile(r"^\s*result_json\s*=", re.IGNORECASE | re.MULTILINE)
-        result_json_assignment_count = len(result_json_assignment_pattern.findall(script_content))
+        result_json_assignment_pattern = re.compile(
+            r"^\s*result_json\s*=", re.IGNORECASE | re.MULTILINE
+        )
+        result_json_assignment_count = len(
+            result_json_assignment_pattern.findall(script_content)
+        )
         if result_json_assignment_count != 1:
             errors.append(
                 "CONTRACT_VIOLATION: script must contain exactly one system-owned 'result_json =' assignment"
@@ -1968,9 +2335,13 @@ def run_agent_loop(
 
         # ── Check 4: Forbidden model classes ──
         for forbidden_class in _FORBIDDEN_MODEL_CLASSES:
-            forbidden_pattern = re.compile(rf"\b{re.escape(forbidden_class)}\b", re.IGNORECASE)
+            forbidden_pattern = re.compile(
+                rf"\b{re.escape(forbidden_class)}\b", re.IGNORECASE
+            )
             if forbidden_pattern.search(script_content):
-                errors.append(f"CONTRACT_VIOLATION: script contains forbidden model class '{forbidden_class}'")
+                errors.append(
+                    f"CONTRACT_VIOLATION: script contains forbidden model class '{forbidden_class}'"
+                )
 
         # ── Check 5: Model redefinition in training section when system-injected ──
         if is_model_injected and training_section:
@@ -2060,15 +2431,21 @@ def run_agent_loop(
             print(f"CONTRACT_VALIDATOR: script passed validation")
             return script_content, training_section, False
 
-        print(f"CONTRACT_VALIDATOR: first validation failed - {validation_result.errors}")
+        print(
+            f"CONTRACT_VALIDATOR: first validation failed - {validation_result.errors}"
+        )
 
         # ── First regeneration attempt with stricter directive ──
-        stricter_directive = _generate_stricter_training_directive(validation_result.errors)
+        stricter_directive = _generate_stricter_training_directive(
+            validation_result.errors
+        )
         stricter_prompt = original_prompt + stricter_directive
 
         regenerated_sections = _generate_autonomous_section_via_llm(stricter_prompt)
-        regen_preprocessing, regen_training = _parse_sectioned_autonomous_output(regenerated_sections)
-        
+        regen_preprocessing, regen_training = _parse_sectioned_autonomous_output(
+            regenerated_sections
+        )
+
         # Remove any natural language instructions
         regen_preprocessing = _remove_natural_language_from_code(regen_preprocessing)
         regen_training = _remove_natural_language_from_code(regen_training)
@@ -2107,7 +2484,9 @@ def run_agent_loop(
             print(f"CONTRACT_VALIDATOR: regenerated script passed validation")
             return regen_script, regen_training, False
 
-        print(f"CONTRACT_VALIDATOR: second validation failed - {validation_result_2.errors}")
+        print(
+            f"CONTRACT_VALIDATOR: second validation failed - {validation_result_2.errors}"
+        )
         print("CONTRACT_VALIDATOR: falling back to safe deterministic template")
 
         # ── Final fallback: safe deterministic template ──
@@ -2154,7 +2533,9 @@ def run_agent_loop(
         override the selected model family. LLM-generated preprocessing/training
         code can mutate around this fixed model object.
         """
-        resolved_training = training_section or _fallback_training_section_without_model()
+        resolved_training = (
+            training_section or _fallback_training_section_without_model()
+        )
         return _build_autonomous_script_template(
             preprocessing_section=preprocessing_section,
             training_section=resolved_training,
@@ -2210,7 +2591,9 @@ def run_agent_loop(
         max_tokens: int,
         model_override: Optional[str] = None,
     ) -> Optional[str]:
-        gemini_api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+        gemini_api_key = (
+            os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+        ).strip()
         if not gemini_api_key:
             return None
 
@@ -2298,7 +2681,9 @@ def run_agent_loop(
         for provider_name in configured_providers:
             try:
                 if provider_name == "gemini":
-                    gemini_model_override = llm_model if llm_provider == "gemini" else None
+                    gemini_model_override = (
+                        llm_model if llm_provider == "gemini" else None
+                    )
                     gemini_text = _call_gemini_text(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
@@ -2315,7 +2700,9 @@ def run_agent_loop(
                         client = llm_client
                         model = llm_model
                     else:
-                        client, model, resolved_provider = _resolve_autonomous_llm_client(provider_name)
+                        client, model, resolved_provider = (
+                            _resolve_autonomous_llm_client(provider_name)
+                        )
                         if resolved_provider != provider_name:
                             continue
 
@@ -2399,14 +2786,19 @@ def run_agent_loop(
             print(f"SANDBOX STRATEGY FALLBACK: {strategy_exc}")
 
         stagnation_count = int(performance_context.get("stagnation_count") or 0)
-        previous_strategy = str(performance_context.get("previous_strategy") or "").strip()
+        previous_strategy = str(
+            performance_context.get("previous_strategy") or ""
+        ).strip()
         if stagnation_count >= 2:
             fallback = (
                 "Switch away from the previous model family and introduce a stronger ensemble approach with "
                 "feature engineering and regularization tuning, including richer preprocessing to reduce error plateaus."
             )
             if previous_strategy and fallback.lower() == previous_strategy.lower():
-                return fallback + " Also add interaction features and calibration-oriented hyperparameter search."
+                return (
+                    fallback
+                    + " Also add interaction features and calibration-oriented hyperparameter search."
+                )
             return fallback
 
         return "Refine the current approach conservatively by tuning key hyperparameters and improving generalization while keeping preprocessing stable."
@@ -2442,7 +2834,9 @@ def run_agent_loop(
             return selected
         return None
 
-    def _contains_forbidden_model_family(code_text: str, forbidden_models: List[str]) -> bool:
+    def _contains_forbidden_model_family(
+        code_text: str, forbidden_models: List[str]
+    ) -> bool:
         if not code_text or not forbidden_models:
             return False
         return any(model_name in code_text for model_name in forbidden_models)
@@ -2535,7 +2929,9 @@ def run_agent_loop(
         ]
 
         excluded = set(recent_model_history[-3:])
-        allowed = [model_name for model_name in model_pool if model_name not in excluded]
+        allowed = [
+            model_name for model_name in model_pool if model_name not in excluded
+        ]
         if not allowed:
             allowed = model_pool
 
@@ -2601,10 +2997,21 @@ def run_agent_loop(
         2) LLM_PROVIDER env var
         3) Default priority: Groq -> OpenAI -> Gemini
         """
-        requested_provider = (force_provider or preferred_llm_provider or os.getenv("LLM_PROVIDER") or "").strip().lower()
+        requested_provider = (
+            (
+                force_provider
+                or preferred_llm_provider
+                or os.getenv("LLM_PROVIDER")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
         openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        gemini_api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+        gemini_api_key = (
+            os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+        ).strip()
 
         if not groq_api_key and not openai_api_key and not gemini_api_key:
             return None, None, None
@@ -2692,7 +3099,9 @@ def run_agent_loop(
         """Create a sandbox job and return its ID without polling."""
         create_sandbox_job_db = SessionLocal()
         try:
-            sandbox_job_timeout_seconds = int(os.getenv("SANDBOX_JOB_TIMEOUT_SECONDS", "180"))
+            sandbox_job_timeout_seconds = int(
+                os.getenv("SANDBOX_JOB_TIMEOUT_SECONDS", "180")
+            )
             sandbox_job = SandboxJob(
                 agent_id=agent_run_id,
                 project_id=project_id,
@@ -2742,7 +3151,9 @@ def run_agent_loop(
 
         system_result_json = parsed_result.get("result_json")
         if not isinstance(system_result_json, dict):
-            raise RuntimeError("Sandbox result_json missing required system-generated 'result_json' object")
+            raise RuntimeError(
+                "Sandbox result_json missing required system-generated 'result_json' object"
+            )
 
         def _to_float(value: Any) -> Optional[float]:
             try:
@@ -2767,7 +3178,9 @@ def run_agent_loop(
             "r2": _to_float(system_result_json.get("r2")),
         }
 
-    def _poll_single_sandbox_job(sandbox_job_id: uuid.UUID, timeout_seconds: Optional[int] = None) -> Dict[str, Optional[float]]:
+    def _poll_single_sandbox_job(
+        sandbox_job_id: uuid.UUID, timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Optional[float]]:
         """Poll a single sandbox job until completion and return metrics."""
         sandbox_poll_start = time.time()
         if timeout_seconds is None:
@@ -2778,11 +3191,17 @@ def run_agent_loop(
 
         while True:
             if time.time() - sandbox_poll_start > timeout_seconds:
-                raise RuntimeError(f"Sandbox polling timeout exceeded ({timeout_seconds}s)")
+                raise RuntimeError(
+                    f"Sandbox polling timeout exceeded ({timeout_seconds}s)"
+                )
 
             poll_db = SessionLocal()
             try:
-                polled_job = poll_db.query(SandboxJob).filter(SandboxJob.id == sandbox_job_id).first()
+                polled_job = (
+                    poll_db.query(SandboxJob)
+                    .filter(SandboxJob.id == sandbox_job_id)
+                    .first()
+                )
                 if polled_job is None:
                     raise RuntimeError("Sandbox job not found during polling")
                 sandbox_status = polled_job.status
@@ -2796,7 +3215,9 @@ def run_agent_loop(
 
             time.sleep(2)
 
-        return _parse_sandbox_metrics(sandbox_status, sandbox_result_json, sandbox_error_log)
+        return _parse_sandbox_metrics(
+            sandbox_status, sandbox_result_json, sandbox_error_log
+        )
 
     def _poll_sandbox_jobs_parallel(
         job_ids: List[uuid.UUID],
@@ -2826,11 +3247,14 @@ def run_agent_loop(
             metadata_db.close()
 
         timeout_by_job_id = {
-            row.id: max(1, int(row.timeout_seconds or 60))
-            for row in job_rows
+            row.id: max(1, int(row.timeout_seconds or 60)) for row in job_rows
         }
-        expected_runtime_seconds = sum(timeout_by_job_id.get(job_id, 60) for job_id in job_ids)
-        total_timeout = max(default_timeout_seconds, expected_runtime_seconds + timeout_buffer_seconds)
+        expected_runtime_seconds = sum(
+            timeout_by_job_id.get(job_id, 60) for job_id in job_ids
+        )
+        total_timeout = max(
+            default_timeout_seconds, expected_runtime_seconds + timeout_buffer_seconds
+        )
         total_timeout = min(total_timeout, max_timeout_seconds)
         inactivity_timeout = max(
             max(timeout_by_job_id.values(), default=60) + timeout_buffer_seconds,
@@ -2858,7 +3282,9 @@ def run_agent_loop(
             if now - batch_poll_start > total_timeout:
                 for idx, job_id in enumerate(job_ids):
                     if job_id in pending_job_id_set:
-                        model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
+                        model_name = (model_names_by_job_id or {}).get(
+                            job_id, "UnknownModel"
+                        )
                         print(
                             "PARALLEL EXECUTION: Job "
                             f"{job_id} failed: Sandbox batch polling timeout exceeded ({total_timeout}s)"
@@ -2880,7 +3306,9 @@ def run_agent_loop(
             if now - last_progress_at > inactivity_timeout:
                 for idx, job_id in enumerate(job_ids):
                     if job_id in pending_job_id_set:
-                        model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
+                        model_name = (model_names_by_job_id or {}).get(
+                            job_id, "UnknownModel"
+                        )
                         print(
                             "PARALLEL EXECUTION: Job "
                             f"{job_id} failed: No sandbox status change observed for {inactivity_timeout}s"
@@ -2917,8 +3345,12 @@ def run_agent_loop(
 
                 polled_job = jobs_by_id.get(job_id)
                 if polled_job is None:
-                    model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
-                    print(f"PARALLEL EXECUTION: Job {job_id} failed: Sandbox job not found during polling")
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
+                    print(
+                        f"PARALLEL EXECUTION: Job {job_id} failed: Sandbox job not found during polling"
+                    )
                     _append_agent_sandbox_event(
                         agent_run_id,
                         f"Sandbox job missing: {model_name} ({job_id})",
@@ -2938,7 +3370,9 @@ def run_agent_loop(
                 last_observed_status_by_job_id[job_id] = current_status
                 previous_status = last_status_by_job_id.get(job_id)
                 if current_status != previous_status:
-                    model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
                     print(
                         f"PARALLEL EXECUTION: Job {job_id} status {previous_status or 'created'} -> {current_status}"
                     )
@@ -2947,14 +3381,18 @@ def run_agent_loop(
                             agent_run_id,
                             f"Sandbox job queued: {model_name} ({job_id})",
                         )
-                        _set_agent_model_status(agent_run_id, model_name, "queued", job_id=job_id)
+                        _set_agent_model_status(
+                            agent_run_id, model_name, "queued", job_id=job_id
+                        )
                     elif current_status == "running":
                         observed_execution_start = True
                         _append_agent_sandbox_event(
                             agent_run_id,
                             f"Sandbox job running: {model_name} ({job_id})",
                         )
-                        _set_agent_model_status(agent_run_id, model_name, "training", job_id=job_id)
+                        _set_agent_model_status(
+                            agent_run_id, model_name, "training", job_id=job_id
+                        )
                     elif current_status == "completed":
                         observed_execution_start = True
                         _append_agent_sandbox_event(
@@ -2985,7 +3423,9 @@ def run_agent_loop(
                         polled_job.result_json,
                         polled_job.error_log,
                     )
-                    model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
                     metrics["_sandbox_status"] = current_status
                     metrics["_error_message"] = None
                     results[idx] = metrics
@@ -3005,7 +3445,9 @@ def run_agent_loop(
                         )
                     print(f"PARALLEL EXECUTION: Job {job_id} completed successfully")
                 except Exception as exc:
-                    model_name = (model_names_by_job_id or {}).get(job_id, "UnknownModel")
+                    model_name = (model_names_by_job_id or {}).get(
+                        job_id, "UnknownModel"
+                    )
                     print(f"PARALLEL EXECUTION: Job {job_id} failed: {exc}")
                     _set_agent_model_status(
                         agent_run_id,
@@ -3028,14 +3470,17 @@ def run_agent_loop(
                 pending_job_id_set.discard(job_id)
                 last_progress_at = now
 
-            pending_job_ids = [job_id for job_id in job_ids if job_id in pending_job_id_set]
+            pending_job_ids = [
+                job_id for job_id in job_ids if job_id in pending_job_id_set
+            ]
             if pending_job_ids:
                 unresolved_pending_statuses = {
                     job_id: last_observed_status_by_job_id.get(job_id, "unknown")
                     for job_id in pending_job_ids
                 }
                 if unresolved_pending_statuses and all(
-                    status == "queued" for status in unresolved_pending_statuses.values()
+                    status == "queued"
+                    for status in unresolved_pending_statuses.values()
                 ):
                     if first_all_queued_at is None:
                         first_all_queued_at = now
@@ -3055,23 +3500,35 @@ def run_agent_loop(
                 job_id: last_observed_status_by_job_id.get(job_id, "unknown")
                 for job_id in job_ids
             }
-            if unresolved_statuses and all(status == "queued" for status in unresolved_statuses.values()):
+            if unresolved_statuses and all(
+                status == "queued" for status in unresolved_statuses.values()
+            ):
                 raise RuntimeError(
                     "Sandbox worker appears offline: all sandbox jobs remained queued and never started. "
                     "Start backend/sandbox_worker.py and retry."
                 )
 
-        return [item if item is not None else _empty_sandbox_metrics() for item in results]
+        return [
+            item if item is not None else _empty_sandbox_metrics() for item in results
+        ]
 
-    def _run_sandbox_script(script_content: str, iteration_number: int) -> Dict[str, Optional[float]]:
+    def _run_sandbox_script(
+        script_content: str, iteration_number: int
+    ) -> Dict[str, Optional[float]]:
         """Queue a sandbox job, poll until terminal state, and return parsed metric payload."""
         job_id = _create_sandbox_job(script_content, iteration_number)
         return _poll_single_sandbox_job(job_id)
 
-    def _update_training_run_stage(training_run_id: uuid.UUID, stage: str, progress: int) -> None:
+    def _update_training_run_stage(
+        training_run_id: uuid.UUID, stage: str, progress: int
+    ) -> None:
         stage_db = SessionLocal()
         try:
-            run = stage_db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+            run = (
+                stage_db.query(TrainingRun)
+                .filter(TrainingRun.id == training_run_id)
+                .first()
+            )
             if run is None:
                 return
             run.stage = stage
@@ -3085,11 +3542,15 @@ def run_agent_loop(
 
     initial_db = SessionLocal()
     try:
-        agent_run = initial_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+        agent_run = (
+            initial_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+        )
         if agent_run is None:
             return
 
-        project = initial_db.query(Project).filter(Project.id == agent_run.project_id).first()
+        project = (
+            initial_db.query(Project).filter(Project.id == agent_run.project_id).first()
+        )
         if project is None:
             agent_run.status = "failed"
             agent_run.error_message = "Project not found for agent run"
@@ -3110,29 +3571,46 @@ def run_agent_loop(
         dataset_path = UPLOAD_DIR / str(project_file_id)
         if dataset_path.exists():
             try:
-                project_dataset_profile = _ensure_project_dataset_profile(initial_db, project, dataset_path)
-                project_dataset_profile_summary = _summarize_dataset_profile(project_dataset_profile)
+                project_dataset_profile = _ensure_project_dataset_profile(
+                    initial_db, project, dataset_path
+                )
+                project_dataset_profile_summary = _summarize_dataset_profile(
+                    project_dataset_profile
+                )
             except Exception as profile_exc:
                 print(f"DATASET PROFILE FALLBACK: {profile_exc}")
                 project_dataset_profile = {}
-                project_dataset_profile_summary = "Dataset profile unavailable due to profiling fallback."
+                project_dataset_profile_summary = (
+                    "Dataset profile unavailable due to profiling fallback."
+                )
         else:
             project_dataset_profile = {}
-            project_dataset_profile_summary = "Dataset profile unavailable because dataset file is missing."
+            project_dataset_profile_summary = (
+                "Dataset profile unavailable because dataset file is missing."
+            )
 
         # ── Phase E: Compute dataset fingerprint & retrieve experiment memory ──
         project_dataset_fingerprint = ""
         experiment_memory_prompt = ""
         if project_dataset_profile:
             try:
-                project_dataset_fingerprint = _compute_dataset_fingerprint(project_dataset_profile)
+                project_dataset_fingerprint = _compute_dataset_fingerprint(
+                    project_dataset_profile
+                )
                 print(f"DATASET_FINGERPRINT: {project_dataset_fingerprint}")
                 memories = _retrieve_experiment_memory(
-                    initial_db, project_dataset_fingerprint, project_dataset_profile, limit=5
+                    initial_db,
+                    project_dataset_fingerprint,
+                    project_dataset_profile,
+                    limit=5,
                 )
                 if memories:
-                    experiment_memory_prompt = _format_experiment_memory_for_prompt(memories)
-                    print(f"EXPERIMENT_MEMORY_RETRIEVED: {len(memories)} records loaded")
+                    experiment_memory_prompt = _format_experiment_memory_for_prompt(
+                        memories
+                    )
+                    print(
+                        f"EXPERIMENT_MEMORY_RETRIEVED: {len(memories)} records loaded"
+                    )
                 else:
                     print("EXPERIMENT_MEMORY_RETRIEVED: no past experiments found")
             except Exception as mem_exc:
@@ -3170,18 +3648,34 @@ def run_agent_loop(
             "RandomForestRegressor",
             "XGBRegressor",
         ]
-        per_model_previous_preprocessing: Dict[str, Optional[str]] = {m: None for m in model_families}
-        per_model_previous_training: Dict[str, Optional[str]] = {m: None for m in model_families}
-        per_model_best_rmse: Dict[str, Optional[float]] = {m: None for m in model_families}
+        per_model_previous_preprocessing: Dict[str, Optional[str]] = {
+            m: None for m in model_families
+        }
+        per_model_previous_training: Dict[str, Optional[str]] = {
+            m: None for m in model_families
+        }
+        per_model_best_rmse: Dict[str, Optional[float]] = {
+            m: None for m in model_families
+        }
         # Prompt Architect state
-        per_model_previous_blueprint: Dict[str, Optional[Blueprint]] = {m: None for m in model_families}
-        per_model_last_error: Dict[str, ErrorContext] = {m: ErrorContext(error_type="none") for m in model_families}
-        per_model_telemetry: Dict[str, List[ArchitectTelemetry]] = {m: [] for m in model_families}
+        per_model_previous_blueprint: Dict[str, Optional[Blueprint]] = {
+            m: None for m in model_families
+        }
+        per_model_last_error: Dict[str, ErrorContext] = {
+            m: ErrorContext(error_type="none") for m in model_families
+        }
+        per_model_telemetry: Dict[str, List[ArchitectTelemetry]] = {
+            m: [] for m in model_families
+        }
 
         while True:
             iteration_db = SessionLocal()
             try:
-                agent_run = iteration_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+                agent_run = (
+                    iteration_db.query(AgentRun)
+                    .filter(AgentRun.id == agent_run_id)
+                    .first()
+                )
                 if agent_run is None:
                     return
 
@@ -3213,9 +3707,13 @@ def run_agent_loop(
 
             create_training_run_db = SessionLocal()
             try:
-                current_version = create_training_run_db.query(
-                    func.coalesce(func.max(TrainingRun.version_number), 0)
-                ).filter(TrainingRun.project_id == project_id).scalar()
+                current_version = (
+                    create_training_run_db.query(
+                        func.coalesce(func.max(TrainingRun.version_number), 0)
+                    )
+                    .filter(TrainingRun.project_id == project_id)
+                    .scalar()
+                )
 
                 training_run = TrainingRun(
                     project_id=project_id,
@@ -3243,13 +3741,17 @@ def run_agent_loop(
             mutation_payload: Optional[Dict[str, Any]] = None
             if current_iteration > 1:
                 print("MUTATION PATH")
-                source_training_run_id = best_training_run_id or current_best_training_run_id
+                source_training_run_id = (
+                    best_training_run_id or current_best_training_run_id
+                )
                 if source_training_run_id is not None:
                     mutation_db = SessionLocal()
                     try:
                         previous_best_model = (
                             mutation_db.query(ModelVersion)
-                            .filter(ModelVersion.training_run_id == source_training_run_id)
+                            .filter(
+                                ModelVersion.training_run_id == source_training_run_id
+                            )
                             .order_by(ModelVersion.rank_position.asc())
                             .first()
                         )
@@ -3283,9 +3785,14 @@ def run_agent_loop(
                             "target_variance": project_target_variance,
                         }
 
-                        if best_rmse is not None and previous_best_model.rmse is not None:
+                        if (
+                            best_rmse is not None
+                            and previous_best_model.rmse is not None
+                        ):
                             try:
-                                previous_best["improvement"] = float(best_rmse) - float(previous_best_model.rmse)
+                                previous_best["improvement"] = float(best_rmse) - float(
+                                    previous_best_model.rmse
+                                )
                             except (TypeError, ValueError):
                                 previous_best["improvement"] = 0.0
                         else:
@@ -3317,14 +3824,23 @@ def run_agent_loop(
                                     selected_params = validated_mutated_params
 
                                 improvement = 0.0
-                                if best_rmse is not None and previous_best_model.rmse is not None:
+                                if (
+                                    best_rmse is not None
+                                    and previous_best_model.rmse is not None
+                                ):
                                     try:
-                                        improvement = float(best_rmse) - float(previous_best_model.rmse)
+                                        improvement = float(best_rmse) - float(
+                                            previous_best_model.rmse
+                                        )
                                     except (TypeError, ValueError):
                                         improvement = 0.0
 
-                                unchanged_params = validated_mutated_params == safe_original_params
-                                empty_or_unchanged = (not validated_mutated_params) or unchanged_params
+                                unchanged_params = (
+                                    validated_mutated_params == safe_original_params
+                                )
+                                empty_or_unchanged = (
+                                    not validated_mutated_params
+                                ) or unchanged_params
 
                                 if not refinement_attempted:
                                     if (
@@ -3333,16 +3849,30 @@ def run_agent_loop(
                                         and mutated_model_name == previous_model_name
                                         and empty_or_unchanged
                                     ):
-                                        if previous_model_name in {"LinearRegression", "Ridge"}:
-                                            selected_model_name = "RandomForestRegressor"
-                                        elif previous_model_name == "RandomForestRegressor":
+                                        if previous_model_name in {
+                                            "LinearRegression",
+                                            "Ridge",
+                                        }:
+                                            selected_model_name = (
+                                                "RandomForestRegressor"
+                                            )
+                                        elif (
+                                            previous_model_name
+                                            == "RandomForestRegressor"
+                                        ):
                                             selected_model_name = "XGBRegressor"
                                         elif previous_model_name == "XGBRegressor":
-                                            selected_model_name = "RandomForestRegressor"
+                                            selected_model_name = (
+                                                "RandomForestRegressor"
+                                            )
                                         else:
-                                            selected_model_name = "RandomForestRegressor"
+                                            selected_model_name = (
+                                                "RandomForestRegressor"
+                                            )
                                         selected_params = {}
-                                        print("DETERMINISTIC OVERRIDE: Forcing model switch due to stagnation.")
+                                        print(
+                                            "DETERMINISTIC OVERRIDE: Forcing model switch due to stagnation."
+                                        )
                         except Exception:
                             selected_model_name = previous_model_name
                             selected_params = safe_original_params
@@ -3351,6 +3881,13 @@ def run_agent_loop(
                             "model_name": selected_model_name,
                             "hyperparameters": selected_params,
                         }
+
+                        print("=" * 80)
+                        print(f"ITERATION {current_iteration}")
+                        print("SELECTED MODEL:", selected_model_name)
+                        print("SELECTED PARAMS:", selected_params)
+                        print("=" * 80)
+
             else:
                 print("BASELINE TRAINING PATH")
 
@@ -3359,7 +3896,9 @@ def run_agent_loop(
                 generated_model_family: Optional[str] = None
                 current_iter_preprocessing_code: Optional[str] = None
                 current_iter_training_code: Optional[str] = None
-                model_line: Optional[str] = None  # Set by orchestrator when model is system-injected
+                model_line: Optional[str] = (
+                    None  # Set by orchestrator when model is system-injected
+                )
                 sandbox_rmse_cv: Optional[float] = None
                 sandbox_rmse_holdout: Optional[float] = None
                 if execution_mode == "sandbox":
@@ -3378,11 +3917,15 @@ def run_agent_loop(
                         stagnation_count=no_improvement_counter,
                         previous_failure_types=previous_failure_types,
                         previous_model_family=previous_model_family,
-                        previous_strategy=(strategy_history[-1] if strategy_history else None),
+                        previous_strategy=(
+                            strategy_history[-1] if strategy_history else None
+                        ),
                         model_history=model_history,
                         exploration_mode=False,
                     )
-                    strategy_reasoning = _generate_strategy_reasoning(performance_context)
+                    strategy_reasoning = _generate_strategy_reasoning(
+                        performance_context
+                    )
                     print(f"SANDBOX STRATEGY: {strategy_reasoning}")
                     _append_agent_sandbox_event(
                         agent_run_id,
@@ -3396,24 +3939,38 @@ def run_agent_loop(
                     best_model_metrics: Optional[Dict[str, Optional[float]]] = None
 
                     # Phase 1: Generate and validate all model scripts
-                    print(f"PARALLEL EXECUTION: Generating scripts for all {len(model_families)} models...")
-                    
+                    print(
+                        f"PARALLEL EXECUTION: Generating scripts for all {len(model_families)} models..."
+                    )
+
                     # Track models being trained for UI
                     AGENT_SANDBOX_EVENT_LOGS.setdefault(str(agent_run_id), [])
                     AGENT_MODELS_IN_PROGRESS[str(agent_run_id)] = [
-                        {"name": model, "status": "pending", "rmse": None, "r2": None, "mae": None, "job_id": None, "error": None}
+                        {
+                            "name": model,
+                            "status": "pending",
+                            "rmse": None,
+                            "r2": None,
+                            "mae": None,
+                            "job_id": None,
+                            "error": None,
+                        }
                         for model in model_families
                     ]
                     _append_agent_sandbox_event(
                         agent_run_id,
                         f"Initialized parallel sandbox execution for {len(model_families)} models.",
                     )
-                    
+
                     model_scripts_data = []
-                    
+
                     for model_family in model_families:
-                        previous_model_preprocessing = per_model_previous_preprocessing.get(model_family)
-                        previous_model_training = per_model_previous_training.get(model_family)
+                        previous_model_preprocessing = (
+                            per_model_previous_preprocessing.get(model_family)
+                        )
+                        previous_model_training = per_model_previous_training.get(
+                            model_family
+                        )
                         model_specific_best = per_model_best_rmse.get(model_family)
                         model_line = _get_model_instantiation_line(model_family)
 
@@ -3438,7 +3995,9 @@ def run_agent_loop(
                                 iteration=current_iteration,
                                 strategy_reasoning=strategy_reasoning,
                                 dataset_metadata=performance_context.get("dataset", {}),
-                                dataset_profile_summary=performance_context.get("dataset_profile_summary"),
+                                dataset_profile_summary=performance_context.get(
+                                    "dataset_profile_summary"
+                                ),
                                 previous_rmse=model_specific_best,
                                 best_rmse=best_rmse,
                                 stagnation_count=no_improvement_counter,
@@ -3491,7 +4050,9 @@ def run_agent_loop(
                                 previous_model_training,
                             )
 
-                            raw_sections = _generate_autonomous_section_via_llm(generator_prompt)
+                            raw_sections = _generate_autonomous_section_via_llm(
+                                generator_prompt
+                            )
 
                         else:
                             # ── Legacy single-stage path (feature flag off) ──
@@ -3559,16 +4120,27 @@ def run_agent_loop(
                                 previous_model_training,
                             )
 
-                            raw_sections = _generate_autonomous_section_via_llm(model_prompt)
+                            raw_sections = _generate_autonomous_section_via_llm(
+                                model_prompt
+                            )
 
                         # ── Common post-processing (both paths) ──
-                        preprocessing_code, training_code = _parse_sectioned_autonomous_output(raw_sections)
+                        preprocessing_code, training_code = (
+                            _parse_sectioned_autonomous_output(raw_sections)
+                        )
 
                         # Remove any natural language instructions from LLM output
-                        preprocessing_code = _remove_natural_language_from_code(preprocessing_code)
-                        training_code = _remove_natural_language_from_code(training_code)
+                        preprocessing_code = _remove_natural_language_from_code(
+                            preprocessing_code
+                        )
+                        training_code = _remove_natural_language_from_code(
+                            training_code
+                        )
 
-                        if not preprocessing_code or "train_test_split" not in preprocessing_code:
+                        if (
+                            not preprocessing_code
+                            or "train_test_split" not in preprocessing_code
+                        ):
                             preprocessing_code = _fallback_preprocessing_section([])
 
                         training_code = _sanitize_training_section(
@@ -3584,22 +4156,47 @@ def run_agent_loop(
                         )
                         if needs_regen:
                             if ENABLE_PROMPT_ARCHITECT:
-                                stronger_prompt = generator_prompt + "\nSTRICT REGENERATION DIRECTIVE: " + regen_reason + "\n"
+                                stronger_prompt = (
+                                    generator_prompt
+                                    + "\nSTRICT REGENERATION DIRECTIVE: "
+                                    + regen_reason
+                                    + "\n"
+                                )
                             else:
-                                stronger_prompt = model_prompt + "\nSTRICT REGENERATION DIRECTIVE: " + regen_reason + "\n"
-                            stronger_sections = _generate_autonomous_section_via_llm(stronger_prompt)
-                            _, stronger_training = _parse_sectioned_autonomous_output(stronger_sections)
+                                stronger_prompt = (
+                                    model_prompt
+                                    + "\nSTRICT REGENERATION DIRECTIVE: "
+                                    + regen_reason
+                                    + "\n"
+                                )
+                            stronger_sections = _generate_autonomous_section_via_llm(
+                                stronger_prompt
+                            )
+                            _, stronger_training = _parse_sectioned_autonomous_output(
+                                stronger_sections
+                            )
                             # Remove natural language from regenerated code
-                            stronger_training = _remove_natural_language_from_code(stronger_training)
+                            stronger_training = _remove_natural_language_from_code(
+                                stronger_training
+                            )
                             training_code = _sanitize_training_section(
                                 stronger_training,
                                 disallow_model_redefinition=False,  # Allow LLM to define model
                             )
 
-                        if not training_code or "model.fit" not in training_code or "predict" not in training_code:
-                            training_code = _fallback_training_section_without_model()
+                        if (
+                            not training_code
+                            or "model.fit" not in training_code
+                            or "predict" not in training_code
+                        ):
+                           
+                            training_code = _fallback_training_section_without_model(
+                                model_family
+                            )
                             telemetry.fallback_used = True
-                            telemetry.reason_code = telemetry.reason_code or "generator_output_invalid"
+                            telemetry.reason_code = (
+                                telemetry.reason_code or "generator_output_invalid"
+                            )
 
                         script_content = _build_exploration_script_template(
                             preprocessing_code,
@@ -3633,20 +4230,34 @@ def run_agent_loop(
                                     f"model.fit(X_train, y_train)\n"
                                     f"predictions = model.predict(X_test)\n"
                                 )
-                                regen_raw = _generate_autonomous_section_via_llm(strict_regen_prompt)
-                                regen_pre, regen_train = _parse_sectioned_autonomous_output(regen_raw)
-                                regen_pre = _remove_natural_language_from_code(regen_pre)
-                                regen_train = _remove_natural_language_from_code(regen_train)
+                                regen_raw = _generate_autonomous_section_via_llm(
+                                    strict_regen_prompt
+                                )
+                                regen_pre, regen_train = (
+                                    _parse_sectioned_autonomous_output(regen_raw)
+                                )
+                                regen_pre = _remove_natural_language_from_code(
+                                    regen_pre
+                                )
+                                regen_train = _remove_natural_language_from_code(
+                                    regen_train
+                                )
 
                                 if regen_pre and "train_test_split" in regen_pre:
                                     preprocessing_code = regen_pre
                                 regen_train = _sanitize_training_section(
                                     regen_train, disallow_model_redefinition=False
                                 )
-                                if regen_train and "model.fit" in regen_train and "predict" in regen_train:
+                                if (
+                                    regen_train
+                                    and "model.fit" in regen_train
+                                    and "predict" in regen_train
+                                ):
                                     training_code = regen_train
                                 else:
-                                    training_code = _fallback_training_section_without_model()
+                                    training_code = (
+                                        _fallback_training_section_without_model()
+                                    )
                                     telemetry.fallback_used = True
 
                                 script_content = _build_exploration_script_template(
@@ -3674,20 +4285,24 @@ def run_agent_loop(
                                 f"- Include predictions = model.predict(X_test)\n"
                                 f"- No imports/prints/markdown\n"
                             )
-                            script_content, training_code, used_fallback = _validate_and_regenerate_script(
-                                script_content=script_content,
-                                training_section=training_code or "",
-                                preprocessing_section=preprocessing_code,
-                                target_column=project_target_column,
-                                system_model_section="",  # No model injection
-                                is_model_injected=False,  # LLM generates model
-                                exploration_mode=False,
-                                exploitation_lock=False,
-                                original_prompt=recovery_prompt,
+                            script_content, training_code, used_fallback = (
+                                _validate_and_regenerate_script(
+                                    script_content=script_content,
+                                    training_section=training_code or "",
+                                    preprocessing_section=preprocessing_code,
+                                    target_column=project_target_column,
+                                    system_model_section="",  # No model injection
+                                    is_model_injected=False,  # LLM generates model
+                                    exploration_mode=False,
+                                    exploitation_lock=False,
+                                    original_prompt=recovery_prompt,
+                                )
                             )
                             if used_fallback:
                                 telemetry.fallback_used = True
-                                telemetry.reason_code = telemetry.reason_code or "validator_fail"
+                                telemetry.reason_code = (
+                                    telemetry.reason_code or "validator_fail"
+                                )
                         else:
                             telemetry.generator_success = True
                             telemetry.validator_pass = True
@@ -3709,12 +4324,24 @@ def run_agent_loop(
                             )
                             # Rebuild from deterministic fallback blueprint
                             _safe_bp = deterministic_blueprint(model_family)
-                            _safe_gen_prompt = blueprint_to_generator_prompt(_safe_bp, project_target_column)
-                            _safe_raw = _generate_autonomous_section_via_llm(_safe_gen_prompt)
-                            _safe_pre, _safe_train = _parse_sectioned_autonomous_output(_safe_raw)
-                            _safe_pre = _remove_natural_language_from_code(_safe_pre) or _fallback_preprocessing_section([])
-                            _safe_train = _remove_natural_language_from_code(_safe_train)
-                            _safe_train = _sanitize_training_section(_safe_train, disallow_model_redefinition=False)
+                            _safe_gen_prompt = blueprint_to_generator_prompt(
+                                _safe_bp, project_target_column
+                            )
+                            _safe_raw = _generate_autonomous_section_via_llm(
+                                _safe_gen_prompt
+                            )
+                            _safe_pre, _safe_train = _parse_sectioned_autonomous_output(
+                                _safe_raw
+                            )
+                            _safe_pre = _remove_natural_language_from_code(
+                                _safe_pre
+                            ) or _fallback_preprocessing_section([])
+                            _safe_train = _remove_natural_language_from_code(
+                                _safe_train
+                            )
+                            _safe_train = _sanitize_training_section(
+                                _safe_train, disallow_model_redefinition=False
+                            )
                             if not _safe_train or "model.fit" not in _safe_train:
                                 _safe_train = _fallback_training_section_without_model()
                             script_content = _build_exploration_script_template(
@@ -3723,15 +4350,21 @@ def run_agent_loop(
                             preprocessing_code = _safe_pre
                             training_code = _safe_train
                             telemetry.fallback_used = True
-                            telemetry.reason_code = telemetry.reason_code or "syntax_error_fallback"
+                            telemetry.reason_code = (
+                                telemetry.reason_code or "syntax_error_fallback"
+                            )
 
-                        model_scripts_data.append({
-                            "model_family": model_family,
-                            "script_content": script_content,
-                            "preprocessing_code": preprocessing_code,
-                            "training_code": training_code,
-                        })
-                        print(f"PARALLEL EXECUTION: Script validated for {model_family}")
+                        model_scripts_data.append(
+                            {
+                                "model_family": model_family,
+                                "script_content": script_content,
+                                "preprocessing_code": preprocessing_code,
+                                "training_code": training_code,
+                            }
+                        )
+                        print(
+                            f"PARALLEL EXECUTION: Script validated for {model_family}"
+                        )
                         if ENABLE_PROMPT_ARCHITECT:
                             telem_msg = (
                                 f"Telemetry [{model_family}]: "
@@ -3740,7 +4373,9 @@ def run_agent_loop(
                                 f"validator={'PASS' if telemetry.validator_pass else 'FAIL'}"
                             )
                             if telemetry.fallback_used:
-                                telem_msg += f" | fallback=YES ({telemetry.reason_code})"
+                                telem_msg += (
+                                    f" | fallback=YES ({telemetry.reason_code})"
+                                )
                             print(telem_msg)
                             _append_agent_sandbox_event(agent_run_id, telem_msg)
 
@@ -3750,19 +4385,34 @@ def run_agent_loop(
                         agent_run_id,
                         f"Stage: Training models - executing {len(model_scripts_data)} sandbox jobs",
                     )
-                    print(f"PARALLEL EXECUTION: Creating {len(model_scripts_data)} sandbox jobs...")
+                    print(
+                        f"PARALLEL EXECUTION: Creating {len(model_scripts_data)} sandbox jobs..."
+                    )
                     job_ids = []
                     model_names_by_job_id: Dict[uuid.UUID, str] = {}
                     for idx, script_data in enumerate(model_scripts_data):
-                        job_id = _create_sandbox_job(script_data["script_content"], current_iteration)
+                        print("=" * 100)
+                        print(f"MODEL FAMILY: {script_data['model_family']}")
+                        print("=" * 100)
+                        print("PREPROCESSING CODE:")
+                        print(script_data["preprocessing_code"])
+                        print("=" * 100)
+                        print("TRAINING CODE:")
+                        print(script_data["training_code"])
+                        print("=" * 100)
+                        job_id = _create_sandbox_job(
+                            script_data["script_content"], current_iteration
+                        )
                         job_ids.append(job_id)
                         model_names_by_job_id[job_id] = script_data["model_family"]
-                        print(f"PARALLEL EXECUTION: Created job {job_id} for {script_data['model_family']}")
+                        print(
+                            f"PARALLEL EXECUTION: Created job {job_id} for {script_data['model_family']}"
+                        )
                         _append_agent_sandbox_event(
                             agent_run_id,
                             f"Sandbox job created: {script_data['model_family']} ({job_id})",
                         )
-                        
+
                         # Update model status to training
                         _set_agent_model_status(
                             agent_run_id,
@@ -3772,9 +4422,15 @@ def run_agent_loop(
                         )
 
                     # Phase 3: Poll all jobs in parallel
-                    print(f"PARALLEL EXECUTION: Polling {len(job_ids)} jobs in parallel...")
-                    metrics_payloads = _poll_sandbox_jobs_parallel(job_ids, model_names_by_job_id)
-                    print(f"PARALLEL EXECUTION: All {len(metrics_payloads)} jobs reached terminal state")
+                    print(
+                        f"PARALLEL EXECUTION: Polling {len(job_ids)} jobs in parallel..."
+                    )
+                    metrics_payloads = _poll_sandbox_jobs_parallel(
+                        job_ids, model_names_by_job_id
+                    )
+                    print(
+                        f"PARALLEL EXECUTION: All {len(metrics_payloads)} jobs reached terminal state"
+                    )
                     _append_agent_sandbox_event(
                         agent_run_id,
                         f"All {len(metrics_payloads)} sandbox jobs reached terminal state.",
@@ -3792,7 +4448,7 @@ def run_agent_loop(
                         training_code = script_data["training_code"]
                         metrics_payload = metrics_payloads[idx]
                         model_rmse = metrics_payload.get("rmse")
-                        
+
                         # Update model status to completed
                         if model_rmse is not None:
                             _set_agent_model_status(
@@ -3814,15 +4470,21 @@ def run_agent_loop(
                                 f"Model {model_family} finished (no RMSE returned)",
                             )
 
-                        per_model_previous_preprocessing[model_family] = preprocessing_code
+                        per_model_previous_preprocessing[model_family] = (
+                            preprocessing_code
+                        )
                         per_model_previous_training[model_family] = training_code
 
                         # Capture error context for Prompt Architect next iteration
                         if ENABLE_PROMPT_ARCHITECT:
-                            _err_ctx = build_error_context({
-                                "status": metrics_payload.get("_sandbox_status", "completed"),
-                                "error_log": metrics_payload.get("_error_message"),
-                            })
+                            _err_ctx = build_error_context(
+                                {
+                                    "status": metrics_payload.get(
+                                        "_sandbox_status", "completed"
+                                    ),
+                                    "error_log": metrics_payload.get("_error_message"),
+                                }
+                            )
                             per_model_last_error[model_family] = _err_ctx
                             if _err_ctx.error_type != "none":
                                 _err_log_msg = (
@@ -3835,7 +4497,10 @@ def run_agent_loop(
 
                         if model_rmse is not None:
                             prior_best_for_model = per_model_best_rmse.get(model_family)
-                            if prior_best_for_model is None or model_rmse < prior_best_for_model:
+                            if (
+                                prior_best_for_model is None
+                                or model_rmse < prior_best_for_model
+                            ):
                                 per_model_best_rmse[model_family] = model_rmse
 
                         model_result_payload = {
@@ -3860,21 +4525,31 @@ def run_agent_loop(
                             current_iter_training_code = training_code
 
                     if not per_model_results:
-                        raise RuntimeError("No model scripts executed in sandbox iteration")
+                        raise RuntimeError(
+                            "No model scripts executed in sandbox iteration"
+                        )
 
                     if best_model_payload is None:
                         sorted_results = sorted(
                             per_model_results,
                             key=lambda item: (
                                 item.get("rmse") is None,
-                                item.get("rmse") if item.get("rmse") is not None else float("inf"),
+                                (
+                                    item.get("rmse")
+                                    if item.get("rmse") is not None
+                                    else float("inf")
+                                ),
                             ),
                         )
                         best_model_payload = dict(sorted_results[0])
                         generated_model_family = best_model_payload.get("name")
 
                     if current_iter_preprocessing_code:
-                        current_preprocessing_tokens = _extract_preprocessing_tokens_from_code(current_iter_preprocessing_code)
+                        current_preprocessing_tokens = (
+                            _extract_preprocessing_tokens_from_code(
+                                current_iter_preprocessing_code
+                            )
+                        )
                         preprocessing_history.append(current_preprocessing_tokens)
                         preprocessing_history = preprocessing_history[-20:]
 
@@ -3886,7 +4561,7 @@ def run_agent_loop(
                         "best_model": best_model_payload,
                         "all_models": per_model_results,
                     }
-                    
+
                     # Clear models in progress for this agent after iteration completes
                     if str(agent_run_id) in AGENT_MODELS_IN_PROGRESS:
                         del AGENT_MODELS_IN_PROGRESS[str(agent_run_id)]
@@ -3915,7 +4590,10 @@ def run_agent_loop(
                 best_model = training_output.get("best_model", {})
                 current_model_family = generated_model_family or best_model.get("name")
                 if isinstance(current_model_family, str) and current_model_family:
-                    if previous_model_family and previous_model_family != current_model_family:
+                    if (
+                        previous_model_family
+                        and previous_model_family != current_model_family
+                    ):
                         model_family_changed_once = True
                         print(
                             f"MODEL FAMILY CHANGED: {previous_model_family} -> {current_model_family}"
@@ -3924,7 +4602,9 @@ def run_agent_loop(
                     model_history.append(current_model_family)
                     model_history = model_history[-20:]
                 current_rmse = best_model.get("rmse")
-                print(f"ITERATION {current_iteration} RESULT → Model: {best_model.get('name')}, RMSE: {best_model.get('rmse')}")
+                print(
+                    f"ITERATION {current_iteration} RESULT → Model: {best_model.get('name')}, RMSE: {best_model.get('rmse')}"
+                )
 
                 all_models = training_output.get("all_models")
                 if not isinstance(all_models, list):
@@ -3945,7 +4625,9 @@ def run_agent_loop(
                     hyperparameters = model_data.get("hyperparameters")
 
                     try:
-                        rmse_value = float(rmse_value) if rmse_value is not None else None
+                        rmse_value = (
+                            float(rmse_value) if rmse_value is not None else None
+                        )
                     except (TypeError, ValueError):
                         rmse_value = None
 
@@ -3979,7 +4661,11 @@ def run_agent_loop(
                     normalized_models,
                     key=lambda item: (
                         item.get("rmse") is None,
-                        item.get("rmse") if item.get("rmse") is not None else float("inf"),
+                        (
+                            item.get("rmse")
+                            if item.get("rmse") is not None
+                            else float("inf")
+                        ),
                     ),
                 )
 
@@ -4030,9 +4716,17 @@ def run_agent_loop(
 
                 # ── Phase E: Insert experiment memory record ──
                 if project_dataset_fingerprint and project_dataset_profile:
-                    mem_rmse_cv = sandbox_rmse_cv if execution_mode == "sandbox" else None
-                    mem_rmse_holdout = sandbox_rmse_holdout if execution_mode == "sandbox" else None
-                    if mem_rmse_cv is None and mem_rmse_holdout is None and current_rmse is not None:
+                    mem_rmse_cv = (
+                        sandbox_rmse_cv if execution_mode == "sandbox" else None
+                    )
+                    mem_rmse_holdout = (
+                        sandbox_rmse_holdout if execution_mode == "sandbox" else None
+                    )
+                    if (
+                        mem_rmse_cv is None
+                        and mem_rmse_holdout is None
+                        and current_rmse is not None
+                    ):
                         mem_rmse_holdout = current_rmse
                     mem_preprocess_tokens = _extract_preprocessing_tokens_from_code(
                         current_iter_preprocessing_code or ""
@@ -4044,9 +4738,12 @@ def run_agent_loop(
                     mem_training_tokens_real = []
                     if current_iter_training_code:
                         for tok_name, tok_pat in [
-                            ("cv", "cross_val_score"), ("grid_search", "GridSearchCV"),
-                            ("random_search", "RandomizedSearchCV"), ("early_stopping", "early_stopping"),
-                            ("regularization", "alpha="), ("fit", "model.fit("),
+                            ("cv", "cross_val_score"),
+                            ("grid_search", "GridSearchCV"),
+                            ("random_search", "RandomizedSearchCV"),
+                            ("early_stopping", "early_stopping"),
+                            ("regularization", "alpha="),
+                            ("fit", "model.fit("),
                         ]:
                             if tok_pat in (current_iter_training_code or ""):
                                 mem_training_tokens_real.append(tok_name)
@@ -4057,7 +4754,8 @@ def run_agent_loop(
                             db=mem_db,
                             dataset_fingerprint=project_dataset_fingerprint,
                             dataset_profile=project_dataset_profile,
-                            model_family=generated_model_family or previous_model_family,
+                            model_family=generated_model_family
+                            or previous_model_family,
                             preprocessing_tokens=mem_preprocess_tokens,
                             training_tokens=mem_training_tokens_real,
                             strategy_summary=mem_strategy,
@@ -4080,12 +4778,9 @@ def run_agent_loop(
                 elif "sandbox" in lower_exc:
                     failure_type = "sandbox_failed"
 
-                infrastructure_failure = (
-                    execution_mode == "sandbox"
-                    and (
-                        "sandbox worker appears offline" in lower_exc
-                        or "never started" in lower_exc
-                    )
+                infrastructure_failure = execution_mode == "sandbox" and (
+                    "sandbox worker appears offline" in lower_exc
+                    or "never started" in lower_exc
                 )
 
                 previous_failure_types.append(failure_type)
@@ -4146,12 +4841,17 @@ def run_agent_loop(
 
             rmse_history.append(current_rmse)
             rmse_history = rmse_history[-20:]
-            improvement_delta = None if last_rmse is None else (last_rmse - current_rmse)
+            improvement_delta = (
+                None if last_rmse is None else (last_rmse - current_rmse)
+            )
             last_rmse = current_rmse
             _append_agent_sandbox_event(
                 agent_run_id,
-                f"Iteration {current_iteration} RMSE: {current_rmse:.6f}" + (
-                    f" (delta: {improvement_delta:+.6f})" if improvement_delta is not None else ""
+                f"Iteration {current_iteration} RMSE: {current_rmse:.6f}"
+                + (
+                    f" (delta: {improvement_delta:+.6f})"
+                    if improvement_delta is not None
+                    else ""
                 ),
             )
 
@@ -4187,8 +4887,10 @@ def run_agent_loop(
                     if lock_candidate:
                         exploitation_lock_counter = EXPLOITATION_LOCK_N
                         exploitation_lock_model = lock_candidate
-                        print(f"EXPLOITATION LOCK ACTIVATED: model={exploitation_lock_model}, "
-                              f"iterations_locked={EXPLOITATION_LOCK_N}")
+                        print(
+                            f"EXPLOITATION LOCK ACTIVATED: model={exploitation_lock_model}, "
+                            f"iterations_locked={EXPLOITATION_LOCK_N}"
+                        )
 
             if execution_mode == "sandbox" and current_iter_preprocessing_code:
                 previous_preprocessing_code = current_iter_preprocessing_code
@@ -4220,7 +4922,9 @@ def run_agent_loop(
                         finally:
                             refinement_db.close()
 
-                    print("REFINEMENT PHASE: Attempting fine-tuning of best model before stopping.")
+                    print(
+                        "REFINEMENT PHASE: Attempting fine-tuning of best model before stopping."
+                    )
                     continue
 
                 print("EARLY STOPPING: Patience limit reached.")
@@ -4228,7 +4932,9 @@ def run_agent_loop(
 
         finalize_db = SessionLocal()
         try:
-            agent_run = finalize_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+            agent_run = (
+                finalize_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+            )
             if agent_run is None:
                 return
 
@@ -4246,7 +4952,8 @@ def run_agent_loop(
                     agent_run.error_message = None
                     completion_msg = (
                         f"Training completed successfully! Best RMSE: {best_rmse:.6f}"
-                        if best_rmse else "Training completed successfully!"
+                        if best_rmse
+                        else "Training completed successfully!"
                     )
                     _append_agent_sandbox_event(agent_run_id, completion_msg)
                 agent_run.completed_at = datetime.now(timezone.utc)
@@ -4260,7 +4967,9 @@ def run_agent_loop(
     except Exception as exc:
         failure_db = SessionLocal()
         try:
-            agent_run = failure_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+            agent_run = (
+                failure_db.query(AgentRun).filter(AgentRun.id == agent_run_id).first()
+            )
             if agent_run is not None:
                 agent_run.status = "failed"
                 agent_run.error_message = str(exc)
@@ -4275,78 +4984,77 @@ def run_agent_loop(
 def train_regression_models(file_path: Path, target_column: str) -> Dict[str, Any]:
     """
     Train multiple regression models and evaluate their performance.
-    
+
     Args:
         file_path: Path to the CSV file
         target_column: Name of the target column
-        
+
     Returns:
         Dictionary containing model results and best model
     """
     # Load dataset
     df = pd.read_csv(file_path)
     validate_dataset_limits(df)
-    
+
     # Validate target column exists
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' not found in dataset.")
-    
+
     # Validate target is numeric
     if not pd.api.types.is_numeric_dtype(df[target_column]):
         raise ValueError("Target column must be numeric for regression.")
-    
+
     # Split features and target
     X = df.drop(columns=[target_column])
     y = df[target_column]
-    
+
     # Handle categorical columns with one-hot encoding
     X = pd.get_dummies(X, drop_first=True)
-    
+
     # Split into train and test sets
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
-    
+
     # Define models to train
     models = {
         "LinearRegression": LinearRegression(),
         "Ridge": Ridge(),
         "RandomForestRegressor": RandomForestRegressor(random_state=42),
-        "XGBRegressor": XGBRegressor(random_state=42, verbosity=0)
+        "XGBRegressor": XGBRegressor(random_state=42, verbosity=0),
     }
-    
+
     # Train and evaluate each model
     results = []
-    
+
     for model_name, model in models.items():
         # Train the model
         model.fit(X_train, y_train)
-        
+
         # Make predictions
         y_pred = model.predict(X_test)
-        
+
         # Calculate metrics
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         mae = mean_absolute_error(y_test, y_pred)
         r2 = r2_score(y_test, y_pred)
-        
-        results.append({
-            "name": model_name,
-            "rmse": float(rmse),
-            "mae": float(mae),
-            "r2": float(r2)
-        })
-    
+
+        results.append(
+            {
+                "name": model_name,
+                "rmse": float(rmse),
+                "mae": float(mae),
+                "r2": float(r2),
+            }
+        )
+
     # Sort by RMSE (ascending - lower is better)
     results.sort(key=lambda x: x["rmse"])
-    
+
     # Best model is the first one after sorting
     best_model = results[0]
-    
-    return {
-        "models": results,
-        "best_model": best_model
-    }
+
+    return {"models": results, "best_model": best_model}
 
 
 def _execute_start_training_with_progress(
@@ -4365,17 +5073,28 @@ def _execute_start_training_with_progress(
     if lifecycle_update is not None:
         lifecycle_update("analyzing_dataset", 10)
     elif job_id is not None:
-        _update_job_status(job_id, status="running", stage="analyzing_dataset", progress=10)
+        _update_job_status(
+            job_id, status="running", stage="analyzing_dataset", progress=10
+        )
     _append_job_log(job_id, "Analyzing dataset")
 
     if not file_path.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"File '{file_id}' not found. Please upload a CSV file first."
+            detail=f"File '{file_id}' not found. Please upload a CSV file first.",
         )
 
     df = pd.read_csv(file_path)
     validate_dataset_limits(df)
+
+    # Backstop. run_agent_loop() calls this worker directly (lines ~4405,
+    # 4412, 4419) with no HTTP layer in front of it, so the guard has to live
+    # here as well as in /training/start. cv_folds is consumed by
+    # _train_and_evaluate() below.
+    readiness = assess_training_readiness(df)
+    if not readiness["ready"]:
+        raise HTTPException(status_code=400, detail=readiness["reason"])
+    cv_folds = readiness["n_folds"]
 
     if lifecycle_update is not None:
         lifecycle_update("preprocessing", 20)
@@ -4417,23 +5136,30 @@ def _execute_start_training_with_progress(
 
     # Default mode: train all supported models.
     # Directed mode: train only the requested model with provided hyperparameters.
+
     directed_hyperparameters_by_model: Dict[str, Dict[str, Any]] = {}
-    if hyperparameter_overrides is None:
-        models = {
-            "LinearRegression": _build_model("LinearRegression", {}),
-            "Ridge": _build_model("Ridge", {}),
-            "Lasso": _build_model("Lasso", {}),
-            "ElasticNet": _build_model("ElasticNet", {}),
-            "RandomForestRegressor": _build_model("RandomForestRegressor", {}),
-            "XGBRegressor": _build_model("XGBRegressor", {}),
-        }
-    else:
+    models = {
+        "LinearRegression": _build_model("LinearRegression", {}),
+        "Ridge": _build_model("Ridge", {}),
+        "Lasso": _build_model("Lasso", {}),
+        "ElasticNet": _build_model("ElasticNet", {}),
+        "RandomForestRegressor": _build_model("RandomForestRegressor", {}),
+        "XGBRegressor": _build_model("XGBRegressor", {}),
+    }
+
+    if hyperparameter_overrides is not None:
         if not isinstance(hyperparameter_overrides, dict):
             raise ValueError("hyperparameter_overrides must be a dictionary")
 
         directed_model_name = hyperparameter_overrides.get("model_name")
         if not isinstance(directed_model_name, str) or not directed_model_name:
             raise ValueError("hyperparameter_overrides.model_name is required")
+
+        if directed_model_name not in models:
+            raise ValueError(
+                f"hyperparameter_overrides.model_name '{directed_model_name}' "
+                f"is not a supported candidate model"
+            )
 
         raw_hyperparameters = hyperparameter_overrides.get("hyperparameters", {})
         if not isinstance(raw_hyperparameters, dict):
@@ -4443,14 +5169,13 @@ def _execute_start_training_with_progress(
             directed_model_name,
             raw_hyperparameters,
         )
+
         directed_hyperparameters_by_model[directed_model_name] = validated_hyperparameters
 
-        models = {
-            directed_model_name: _build_model(
-                directed_model_name,
-                validated_hyperparameters,
-            )
-        }
+        models[directed_model_name] = _build_model(
+            directed_model_name,
+            validated_hyperparameters,
+        )
 
     if lifecycle_update is not None:
         lifecycle_update("training_models", 40)
@@ -4459,6 +5184,7 @@ def _execute_start_training_with_progress(
     _append_job_log(job_id, "Training candidate models")
 
     def _train_and_evaluate() -> List[Dict[str, Any]]:
+        print("******** TRAIN FUNCTION CALLED ********")
         from sklearn.model_selection import KFold
         from sklearn.preprocessing import StandardScaler
         from sklearn.compose import ColumnTransformer
@@ -4466,22 +5192,30 @@ def _execute_start_training_with_progress(
 
         metrics: List[Dict[str, Any]] = []
         numeric_columns = X.select_dtypes(include=["number"]).columns
+        print("=" * 80)
+        print(f"X Shape: {X.shape}")
+        print(f"Y Shape: {y.shape}")
+        print(f"Numeric Columns: {list(numeric_columns)}")
+        print(f"Target Unique Values: {y.nunique()}")
+        print("=" * 80)
+
+        # One splitter for every model: identical folds, so the leaderboard
+        # compares models rather than fold luck. cv_folds comes from
+        # assess_training_readiness() in the enclosing function and is 5 for
+        # any dataset of 30+ rows - unchanged from the previous behaviour.
+        kfold = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
 
         for model_name, model_instance in models.items():
             _append_job_log(job_id, f"Training model: {model_name}")
-            kfold = KFold(n_splits=5, shuffle=True, random_state=42)
 
             preprocessor = ColumnTransformer(
-                transformers=[
-                    ("num", StandardScaler(), numeric_columns)
-                ],
-                remainder="passthrough"
+                transformers=[("num", StandardScaler(), numeric_columns)],
+                remainder="passthrough",
             )
-            model_pipeline = Pipeline([
-                ("preprocessor", preprocessor),
-                ("model", model_instance)
-            ])
 
+            model_pipeline = Pipeline(
+                [("preprocessor", preprocessor), ("model", model_instance)]
+            )
             rmse_list: List[float] = []
             mae_list: List[float] = []
             r2_list: List[float] = []
@@ -4495,7 +5229,9 @@ def _execute_start_training_with_progress(
                 model_pipeline.fit(X_train_fold, y_train_fold)
                 y_pred_fold = model_pipeline.predict(X_val_fold)
 
-                rmse_list.append(float(np.sqrt(mean_squared_error(y_val_fold, y_pred_fold))))
+                rmse_list.append(
+                    float(np.sqrt(mean_squared_error(y_val_fold, y_pred_fold)))
+                )
                 mae_list.append(float(mean_absolute_error(y_val_fold, y_pred_fold)))
                 r2_list.append(float(r2_score(y_val_fold, y_pred_fold)))
 
@@ -4503,13 +5239,21 @@ def _execute_start_training_with_progress(
             mae = float(np.mean(mae_list))
             r2 = float(np.mean(r2_list))
 
-            metrics.append({
-                "name": model_name,
-                "rmse": float(rmse),
-                "mae": float(mae),
-                "r2": float(r2),
-                "hyperparameters": directed_hyperparameters_by_model.get(model_name),
-            })
+            print(
+                f"MODEL={model_name} | RMSE={rmse:.6f} | MAE={mae:.6f} | R2={r2:.6f}"
+            )
+
+            metrics.append(
+                {
+                    "name": model_name,
+                    "rmse": float(rmse),
+                    "mae": float(mae),
+                    "r2": float(r2),
+                    "hyperparameters": directed_hyperparameters_by_model.get(
+                        model_name
+                    ),
+                }
+            )
             _append_job_log(job_id, f"Completed model: {model_name} | RMSE={rmse:.4f}")
         return metrics
 
@@ -4537,17 +5281,16 @@ def _execute_start_training_with_progress(
     else:
         version = len(TRAINING_HISTORY[file_id]) + 1
 
-    version_entry = {
-        "version": version,
-        "models": results,
-        "best_model": best_model
-    }
+    version_entry = {"version": version, "models": results, "best_model": best_model}
     TRAINING_HISTORY[file_id].append(copy.deepcopy(version_entry))
 
     return {
         "version": version,
         "models": results,
-        "best_model": best_model
+        "best_model": best_model,
+        "dataset_rows": readiness["n_rows"],
+        "cv_folds": cv_folds,
+        "warnings": readiness["warnings"],
     }
 
 
@@ -4563,7 +5306,9 @@ async def upload_temp_file(
 
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="File too large. Max 20 MB allowed.")
+        raise HTTPException(
+            status_code=413, detail="File too large. Max 20 MB allowed."
+        )
 
     unique_filename = f"{uuid.uuid4()}.csv"
     file_path = UPLOAD_DIR / unique_filename
@@ -4593,7 +5338,9 @@ async def upload_temp_file(
         num_numeric_features=len(numeric_cols),
         num_categorical_features=len(categorical_cols),
         missing_value_count=int(df.isnull().sum().sum()),
-        target_variance=float(df[target_col].var()) if target_col in numeric_cols else 0.0,
+        target_variance=(
+            float(df[target_col].var()) if target_col in numeric_cols else 0.0
+        ),
     )
     db.add(project)
     db.commit()
@@ -4601,39 +5348,295 @@ async def upload_temp_file(
     return {"file_id": unique_filename}
 
 
+# =============================================================================
+# AutoAI Builder - Database Connectivity (Step 2)
+#
+# HOW TO USE THIS FILE
+#
+#   1. Open  backend/main.py  in your editor.
+#   2. Press Ctrl+F and search for this exact text:
+#
+#          @app.post("/projects/create")
+#
+#   3. Click at the START of that line to put your cursor there.
+#   4. Copy EVERYTHING in this file from the line below marked
+#      "COPY FROM HERE" all the way to the bottom, and paste it.
+#   5. Save the file.
+#
+#   The import is included at the top of the block, so this is the ONLY
+#   place you need to paste. There is no second edit.
+#
+# =============================================================================
+
+
+# ============================ COPY FROM HERE =================================
+
+# ---------------------------------------------------------------------------
+# Database Connectivity - lets a user pull data from their own SQL Server or
+# PostgreSQL database instead of uploading a CSV.
+#
+# The design point: /datasource/extract saves the query result into uploads/
+# and returns a file_id in exactly the same format /projects/create does.
+# Because every downstream feature reads UPLOAD_DIR / file_id, training, the
+# agent, transform, results and downloads all work with no further changes.
+# ---------------------------------------------------------------------------
+
+from services.db_connector import (
+    DataSourceError,
+    build_connection_string,
+    extract_to_dataframe,
+    list_tables,
+    list_columns,
+    list_foreign_keys,
+    preview_to_dataframe,
+    test_connection as test_db_connection,
+)
+
+
+class DataSourceConnection(BaseModel):
+    """Connection details. Sent with every call and never stored on disk."""
+
+    db_type: str = Field(default="mssql", description="'mssql' or 'postgresql'")
+    host: str = Field(..., description="Server hostname or IP, e.g. localhost")
+    port: Optional[int] = Field(default=None, description="Defaults to 1433 / 5432")
+    database: str = Field(..., description="Database name")
+    username: Optional[str] = Field(default=None)
+    password: Optional[str] = Field(default=None)
+    trusted_connection: bool = Field(
+        default=False, description="SQL Server Windows Authentication"
+    )
+    odbc_driver: Optional[str] = Field(
+        default=None, description="Override the ODBC driver name if needed"
+    )
+
+
+class DataSourceQueryRequest(DataSourceConnection):
+    query: str = Field(..., description="A single SELECT statement")
+
+
+class DataSourceExtractRequest(DataSourceQueryRequest):
+    project_name: str = Field(..., description="Name for the new project")
+    target_column: Optional[str] = Field(
+        default=None, description="Column to predict. Defaults to the last column."
+    )
+
+
+def _connection_string_from(request: DataSourceConnection) -> str:
+    """Turn the request fields into a connection URL, or raise a 400."""
+    try:
+        return build_connection_string(
+            db_type=request.db_type,
+            host=request.host,
+            port=request.port,
+            database=request.database,
+            username=request.username,
+            password=request.password,
+            trusted_connection=request.trusted_connection,
+            odbc_driver=request.odbc_driver,
+        )
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _rows_as_json(df: pd.DataFrame, limit: int = 20) -> list:
+    """Convert sample rows to plain JSON, avoiding UUID/timestamp
+    serialization issues from pandas.to_json()."""
+
+    preview_df = df.head(limit).copy()
+
+    # Convert all values to strings so FastAPI can safely return them.
+    preview_df = preview_df.astype(str)
+
+    return preview_df.to_dict(orient="records")
+
+
+@app.post("/datasource/test")
+async def datasource_test(request: DataSourceConnection):
+    """Check that the database is reachable before the user types a query."""
+    connection_string = _connection_string_from(request)
+    try:
+        info = test_db_connection(connection_string)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"ok": True, "server_version": info["server_version"]}
+
+
+@app.post("/datasource/tables")
+async def datasource_tables(request: DataSourceConnection):
+    """List the tables and views the user can choose from."""
+    connection_string = _connection_string_from(request)
+    try:
+        tables = list_tables(connection_string)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"tables": tables, "count": len(tables)}
+
+
+@app.post("/datasource/preview")
+async def datasource_preview(request: DataSourceQueryRequest):
+    """Run the query and show the columns and a few rows. Saves nothing.
+
+    This is what lets the user pick a target column before committing, the same
+    way the CSV screen reads the file before asking for a target.
+    """
+    connection_string = _connection_string_from(request)
+    try:
+        df, has_more = preview_to_dataframe(connection_string, request.query)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+    return {
+        "preview_rows": len(df),
+        "has_more": has_more,
+        "columns": len(df.columns),
+        "column_names": [str(c) for c in df.columns],
+        "numeric_columns": [str(c) for c in numeric_cols],
+        "sample_rows": _rows_as_json(df, limit=len(df)),
+    }
+
+
+@app.post("/datasource/extract")
+async def datasource_extract(
+    request: DataSourceExtractRequest,
+    db: Session = Depends(get_db),
+):
+    """Run the query, save the result as a CSV in uploads/, and create a
+    Project - exactly as if the user had uploaded that CSV by hand.
+
+    Returns a file_id. Every existing feature (training, agent, transform,
+    results, downloads) then works with no further change.
+    """
+    connection_string = _connection_string_from(request)
+
+    # 1. Pull the data
+    try:
+        df = extract_to_dataframe(connection_string, request.query)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # 2. Apply the same row/column limits as an uploaded CSV
+    validate_dataset_limits(df)
+
+    # 3. Work out the target column
+    target_column = request.target_column or str(df.columns[-1])
+    if target_column not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Target column '{target_column}' is not in the query result. "
+                f"Available columns: {', '.join(map(str, df.columns))}"
+            ),
+        )
+
+    # Same rule the CSV path enforces today (regression only).
+    if not pd.api.types.is_numeric_dtype(df[target_column]):
+        raise HTTPException(
+            status_code=400,
+            detail="Currently only regression (numeric target) is supported.",
+        )
+
+    # 4. Save it into uploads/ under a generated file_id
+    unique_filename = f"{uuid.uuid4()}.csv"
+    file_path = UPLOAD_DIR / unique_filename
+    try:
+        df.to_csv(file_path, index=False)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Could not save the extracted data: {exc}"
+        )
+
+    # 5. Create the Project row, mirroring /projects/create
+    try:
+        numeric_features = df.drop(columns=[target_column]).select_dtypes(
+            include=["number"]
+        )
+        categorical_features = df.drop(columns=[target_column]).select_dtypes(
+            exclude=["number"]
+        )
+
+        dataset_profile = _build_dataset_profile(df, target_column)
+        dataset_profile_summary = _summarize_dataset_profile(dataset_profile)
+
+        new_project = Project(
+            project_name=request.project_name,
+            file_id=unique_filename,
+            target_column=target_column,
+            num_rows=len(df),
+            num_features=df.shape[1] - 1,
+            num_numeric_features=numeric_features.shape[1],
+            num_categorical_features=categorical_features.shape[1],
+            missing_value_count=int(df.isnull().sum().sum()),
+            target_variance=float(df[target_column].var()),
+        )
+        db.add(new_project)
+        db.commit()
+        db.refresh(new_project)
+
+        db.add(
+            DatasetProfile(
+                project_id=new_project.id,
+                profile_json=dataset_profile,
+            )
+        )
+    except Exception as e:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Database insert failed: {str(e)}")
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "project_id": str(new_project.id),
+            "project_name": request.project_name,
+            "file_id": unique_filename,
+            "target_column": target_column,
+            "rows": len(df),
+            "columns": len(df.columns),
+            "source": f"{request.db_type}://{request.host}/{request.database}",
+            "dataset_profile_summary": dataset_profile_summary,
+        },
+    )
+
+
+# ============================= END OF PASTE ==================================
+
+
 @app.post("/projects/create")
 async def create_project(
     project_name: str = Form(..., description="Name of the project"),
     target_column: str = Form(..., description="Target column for regression"),
-    file: UploadFile = File(..., description="CSV file to upload")
+    file: UploadFile = File(..., description="CSV file to upload"),
 ):
     """
     Create a new project by uploading a CSV file.
-    
+
     Validates that the target column exists and is numeric (regression only).
     Returns project metadata including row/column counts and column names.
     """
     try:
         # Validate file extension
-        if not file.filename.endswith('.csv'):
+        if not file.filename.endswith(".csv"):
             raise HTTPException(
                 status_code=400,
-                detail="Only CSV files are supported. Please upload a .csv file."
+                detail="Only CSV files are supported. Please upload a .csv file.",
             )
-        
+
         # Generate unique filename
         file_extension = Path(file.filename).suffix
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = UPLOAD_DIR / unique_filename
-        
+
         # Save uploaded file
         try:
             contents = await file.read()
 
             if len(contents) > MAX_FILE_SIZE_BYTES:
                 raise HTTPException(
-                    status_code=413,
-                    detail="File too large. Max 20MB allowed."
+                    status_code=413, detail="File too large. Max 20MB allowed."
                 )
 
             with open(file_path, "wb") as f:
@@ -4641,42 +5644,43 @@ async def create_project(
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error"
-            )
-        
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
         # Read and analyze CSV
         try:
             df = pd.read_csv(file_path)
             validate_dataset_limits(df)
             project_id = None
-            
+
             # Validate target column exists
             if target_column not in df.columns:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Target column '{target_column}' not found in CSV. Available columns: {', '.join(df.columns.tolist())}"
+                    detail=f"Target column '{target_column}' not found in CSV. Available columns: {', '.join(df.columns.tolist())}",
                 )
-            
+
             # Validate target column is numeric (regression only)
             if not pd.api.types.is_numeric_dtype(df[target_column]):
                 raise HTTPException(
                     status_code=400,
-                    detail="Currently only regression (numeric target) is supported."
+                    detail="Currently only regression (numeric target) is supported.",
                 )
 
             num_rows = len(df)
             num_features = df.shape[1] - 1
-            numeric_features = df.drop(columns=[target_column]).select_dtypes(include=["number"])
-            categorical_features = df.drop(columns=[target_column]).select_dtypes(exclude=["number"])
+            numeric_features = df.drop(columns=[target_column]).select_dtypes(
+                include=["number"]
+            )
+            categorical_features = df.drop(columns=[target_column]).select_dtypes(
+                exclude=["number"]
+            )
             num_numeric_features = numeric_features.shape[1]
             num_categorical_features = categorical_features.shape[1]
             missing_value_count = int(df.isnull().sum().sum())
             target_variance = float(df[target_column].var())
             dataset_profile = _build_dataset_profile(df, target_column)
             dataset_profile_summary = _summarize_dataset_profile(dataset_profile)
-            
+
             db = SessionLocal()
             try:
                 new_project = Project(
@@ -4705,10 +5709,7 @@ async def create_project(
                 db.rollback()
                 if file_path.exists():
                     os.remove(file_path)
-                raise HTTPException(
-                    status_code=500,
-                    detail="Database insert failed"
-                )
+                raise HTTPException(status_code=500, detail="Database insert failed")
             finally:
                 db.close()
 
@@ -4722,12 +5723,9 @@ async def create_project(
                 "dataset_profile_summary": dataset_profile_summary,
             }
             print(f"[DEBUG] /projects/create response: {response_data}")
-            
-            return JSONResponse(
-                status_code=201,
-                content=response_data
-            )
-            
+
+            return JSONResponse(status_code=201, content=response_data)
+
         except HTTPException:
             if file_path.exists():
                 os.remove(file_path)
@@ -4737,40 +5735,30 @@ async def create_project(
             if file_path.exists():
                 os.remove(file_path)
             raise HTTPException(
-                status_code=400,
-                detail="The uploaded CSV file is empty."
+                status_code=400, detail="The uploaded CSV file is empty."
             )
         except pd.errors.ParserError as e:
             # Clean up the invalid file
             if file_path.exists():
                 os.remove(file_path)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid CSV format: {str(e)}"
-            )
+            raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
         except Exception:
             # Clean up on any other error
             if file_path.exists():
                 os.remove(file_path)
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error"
-            )
-            
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail="Internal Server Error"
-        )
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 @app.post("/training/start")
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
     """
     Start training regression models on the uploaded dataset.
-    
+
     Trains models asynchronously and returns a job ID immediately.
     """
     try:
@@ -4778,13 +5766,31 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
 
         # Construct file path
         file_path = UPLOAD_DIR / request.file_id
-        
+
         # Check if file exists
         if not file_path.exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"File '{request.file_id}' not found. Please upload a CSV file first."
+                detail=f"File '{request.file_id}' not found. Please upload a CSV file first.",
             )
+
+        # Refuse a dataset too small to evaluate BEFORE queueing a job, so the
+        # user gets an immediate, readable 400 instead of a 200 followed by a
+        # failed background job they have to poll for.
+        try:
+            readiness_df = pd.read_csv(file_path)
+        except Exception:
+            # Unreadable file is not this check's problem - let the existing
+            # training path report it the way it always has.
+            readiness_df = None
+
+        if readiness_df is not None:
+            readiness = assess_training_readiness(readiness_df)
+            if not readiness["ready"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=readiness["reason"],
+                )
 
         job_id = str(uuid.uuid4())
         JOB_STATUS[job_id] = {
@@ -4799,27 +5805,17 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         _append_job_log(job_id, "Training job queued")
 
         background_tasks.add_task(
-            run_training_job,
-            job_id,
-            request.file_id,
-            request.target_column
+            run_training_job, job_id, request.file_id, request.target_column
         )
 
         return JSONResponse(
-            status_code=200,
-            content={
-                "job_id": job_id,
-                "status": "started"
-            }
+            status_code=200, content={"job_id": job_id, "status": "started"}
         )
-            
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail="Internal Server Error"
-        )
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 @app.post("/agent/start")
@@ -4832,7 +5828,9 @@ async def start_agent(request: AgentStartRequest, background_tasks: BackgroundTa
 
     db = SessionLocal()
     try:
-        project = db.query(Project).filter(Project.id == str(request.project_id)).first()
+        project = (
+            db.query(Project).filter(Project.id == str(request.project_id)).first()
+        )
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -4870,7 +5868,9 @@ async def start_agent(request: AgentStartRequest, background_tasks: BackgroundTa
 
 
 @app.post("/agent/start-by-file")
-async def start_agent_by_file(request: AgentStartByFileRequest, background_tasks: BackgroundTasks):
+async def start_agent_by_file(
+    request: AgentStartByFileRequest, background_tasks: BackgroundTasks
+):
     """
     Start autonomous agent loop using file_id (frontend-friendly bridge).
     """
@@ -4962,7 +5962,9 @@ def get_agent_status(agent_id: uuid.UUID, db: Session = Depends(get_db)):
         if latest_run.error_message and not error_message:
             error_message = latest_run.error_message
 
-    logs.append(f"Agent iteration: {agent_run.current_iteration}/{agent_run.max_iterations}")
+    logs.append(
+        f"Agent iteration: {agent_run.current_iteration}/{agent_run.max_iterations}"
+    )
     if stage:
         logs.append(f"Current stage: {stage}")
     if best_model_name:
@@ -4972,7 +5974,7 @@ def get_agent_status(agent_id: uuid.UUID, db: Session = Depends(get_db)):
     sandbox_event_logs = AGENT_SANDBOX_EVENT_LOGS.get(str(agent_id), [])
     if sandbox_event_logs:
         logs.extend(sandbox_event_logs)
-    
+
     # Get models currently being trained in parallel
     models_in_progress = AGENT_MODELS_IN_PROGRESS.get(str(agent_id), [])
 
@@ -4980,7 +5982,9 @@ def get_agent_status(agent_id: uuid.UUID, db: Session = Depends(get_db)):
         if agent_run.max_iterations == 0:
             progress = 0
         else:
-            progress = int(round((agent_run.current_iteration / agent_run.max_iterations) * 100))
+            progress = int(
+                round((agent_run.current_iteration / agent_run.max_iterations) * 100)
+            )
 
     if agent_run.max_iterations == 0:
         progress_percent = 0.0
@@ -5012,7 +6016,9 @@ def get_agent_status(agent_id: uuid.UUID, db: Session = Depends(get_db)):
             "best_model_name": best_model_name,
             "best_rmse": best_rmse,
         },
-        "completed_at": agent_run.completed_at.isoformat() if agent_run.completed_at else None,
+        "completed_at": (
+            agent_run.completed_at.isoformat() if agent_run.completed_at else None
+        ),
         "current_iteration": agent_run.current_iteration,
         "max_iterations": agent_run.max_iterations,
         "best_model_name": best_model_name,
@@ -5086,16 +6092,24 @@ def get_agent_history(agent_id: uuid.UUID, db: Session = Depends(get_db)):
 
     iterations = []
     for train_run in training_runs:
-        iterations.append({
-            "iteration": train_run.version_number,
-            "training_run_id": str(train_run.id),
-            "model_name": train_run.best_model_name,
-            "rmse": train_run.rmse,
-            "mae": train_run.mae,
-            "r2": train_run.r2,
-            "started_at": train_run.started_at.isoformat() if train_run.started_at else None,
-            "completed_at": train_run.completed_at.isoformat() if train_run.completed_at else None,
-        })
+        iterations.append(
+            {
+                "iteration": train_run.version_number,
+                "training_run_id": str(train_run.id),
+                "model_name": train_run.best_model_name,
+                "rmse": train_run.rmse,
+                "mae": train_run.mae,
+                "r2": train_run.r2,
+                "started_at": (
+                    train_run.started_at.isoformat() if train_run.started_at else None
+                ),
+                "completed_at": (
+                    train_run.completed_at.isoformat()
+                    if train_run.completed_at
+                    else None
+                ),
+            }
+        )
 
     return {
         "agent_id": str(agent_run.id),
@@ -5129,7 +6143,11 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
                 completed_at=datetime.utcnow() if completed else None,
             )
 
-            run = lifecycle_db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+            run = (
+                lifecycle_db.query(TrainingRun)
+                .filter(TrainingRun.id == training_run_id)
+                .first()
+            )
             if run is not None:
                 if status is not None:
                     run.status = status
@@ -5144,6 +6162,7 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
                 lifecycle_db.commit()
         except Exception:
             lifecycle_db.rollback()
+
     try:
         db = SessionLocal()
         try:
@@ -5151,9 +6170,11 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
             if project is None:
                 return
 
-            current_version = db.query(
-                func.coalesce(func.max(TrainingRun.version_number), 0)
-            ).filter(TrainingRun.project_id == project.id).scalar()
+            current_version = (
+                db.query(func.coalesce(func.max(TrainingRun.version_number), 0))
+                .filter(TrainingRun.project_id == project.id)
+                .scalar()
+            )
 
             training_run = TrainingRun(
                 project_id=project.id,
@@ -5204,7 +6225,11 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
         if training_run_id is not None:
             db = SessionLocal()
             try:
-                run = db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+                run = (
+                    db.query(TrainingRun)
+                    .filter(TrainingRun.id == training_run_id)
+                    .first()
+                )
                 if run is not None:
                     best_model = safe_result.get("best_model", {})
                     run.status = "completed"
@@ -5226,7 +6251,9 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
                         if not isinstance(model_data, dict):
                             continue
 
-                        model_name = model_data.get("name") or model_data.get("model_name")
+                        model_name = model_data.get("name") or model_data.get(
+                            "model_name"
+                        )
                         if not model_name:
                             continue
 
@@ -5236,12 +6263,16 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
                         hyperparameters = model_data.get("hyperparameters")
 
                         try:
-                            rmse_value = float(rmse_value) if rmse_value is not None else None
+                            rmse_value = (
+                                float(rmse_value) if rmse_value is not None else None
+                            )
                         except (TypeError, ValueError):
                             rmse_value = None
 
                         try:
-                            mae_value = float(mae_value) if mae_value is not None else None
+                            mae_value = (
+                                float(mae_value) if mae_value is not None else None
+                            )
                         except (TypeError, ValueError):
                             mae_value = None
 
@@ -5270,7 +6301,11 @@ def run_training_job(job_id: Optional[str], file_id: str, target_column: str) ->
                         normalized_models,
                         key=lambda item: (
                             item.get("rmse") is None,
-                            item.get("rmse") if item.get("rmse") is not None else float("inf"),
+                            (
+                                item.get("rmse")
+                                if item.get("rmse") is not None
+                                else float("inf")
+                            ),
                         ),
                     )
 
@@ -5322,10 +6357,7 @@ async def get_training_job_status(job_id: str):
     cleanup_old_jobs()
 
     if job_id not in JOB_STATUS:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Job '{job_id}' not found."
-        )
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
     job = copy.deepcopy(JOB_STATUS[job_id])
     completed_at = job.get("completed_at")
@@ -5342,7 +6374,7 @@ async def get_training_job_status(job_id: str):
             "error": job.get("error"),
             "completed_at": job.get("completed_at"),
             "logs": job.get("logs", []),
-        }
+        },
     )
 
 
@@ -5350,7 +6382,7 @@ async def get_training_job_status(job_id: str):
 async def get_training_history(file_id: str):
     """
     Get training history for a specific file.
-    
+
     Returns all training versions for the given file_id.
     """
     try:
@@ -5373,30 +6405,47 @@ async def get_training_history(file_id: str):
                 for run in training_runs:
                     version_to_training_run_id[int(run.version_number)] = str(run.id)
                     if run.started_at is not None and run.completed_at is not None:
-                        duration_seconds = (run.completed_at - run.started_at).total_seconds()
-                        version_to_run_duration_seconds[int(run.version_number)] = max(0.0, float(duration_seconds))
+                        duration_seconds = (
+                            run.completed_at - run.started_at
+                        ).total_seconds()
+                        version_to_run_duration_seconds[int(run.version_number)] = max(
+                            0.0, float(duration_seconds)
+                        )
                     else:
                         version_to_run_duration_seconds[int(run.version_number)] = 0.0
                     if run.agent_run_id is not None:
-                        version_to_generation_source[int(run.version_number)] = "llm_generated"
+                        version_to_generation_source[int(run.version_number)] = (
+                            "llm_generated"
+                        )
                     elif (run.stage or "").lower() == "fine_tuned":
-                        version_to_generation_source[int(run.version_number)] = "fine_tuned"
+                        version_to_generation_source[int(run.version_number)] = (
+                            "fine_tuned"
+                        )
                     else:
-                        version_to_generation_source[int(run.version_number)] = "standard"
+                        version_to_generation_source[int(run.version_number)] = (
+                            "standard"
+                        )
         finally:
             db.close()
 
         versions_with_ids: List[Dict[str, Any]] = []
 
-        if file_id in TRAINING_HISTORY and len(TRAINING_HISTORY[file_id]) > 0:
+
+        if (not training_runs) and file_id in TRAINING_HISTORY and len(TRAINING_HISTORY[file_id]) > 0:
             for version_entry in TRAINING_HISTORY[file_id]:
                 if isinstance(version_entry, dict):
                     version_number = int(version_entry.get("version", 0) or 0)
                     enriched = copy.deepcopy(version_entry)
-                    enriched["training_run_id"] = version_to_training_run_id.get(version_number)
-                    run_duration_seconds = version_to_run_duration_seconds.get(version_number, 0.0)
+                    enriched["training_run_id"] = version_to_training_run_id.get(
+                        version_number
+                    )
+                    run_duration_seconds = version_to_run_duration_seconds.get(
+                        version_number, 0.0
+                    )
                     enriched["training_time_seconds"] = run_duration_seconds
-                    generated_by = version_to_generation_source.get(version_number, "standard")
+                    generated_by = version_to_generation_source.get(
+                        version_number, "standard"
+                    )
                     enriched["generated_by"] = generated_by
 
                     if isinstance(enriched.get("models"), list):
@@ -5406,9 +6455,13 @@ async def get_training_history(file_id: str):
                         for model_entry in enriched["models"]:
                             if isinstance(model_entry, dict):
                                 model_copy = copy.deepcopy(model_entry)
-                                model_copy["generated_by"] = model_copy.get("generated_by", generated_by)
+                                model_copy["generated_by"] = model_copy.get(
+                                    "generated_by", generated_by
+                                )
                                 model_copy["training_time_seconds"] = float(
-                                    model_copy.get("training_time_seconds", per_model_time)
+                                    model_copy.get(
+                                        "training_time_seconds", per_model_time
+                                    )
                                 )
                                 next_models.append(model_copy)
                             else:
@@ -5422,7 +6475,7 @@ async def get_training_history(file_id: str):
             if not training_runs:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No training history found for file '{file_id}'."
+                    detail=f"No training history found for file '{file_id}'.",
                 )
 
             db = SessionLocal()
@@ -5431,11 +6484,16 @@ async def get_training_history(file_id: str):
                     model_versions = (
                         db.query(ModelVersion)
                         .filter(ModelVersion.training_run_id == run.id)
-                        .order_by(ModelVersion.rank_position.asc(), ModelVersion.created_at.asc())
+                        .order_by(
+                            ModelVersion.rank_position.asc(),
+                            ModelVersion.created_at.asc(),
+                        )
                         .all()
                     )
 
-                    run_duration_seconds = version_to_run_duration_seconds.get(int(run.version_number), 0.0)
+                    run_duration_seconds = version_to_run_duration_seconds.get(
+                        int(run.version_number), 0.0
+                    )
                     model_count = max(1, len(model_versions))
                     per_model_time = run_duration_seconds / model_count
 
@@ -5454,9 +6512,11 @@ async def get_training_history(file_id: str):
                                 "generated_by": (
                                     "llm_generated"
                                     if run.agent_run_id is not None
-                                    else "fine_tuned"
-                                    if (run.stage or "").lower() == "fine_tuned"
-                                    else "standard"
+                                    else (
+                                        "fine_tuned"
+                                        if (run.stage or "").lower() == "fine_tuned"
+                                        else "standard"
+                                    )
                                 ),
                             }
                         )
@@ -5479,9 +6539,11 @@ async def get_training_history(file_id: str):
                             "generated_by": (
                                 "llm_generated"
                                 if run.agent_run_id is not None
-                                else "fine_tuned"
-                                if (run.stage or "").lower() == "fine_tuned"
-                                else "standard"
+                                else (
+                                    "fine_tuned"
+                                    if (run.stage or "").lower() == "fine_tuned"
+                                    else "standard"
+                                )
                             ),
                         }
                     )
@@ -5492,21 +6554,15 @@ async def get_training_history(file_id: str):
         response = {
             "file_id": file_id,
             "target_column": target_column,
-            "versions": versions_with_ids
+            "versions": versions_with_ids,
         }
-        
-        return JSONResponse(
-            status_code=200,
-            content=response
-        )
-        
+
+        return JSONResponse(status_code=200, content=response)
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail="Internal Server Error"
-        )
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 @app.get("/training/report/{file_id}")
@@ -5536,7 +6592,9 @@ async def get_training_report(file_id: str):
             training_runs = (
                 db.query(TrainingRun)
                 .filter(TrainingRun.agent_run_id == latest_agent_run.id)
-                .order_by(TrainingRun.version_number.asc(), TrainingRun.created_at.asc())
+                .order_by(
+                    TrainingRun.version_number.asc(), TrainingRun.created_at.asc()
+                )
                 .all()
             )
             if not training_runs:
@@ -5549,7 +6607,10 @@ async def get_training_report(file_id: str):
                 db.query(ExperimentMemory)
                 .filter(ExperimentMemory.project_id == project.id)
                 .filter(ExperimentMemory.agent_run_id == latest_agent_run.id)
-                .order_by(ExperimentMemory.iteration_number.asc(), ExperimentMemory.created_at.asc())
+                .order_by(
+                    ExperimentMemory.iteration_number.asc(),
+                    ExperimentMemory.created_at.asc(),
+                )
                 .all()
             )
 
@@ -5577,7 +6638,9 @@ async def get_training_report(file_id: str):
 
         model_versions_by_run_id: Dict[str, List[ModelVersion]] = {}
         for model_version in model_versions:
-            model_versions_by_run_id.setdefault(str(model_version.training_run_id), []).append(model_version)
+            model_versions_by_run_id.setdefault(
+                str(model_version.training_run_id), []
+            ).append(model_version)
 
         retained_logs = AGENT_SANDBOX_EVENT_LOGS.get(str(latest_agent_run.id), [])
         log_index = _build_iteration_log_index(retained_logs)
@@ -5598,7 +6661,9 @@ async def get_training_report(file_id: str):
             r2_value = _safe_float(run.r2)
             duration_seconds = None
             if run.started_at is not None and run.completed_at is not None:
-                duration_seconds = max(0.0, float((run.completed_at - run.started_at).total_seconds()))
+                duration_seconds = max(
+                    0.0, float((run.completed_at - run.started_at).total_seconds())
+                )
 
             delta_from_previous = None
             if previous_rmse is not None and rmse_value is not None:
@@ -5616,17 +6681,24 @@ async def get_training_report(file_id: str):
 
             candidate_models: List[Dict[str, Any]] = []
             for model_version in model_versions_by_run_id.get(str(run.id), []):
-                candidate_models.append({
-                    "model_name": model_version.model_name,
-                    "rank_position": model_version.rank_position,
-                    "rmse": _safe_float(model_version.rmse),
-                    "mae": _safe_float(model_version.mae),
-                    "r2": _safe_float(model_version.r2),
-                    "hyperparameters": model_version.hyperparameters if isinstance(model_version.hyperparameters, dict) else None,
-                })
+                candidate_models.append(
+                    {
+                        "model_name": model_version.model_name,
+                        "rank_position": model_version.rank_position,
+                        "rmse": _safe_float(model_version.rmse),
+                        "mae": _safe_float(model_version.mae),
+                        "r2": _safe_float(model_version.r2),
+                        "hyperparameters": (
+                            model_version.hyperparameters
+                            if isinstance(model_version.hyperparameters, dict)
+                            else None
+                        ),
+                    }
+                )
 
             is_new_best = bool(
-                rmse_value is not None and (best_rmse_so_far is None or rmse_value < best_rmse_so_far)
+                rmse_value is not None
+                and (best_rmse_so_far is None or rmse_value < best_rmse_so_far)
             )
 
             iteration_payload: Dict[str, Any] = {
@@ -5639,20 +6711,36 @@ async def get_training_report(file_id: str):
                 "r2": r2_value,
                 "duration_seconds": duration_seconds,
                 "started_at": run.started_at.isoformat() if run.started_at else None,
-                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+                "completed_at": (
+                    run.completed_at.isoformat() if run.completed_at else None
+                ),
                 "delta_from_previous_rmse": delta_from_previous,
                 "delta_from_best_rmse": delta_from_best,
                 "is_new_best": is_new_best,
                 "strategy_summary": strategy_summary,
                 "candidate_models": candidate_models,
-                "preprocessing_tokens": _parse_token_list(memory_row.preprocessing_tokens if memory_row else None),
-                "training_tokens": _parse_token_list(memory_row.training_tokens if memory_row else None),
+                "preprocessing_tokens": _parse_token_list(
+                    memory_row.preprocessing_tokens if memory_row else None
+                ),
+                "training_tokens": _parse_token_list(
+                    memory_row.training_tokens if memory_row else None
+                ),
                 "agent_signals": {
-                    "architect_blueprints": int(log_details.get("architect_blueprints", 0) or 0),
-                    "architect_fallbacks": int(log_details.get("architect_fallbacks", 0) or 0),
-                    "single_model_gate_rejections": int(log_details.get("single_model_gate_rejections", 0) or 0),
-                    "compile_fallbacks": int(log_details.get("compile_fallbacks", 0) or 0),
-                    "telemetry_events": int(log_details.get("telemetry_events", 0) or 0),
+                    "architect_blueprints": int(
+                        log_details.get("architect_blueprints", 0) or 0
+                    ),
+                    "architect_fallbacks": int(
+                        log_details.get("architect_fallbacks", 0) or 0
+                    ),
+                    "single_model_gate_rejections": int(
+                        log_details.get("single_model_gate_rejections", 0) or 0
+                    ),
+                    "compile_fallbacks": int(
+                        log_details.get("compile_fallbacks", 0) or 0
+                    ),
+                    "telemetry_events": int(
+                        log_details.get("telemetry_events", 0) or 0
+                    ),
                 },
                 "log_excerpt": list(log_details.get("log_excerpt", [])),
             }
@@ -5666,9 +6754,13 @@ async def get_training_report(file_id: str):
                     best_rmse_so_far = rmse_value
                     best_iteration = iteration_payload
 
-        baseline_rmse = first_completed_iteration.get("rmse") if first_completed_iteration else None
+        baseline_rmse = (
+            first_completed_iteration.get("rmse") if first_completed_iteration else None
+        )
         best_rmse = best_iteration.get("rmse") if best_iteration else None
-        baseline_r2 = first_completed_iteration.get("r2") if first_completed_iteration else None
+        baseline_r2 = (
+            first_completed_iteration.get("r2") if first_completed_iteration else None
+        )
         best_r2 = best_iteration.get("r2") if best_iteration else None
 
         rmse_reduction = None
@@ -5691,8 +6783,16 @@ async def get_training_report(file_id: str):
                 "target_column": project.target_column,
                 "agent_run_id": str(latest_agent_run.id),
                 "agent_status": latest_agent_run.status,
-                "started_at": latest_agent_run.started_at.isoformat() if latest_agent_run.started_at else None,
-                "completed_at": latest_agent_run.completed_at.isoformat() if latest_agent_run.completed_at else None,
+                "started_at": (
+                    latest_agent_run.started_at.isoformat()
+                    if latest_agent_run.started_at
+                    else None
+                ),
+                "completed_at": (
+                    latest_agent_run.completed_at.isoformat()
+                    if latest_agent_run.completed_at
+                    else None
+                ),
                 "summary": {
                     "iterations_completed": len(iterations),
                     "max_iterations": latest_agent_run.max_iterations,
@@ -5701,7 +6801,9 @@ async def get_training_report(file_id: str):
                     "rmse_reduction": rmse_reduction,
                     "rmse_reduction_percent": rmse_reduction_percent,
                     "r2_gain": r2_gain,
-                    "best_model_name": best_iteration.get("model_name") if best_iteration else None,
+                    "best_model_name": (
+                        best_iteration.get("model_name") if best_iteration else None
+                    ),
                 },
                 "iterations": iterations,
                 "strategy_themes": _build_strategy_theme_summary(iterations),
@@ -5714,21 +6816,25 @@ async def get_training_report(file_id: str):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to build experiment report: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to build experiment report: {exc}"
+        )
 
 
-def _build_training_code(training_run: TrainingRun, model_versions: List[ModelVersion]) -> str:
+def _build_training_code(
+    training_run: TrainingRun, model_versions: List[ModelVersion]
+) -> str:
     model_blocks: List[str] = []
     for mv in model_versions:
         model_name = mv.model_name
         params = mv.hyperparameters if isinstance(mv.hyperparameters, dict) else {}
         model_blocks.append(
-            f"    {{\"model_name\": \"{model_name}\", \"hyperparameters\": {json.dumps(params)} }}"
+            f'    {{"model_name": "{model_name}", "hyperparameters": {json.dumps(params)} }}'
         )
 
     models_literal = "[\n" + ",\n".join(model_blocks) + "\n]" if model_blocks else "[]"
 
-    return f'''import pandas as pd
+    return f"""import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
@@ -5794,19 +6900,25 @@ def run_training():
 if __name__ == "__main__":
     output = run_training()
     print(output)
-'''
+"""
 
 
 @app.get("/models/download/{training_run_id}")
-def download_model_artifact(training_run_id: uuid.UUID, model_name: Optional[str] = None):
+def download_model_artifact(
+    training_run_id: uuid.UUID, model_name: Optional[str] = None
+):
     db = SessionLocal()
     try:
-        training_run = db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+        training_run = (
+            db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+        )
         if training_run is None:
             raise HTTPException(status_code=404, detail="Training run not found")
 
         source_training_run = training_run
-        query = db.query(ModelVersion).filter(ModelVersion.training_run_id == training_run_id)
+        query = db.query(ModelVersion).filter(
+            ModelVersion.training_run_id == training_run_id
+        )
         if model_name:
             query = query.filter(ModelVersion.model_name == model_name)
 
@@ -5821,7 +6933,9 @@ def download_model_artifact(training_run_id: uuid.UUID, model_name: Optional[str
                     TrainingRun.project_id == training_run.project_id,
                     ModelVersion.model_name == model_name,
                 )
-                .order_by(TrainingRun.version_number.desc(), TrainingRun.created_at.desc())
+                .order_by(
+                    TrainingRun.version_number.desc(), TrainingRun.created_at.desc()
+                )
                 .first()
             )
             if fallback_row is not None:
@@ -5839,20 +6953,31 @@ def download_model_artifact(training_run_id: uuid.UUID, model_name: Optional[str
                 ),
             )
 
-        project = db.query(Project).filter(Project.id == source_training_run.project_id).first()
+        project = (
+            db.query(Project)
+            .filter(Project.id == source_training_run.project_id)
+            .first()
+        )
         if project is None:
-            raise HTTPException(status_code=404, detail="Project not found for training run")
+            raise HTTPException(
+                status_code=404, detail="Project not found for training run"
+            )
 
         file_path = UPLOAD_DIR / project.file_id
         if not file_path.exists():
-            raise HTTPException(status_code=404, detail="Dataset file not found for training run")
+            raise HTTPException(
+                status_code=404, detail="Dataset file not found for training run"
+            )
 
         df = pd.read_csv(file_path)
         validate_dataset_limits(df)
 
         target_column = project.target_column
         if target_column not in df.columns:
-            raise HTTPException(status_code=400, detail=f"Target column '{target_column}' not found in dataset")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Target column '{target_column}' not found in dataset",
+            )
 
         X = pd.get_dummies(df.drop(columns=[target_column]), drop_first=True)
         y = df[target_column]
@@ -5875,7 +7000,9 @@ def download_model_artifact(training_run_id: uuid.UUID, model_name: Optional[str
                 base_params = {"random_state": 42, "verbosity": 0}
                 base_params.update(safe_params)
                 return XGBRegressor(**base_params)
-            raise HTTPException(status_code=400, detail=f"Unsupported model '{model_name_local}'")
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported model '{model_name_local}'"
+            )
 
         def _build_pickle_payload(mv: ModelVersion, source_run: TrainingRun) -> bytes:
             params = mv.hyperparameters if isinstance(mv.hyperparameters, dict) else {}
@@ -5905,11 +7032,15 @@ def download_model_artifact(training_run_id: uuid.UUID, model_name: Optional[str
             )
 
         zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(
+            zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as zf:
             for mv in model_versions:
                 model_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", mv.model_name)
                 artifact_name = f"{model_slug}.pkl"
-                zf.writestr(artifact_name, _build_pickle_payload(mv, source_training_run))
+                zf.writestr(
+                    artifact_name, _build_pickle_payload(mv, source_training_run)
+                )
 
         zip_buffer.seek(0)
         zip_filename = f"model_artifacts_{training_run_id}.zip"
@@ -5951,10 +7082,22 @@ def _synthesize_native_training_script(
         else:
             model_init_lines.append(f'    ("{name}", {name}()),')
 
-    models_block = "\n".join(model_init_lines) if model_init_lines else '    ("RandomForestRegressor", RandomForestRegressor()),'
+    models_block = (
+        "\n".join(model_init_lines)
+        if model_init_lines
+        else '    ("RandomForestRegressor", RandomForestRegressor()),'
+    )
 
-    dataset_comment = f"# Dataset file_id: {file_id}" if file_id else "# Replace DATA_PATH with the path to your CSV file."
-    data_path_line = f'DATA_PATH = "{file_id}"  # update this path' if file_id else 'DATA_PATH = "dataset.csv"  # update this path'
+    dataset_comment = (
+        f"# Dataset file_id: {file_id}"
+        if file_id
+        else "# Replace DATA_PATH with the path to your CSV file."
+    )
+    data_path_line = (
+        f'DATA_PATH = "{file_id}"  # update this path'
+        if file_id
+        else 'DATA_PATH = "dataset.csv"  # update this path'
+    )
 
     script = f'''\
 """
@@ -6022,7 +7165,9 @@ if results:
 def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = None):
     db = SessionLocal()
     try:
-        training_run = db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+        training_run = (
+            db.query(TrainingRun).filter(TrainingRun.id == training_run_id).first()
+        )
         if training_run is None:
             raise HTTPException(status_code=404, detail="Training run not found")
 
@@ -6037,14 +7182,18 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
             agent_runs_for_project = (
                 db.query(TrainingRun.id)
                 .filter(TrainingRun.agent_run_id == training_run.agent_run_id)
-                .order_by(TrainingRun.version_number.asc(), TrainingRun.created_at.asc())
+                .order_by(
+                    TrainingRun.version_number.asc(), TrainingRun.created_at.asc()
+                )
                 .all()
             )
             ordered_agent_run_ids = [str(row[0]) for row in agent_runs_for_project]
             expected_iteration_number: Optional[int] = None
             current_training_run_id = str(training_run.id)
             if current_training_run_id in ordered_agent_run_ids:
-                expected_iteration_number = ordered_agent_run_ids.index(current_training_run_id) + 1
+                expected_iteration_number = (
+                    ordered_agent_run_ids.index(current_training_run_id) + 1
+                )
 
             if expected_iteration_number is not None:
                 sandbox_job = (
@@ -6063,8 +7212,11 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
                     db.query(SandboxJob)
                     .filter(
                         SandboxJob.project_id == training_run.project_id,
-                        SandboxJob.iteration_number == (
-                            expected_iteration_number if expected_iteration_number is not None else training_run.version_number
+                        SandboxJob.iteration_number
+                        == (
+                            expected_iteration_number
+                            if expected_iteration_number is not None
+                            else training_run.version_number
                         ),
                     )
                     .order_by(SandboxJob.created_at.desc())
@@ -6080,9 +7232,17 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
                     .first()
                 )
 
-        if sandbox_job is not None and isinstance(sandbox_job.script_content, str) and sandbox_job.script_content.strip():
+        if (
+            sandbox_job is not None
+            and isinstance(sandbox_job.script_content, str)
+            and sandbox_job.script_content.strip()
+        ):
             llm_code = sandbox_job.script_content
-            model_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name) if model_name else "all_models"
+            model_slug = (
+                re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)
+                if model_name
+                else "all_models"
+            )
             filename = f"training_code_{training_run_id}_{model_slug}.py"
             return StreamingResponse(
                 io.BytesIO(llm_code.encode("utf-8")),
@@ -6092,25 +7252,29 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
 
         # No SandboxJob found (native execution mode) — synthesize a runnable script
         # from the ModelVersion records persisted for this training run.
-        model_versions_query = (
-            db.query(ModelVersion)
-            .filter(ModelVersion.training_run_id == training_run.id)
+        model_versions_query = db.query(ModelVersion).filter(
+            ModelVersion.training_run_id == training_run.id
         )
         # If a specific model is requested, filter to just that model
         if model_name:
-            model_versions_query = model_versions_query.filter(ModelVersion.model_name == model_name)
-        model_versions = model_versions_query.order_by(ModelVersion.rank_position.asc()).all()
+            model_versions_query = model_versions_query.filter(
+                ModelVersion.model_name == model_name
+            )
+        model_versions = model_versions_query.order_by(
+            ModelVersion.rank_position.asc()
+        ).all()
 
         # If this specific run has no models, collect from all runs in this agent session
         # so the user always gets a script with the full model list.
         if not model_versions:
             all_run_ids = [uuid.UUID(rid) for rid in ordered_agent_run_ids]
-            fallback_query = (
-                db.query(ModelVersion)
-                .filter(ModelVersion.training_run_id.in_(all_run_ids))
+            fallback_query = db.query(ModelVersion).filter(
+                ModelVersion.training_run_id.in_(all_run_ids)
             )
             if model_name:
-                fallback_query = fallback_query.filter(ModelVersion.model_name == model_name)
+                fallback_query = fallback_query.filter(
+                    ModelVersion.model_name == model_name
+                )
             model_versions = fallback_query.order_by(ModelVersion.rmse.asc()).all()
 
         # Secondary fallback: search across all project training runs for the requested model
@@ -6122,7 +7286,9 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
                     TrainingRun.project_id == training_run.project_id,
                     ModelVersion.model_name == model_name,
                 )
-                .order_by(TrainingRun.version_number.desc(), TrainingRun.created_at.desc())
+                .order_by(
+                    TrainingRun.version_number.desc(), TrainingRun.created_at.desc()
+                )
                 .first()
             )
             if project_fallback_row is not None:
@@ -6141,9 +7307,15 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
             )
 
         # Fetch project for target_column / file_id (use source_training_run in case of fallback)
-        project = db.query(Project).filter(Project.id == source_training_run.project_id).first()
-        target_col = (project.target_column if project and project.target_column else "target")
-        file_id_val = (project.file_id if project else None)
+        project = (
+            db.query(Project)
+            .filter(Project.id == source_training_run.project_id)
+            .first()
+        )
+        target_col = (
+            project.target_column if project and project.target_column else "target"
+        )
+        file_id_val = project.file_id if project else None
 
         synthesized = _synthesize_native_training_script(
             target_column=target_col,
@@ -6151,7 +7323,9 @@ def download_model_code(training_run_id: uuid.UUID, model_name: Optional[str] = 
             training_run_id=str(source_training_run.id),
             file_id=file_id_val,
         )
-        model_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name) if model_name else "all_models"
+        model_slug = (
+            re.sub(r"[^a-zA-Z0-9_-]", "_", model_name) if model_name else "all_models"
+        )
         filename = f"training_code_{training_run_id}_{model_slug}.py"
         return StreamingResponse(
             io.BytesIO(synthesized.encode("utf-8")),
@@ -6179,30 +7353,46 @@ def _canonical_regression_model_name(model_name: str) -> str:
     raise ValueError(f"Unknown model type: {model_name}")
 
 
-def _apply_prompt_hyperparameter_overrides(model_name: str, prompt: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_prompt_hyperparameter_overrides(
+    model_name: str, prompt: Optional[str], params: Dict[str, Any]
+) -> Dict[str, Any]:
     if not prompt:
         return dict(params)
 
     updated = dict(params)
     prompt_text = prompt.lower()
-    speed_hint = any(token in prompt_text for token in ["faster", "speed", "latency", "quick"])
-    regularization_hint = any(token in prompt_text for token in ["overfit", "regularization", "generalization", "stability"])
-    quality_hint = any(token in prompt_text for token in ["improve", "better", "accuracy", "performance", "quality"])
+    speed_hint = any(
+        token in prompt_text for token in ["faster", "speed", "latency", "quick"]
+    )
+    regularization_hint = any(
+        token in prompt_text
+        for token in ["overfit", "regularization", "generalization", "stability"]
+    )
+    quality_hint = any(
+        token in prompt_text
+        for token in ["improve", "better", "accuracy", "performance", "quality"]
+    )
 
     if model_name == "RandomForestRegressor":
         if speed_hint:
             updated["n_estimators"] = min(int(updated.get("n_estimators", 150)), 120)
             updated["max_depth"] = min(int(updated.get("max_depth", 10)), 8)
         if regularization_hint:
-            updated["min_samples_split"] = max(int(updated.get("min_samples_split", 2)), 4)
-            updated["min_samples_leaf"] = max(int(updated.get("min_samples_leaf", 1)), 2)
+            updated["min_samples_split"] = max(
+                int(updated.get("min_samples_split", 2)), 4
+            )
+            updated["min_samples_leaf"] = max(
+                int(updated.get("min_samples_leaf", 1)), 2
+            )
         if quality_hint:
             updated["n_estimators"] = max(int(updated.get("n_estimators", 150)), 220)
 
     if model_name == "XGBRegressor":
         if speed_hint:
             updated["n_estimators"] = min(int(updated.get("n_estimators", 250)), 200)
-            updated["learning_rate"] = max(float(updated.get("learning_rate", 0.05)), 0.08)
+            updated["learning_rate"] = max(
+                float(updated.get("learning_rate", 0.05)), 0.08
+            )
         if regularization_hint:
             updated["max_depth"] = min(int(updated.get("max_depth", 6)), 5)
             updated["subsample"] = min(float(updated.get("subsample", 1.0)), 0.85)
@@ -6225,15 +7415,23 @@ def _derive_fine_tune_hyperparameters(
     baseline_metrics: Dict[str, float],
     prompt: Optional[str],
 ) -> Dict[str, Any]:
-    llm_response = get_hyperparameter_suggestions(canonical_model_name, baseline_metrics, llm_provider)
-    suggested = llm_response.get("hyperparameters") if isinstance(llm_response, dict) else {}
+    llm_response = get_hyperparameter_suggestions(
+        canonical_model_name, baseline_metrics, llm_provider
+    )
+    suggested = (
+        llm_response.get("hyperparameters") if isinstance(llm_response, dict) else {}
+    )
     if not isinstance(suggested, dict):
         suggested = {}
-    prompt_adjusted = _apply_prompt_hyperparameter_overrides(canonical_model_name, prompt, suggested)
+    prompt_adjusted = _apply_prompt_hyperparameter_overrides(
+        canonical_model_name, prompt, suggested
+    )
     return validate_hyperparameters(canonical_model_name, prompt_adjusted)
 
 
-def _build_fine_tune_sandbox_script(target_column: str, model_name: str, hyperparameters: Dict[str, Any]) -> str:
+def _build_fine_tune_sandbox_script(
+    target_column: str, model_name: str, hyperparameters: Dict[str, Any]
+) -> str:
     model_initializers = {
         "LinearRegression": "LinearRegression()",
         "Ridge": "Ridge(**HYPERPARAMETERS)",
@@ -6245,7 +7443,7 @@ def _build_fine_tune_sandbox_script(target_column: str, model_name: str, hyperpa
     if model_name not in model_initializers:
         raise ValueError(f"Unsupported model for fine-tune sandbox run: {model_name}")
 
-    return f'''import json
+    return f"""import json
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -6288,10 +7486,12 @@ result_json = {{
     "hyperparameters": HYPERPARAMETERS,
 }}
 print(json.dumps({{"result_json": result_json}}))
-'''
+"""
 
 
-def _poll_sandbox_job_for_fine_tune(job_id: uuid.UUID, timeout_seconds: int) -> Dict[str, Any]:
+def _poll_sandbox_job_for_fine_tune(
+    job_id: uuid.UUID, timeout_seconds: int
+) -> Dict[str, Any]:
     started_at = time.time()
     last_status: Optional[str] = None
     last_progress_at = started_at
@@ -6299,7 +7499,9 @@ def _poll_sandbox_job_for_fine_tune(job_id: uuid.UUID, timeout_seconds: int) -> 
     while True:
         now = time.time()
         if now - started_at > timeout_seconds:
-            raise RuntimeError(f"Fine-tune sandbox polling timed out after {timeout_seconds}s")
+            raise RuntimeError(
+                f"Fine-tune sandbox polling timed out after {timeout_seconds}s"
+            )
 
         db = SessionLocal()
         try:
@@ -6346,44 +7548,50 @@ def _poll_sandbox_job_for_fine_tune(job_id: uuid.UUID, timeout_seconds: int) -> 
         return result_json
 
 
-def fine_tune_best_model(file_path: Path, target_column: str, best_model_name: str, llm_provider: str, hyperparameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def fine_tune_best_model(
+    file_path: Path,
+    target_column: str,
+    best_model_name: str,
+    llm_provider: str,
+    hyperparameters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Fine-tune the best model with improved hyperparameters.
-    
+
     Args:
         file_path: Path to the CSV file
         target_column: Name of the target column
         best_model_name: Name of the best model to fine-tune
         llm_provider: LLM provider for hyperparameter suggestions
         hyperparameters: Optional pre-derived hyperparameters to use
-        
+
     Returns:
         Dictionary containing model metrics
     """
     # Load dataset
     df = pd.read_csv(file_path)
     validate_dataset_limits(df)
-    
+
     # Validate target column exists
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' not found in dataset.")
-    
+
     # Validate target is numeric
     if not pd.api.types.is_numeric_dtype(df[target_column]):
         raise ValueError("Target column must be numeric for regression.")
-    
+
     # Split features and target
     X = df.drop(columns=[target_column])
     y = df[target_column]
-    
+
     # Handle categorical columns with one-hot encoding
     X = pd.get_dummies(X, drop_first=True)
-    
+
     # Split into train and test sets
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
-    
+
     normalized_model_name = re.sub(r"[^a-z0-9]", "", str(best_model_name).lower())
     hp = hyperparameters or {}
 
@@ -6401,7 +7609,9 @@ def fine_tune_best_model(file_path: Path, target_column: str, best_model_name: s
         alpha_val = hp.get("alpha", 0.01)
         l1_ratio_val = hp.get("l1_ratio", 0.5)
         max_iter_val = hp.get("max_iter", 5000)
-        model = ElasticNet(alpha=alpha_val, l1_ratio=l1_ratio_val, max_iter=max_iter_val)
+        model = ElasticNet(
+            alpha=alpha_val, l1_ratio=l1_ratio_val, max_iter=max_iter_val
+        )
     elif normalized_model_name in {"randomforestregressor", "randomforest", "rf"}:
         n_estimators_val = hp.get("n_estimators", 200)
         max_depth_val = hp.get("max_depth", 10)
@@ -6429,23 +7639,23 @@ def fine_tune_best_model(file_path: Path, target_column: str, best_model_name: s
         )
     else:
         raise ValueError(f"Unknown model type: {best_model_name}")
-    
+
     # Train the model
     model.fit(X_train, y_train)
-    
+
     # Make predictions
     y_pred = model.predict(X_test)
-    
+
     # Calculate metrics
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
-    
+
     return {
         "name": best_model_name,
         "rmse": float(rmse),
         "mae": float(mae),
-        "r2": float(r2)
+        "r2": float(r2),
     }
 
 
@@ -6453,7 +7663,7 @@ def fine_tune_best_model(file_path: Path, target_column: str, best_model_name: s
 async def fine_tune_model(request: FineTuneRequest):
     """
     Fine-tune the best model from the latest training version.
-    
+
     Improves the best model with better hyperparameters and creates a new version.
     """
     try:
@@ -6462,14 +7672,19 @@ async def fine_tune_model(request: FineTuneRequest):
         if request.llm_provider not in allowed_providers:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid llm_provider '{request.llm_provider}'. Allowed values: {', '.join(allowed_providers)}"
+                detail=f"Invalid llm_provider '{request.llm_provider}'. Allowed values: {', '.join(allowed_providers)}",
             )
-        
+
         # Check if training history exists for this file
-        if request.file_id not in TRAINING_HISTORY or len(TRAINING_HISTORY[request.file_id]) == 0:
+        if (
+            request.file_id not in TRAINING_HISTORY
+            or len(TRAINING_HISTORY[request.file_id]) == 0
+        ):
             db = SessionLocal()
             try:
-                project = db.query(Project).filter(Project.file_id == request.file_id).first()
+                project = (
+                    db.query(Project).filter(Project.file_id == request.file_id).first()
+                )
                 if project is not None:
                     training_runs = (
                         db.query(TrainingRun)
@@ -6483,7 +7698,10 @@ async def fine_tune_model(request: FineTuneRequest):
                         model_versions = (
                             db.query(ModelVersion)
                             .filter(ModelVersion.training_run_id == run.id)
-                            .order_by(ModelVersion.rank_position.asc(), ModelVersion.created_at.asc())
+                            .order_by(
+                                ModelVersion.rank_position.asc(),
+                                ModelVersion.created_at.asc(),
+                            )
                             .all()
                         )
 
@@ -6521,30 +7739,38 @@ async def fine_tune_model(request: FineTuneRequest):
             finally:
                 db.close()
 
-        if request.file_id not in TRAINING_HISTORY or len(TRAINING_HISTORY[request.file_id]) == 0:
+        if (
+            request.file_id not in TRAINING_HISTORY
+            or len(TRAINING_HISTORY[request.file_id]) == 0
+        ):
             raise HTTPException(
                 status_code=404,
-                detail=f"No training history found for file '{request.file_id}'. Please run initial training first."
+                detail=f"No training history found for file '{request.file_id}'. Please run initial training first.",
             )
-        
+
         # Construct file path
         file_path = UPLOAD_DIR / request.file_id
-        
+
         # Check if file exists
         if not file_path.exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"File '{request.file_id}' not found. Please upload a CSV file first."
+                detail=f"File '{request.file_id}' not found. Please upload a CSV file first.",
             )
-        
+
         # Get latest usable version (skip malformed/empty version records)
         history_versions = TRAINING_HISTORY[request.file_id]
         latest_version_data = history_versions[-1]
         for candidate in reversed(history_versions):
             if not isinstance(candidate, dict):
                 continue
-            has_models = isinstance(candidate.get("models"), list) and len(candidate.get("models")) > 0
-            has_best = isinstance(candidate.get("best_model"), dict) and bool(candidate.get("best_model", {}).get("name"))
+            has_models = (
+                isinstance(candidate.get("models"), list)
+                and len(candidate.get("models")) > 0
+            )
+            has_best = isinstance(candidate.get("best_model"), dict) and bool(
+                candidate.get("best_model", {}).get("name")
+            )
             if has_models or has_best:
                 latest_version_data = candidate
                 break
@@ -6552,7 +7778,9 @@ async def fine_tune_model(request: FineTuneRequest):
         previous_version = latest_version_data.get("version", len(history_versions))
         best_model_before = latest_version_data.get("best_model") or {}
 
-        selected_model_name = request.model_name.strip() if isinstance(request.model_name, str) else None
+        selected_model_name = (
+            request.model_name.strip() if isinstance(request.model_name, str) else None
+        )
         if selected_model_name:
             candidate_models = latest_version_data.get("models", [])
             matched_model = None
@@ -6560,7 +7788,9 @@ async def fine_tune_model(request: FineTuneRequest):
                 for model_entry in candidate_models:
                     if not isinstance(model_entry, dict):
                         continue
-                    model_entry_name = model_entry.get("name") or model_entry.get("model_name")
+                    model_entry_name = model_entry.get("name") or model_entry.get(
+                        "model_name"
+                    )
                     if model_entry_name == selected_model_name:
                         matched_model = model_entry
                         break
@@ -6576,7 +7806,9 @@ async def fine_tune_model(request: FineTuneRequest):
                     for model_entry in version_models:
                         if not isinstance(model_entry, dict):
                             continue
-                        model_entry_name = model_entry.get("name") or model_entry.get("model_name")
+                        model_entry_name = model_entry.get("name") or model_entry.get(
+                            "model_name"
+                        )
                         if model_entry_name == selected_model_name:
                             matched_model = model_entry
                             break
@@ -6586,7 +7818,7 @@ async def fine_tune_model(request: FineTuneRequest):
             if matched_model is None:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Selected model '{selected_model_name}' not found in latest version."
+                    detail=f"Selected model '{selected_model_name}' not found in latest version.",
                 )
 
             best_model_before = {
@@ -6595,17 +7827,31 @@ async def fine_tune_model(request: FineTuneRequest):
                 "mae": matched_model.get("mae"),
                 "r2": matched_model.get("r2"),
             }
-        
+
         # Fine-tune the best model
         try:
             selected_model = best_model_before.get("name")
             if not isinstance(selected_model, str) or not selected_model.strip():
-                raise HTTPException(status_code=400, detail="No valid model selected for fine-tuning.")
+                raise HTTPException(
+                    status_code=400, detail="No valid model selected for fine-tuning."
+                )
 
             canonical_model_name = _canonical_regression_model_name(selected_model)
-            baseline_rmse = float(best_model_before.get("rmse")) if best_model_before.get("rmse") is not None else 0.0
-            baseline_mae = float(best_model_before.get("mae")) if best_model_before.get("mae") is not None else 0.0
-            baseline_r2 = float(best_model_before.get("r2")) if best_model_before.get("r2") is not None else 0.0
+            baseline_rmse = (
+                float(best_model_before.get("rmse"))
+                if best_model_before.get("rmse") is not None
+                else 0.0
+            )
+            baseline_mae = (
+                float(best_model_before.get("mae"))
+                if best_model_before.get("mae") is not None
+                else 0.0
+            )
+            baseline_r2 = (
+                float(best_model_before.get("r2"))
+                if best_model_before.get("r2") is not None
+                else 0.0
+            )
 
             new_version = len(TRAINING_HISTORY[request.file_id]) + 1
             persisted_training_run_id: Optional[str] = None
@@ -6620,11 +7866,15 @@ async def fine_tune_model(request: FineTuneRequest):
 
                 db = SessionLocal()
                 try:
-                    project = db.query(Project).filter(Project.file_id == request.file_id).first()
+                    project = (
+                        db.query(Project)
+                        .filter(Project.file_id == request.file_id)
+                        .first()
+                    )
                     if project is None:
                         raise HTTPException(
                             status_code=404,
-                            detail=f"Project not found for file '{request.file_id}'."
+                            detail=f"Project not found for file '{request.file_id}'.",
                         )
 
                     latest_db_version = (
@@ -6712,7 +7962,9 @@ async def fine_tune_model(request: FineTuneRequest):
                     db.close()
 
                 if sandbox_job_id is None or fine_tuned_run_id is None:
-                    raise HTTPException(status_code=500, detail="Failed to queue fine-tune sandbox job.")
+                    raise HTTPException(
+                        status_code=500, detail="Failed to queue fine-tune sandbox job."
+                    )
 
                 try:
                     sandbox_metrics = _poll_sandbox_job_for_fine_tune(
@@ -6729,9 +7981,15 @@ async def fine_tune_model(request: FineTuneRequest):
 
                     finalize_db = SessionLocal()
                     try:
-                        run_row = finalize_db.query(TrainingRun).filter(TrainingRun.id == fine_tuned_run_id).first()
+                        run_row = (
+                            finalize_db.query(TrainingRun)
+                            .filter(TrainingRun.id == fine_tuned_run_id)
+                            .first()
+                        )
                         if run_row is None:
-                            raise RuntimeError("Fine-tune training run not found during finalize")
+                            raise RuntimeError(
+                                "Fine-tune training run not found during finalize"
+                            )
 
                         run_row.status = "completed"
                         run_row.stage = "fine_tuned"
@@ -6762,7 +8020,11 @@ async def fine_tune_model(request: FineTuneRequest):
                 except Exception as sandbox_exc:
                     failure_db = SessionLocal()
                     try:
-                        run_row = failure_db.query(TrainingRun).filter(TrainingRun.id == fine_tuned_run_id).first()
+                        run_row = (
+                            failure_db.query(TrainingRun)
+                            .filter(TrainingRun.id == fine_tuned_run_id)
+                            .first()
+                        )
                         if run_row is not None:
                             run_row.status = "failed"
                             run_row.stage = "fine_tuned"
@@ -6804,11 +8066,15 @@ async def fine_tune_model(request: FineTuneRequest):
 
                 db = SessionLocal()
                 try:
-                    project = db.query(Project).filter(Project.file_id == request.file_id).first()
+                    project = (
+                        db.query(Project)
+                        .filter(Project.file_id == request.file_id)
+                        .first()
+                    )
                     if project is None:
                         raise HTTPException(
                             status_code=404,
-                            detail=f"Project not found for file '{request.file_id}'."
+                            detail=f"Project not found for file '{request.file_id}'.",
                         )
 
                     latest_db_version = (
@@ -6900,46 +8166,43 @@ async def fine_tune_model(request: FineTuneRequest):
             }
 
             return JSONResponse(status_code=200, content=response)
-            
+
         except HTTPException:
             raise
         except ValueError as e:
             # Validation errors
-            raise HTTPException(
-                status_code=400,
-                detail=str(e)
-            )
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             # Model training errors
             raise HTTPException(
-                status_code=500,
-                detail=f"Fine-tune execution failed: {e}"
+                status_code=500, detail=f"Fine-tune execution failed: {e}"
             )
-            
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Fine-tune request failed: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Fine-tune request failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DATA TRANSFORM — Copilot-style prompt-driven dataset transformation
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TransformPromptRequest(BaseModel):
     session_id: str
     prompt: str
+
 
 class TransformAcceptRequest(BaseModel):
     session_id: str
     step_index: int
 
+
 class TransformUndoRequest(BaseModel):
     session_id: str
     step_index: int
+
 
 class TransformRevertRequest(BaseModel):
     session_id: str
@@ -6969,7 +8232,7 @@ async def transform_start_session(file_id: str, db: Session = Depends(get_db)):
         "project_id": str(project.id),
         "original_df": df.copy(),
         "current_df": df.copy(),
-        "steps": [],          # list of {prompt, code, summary, diff, accepted}
+        "steps": [],  # list of {prompt, code, summary, diff, accepted}
         "created_at": time.time(),
         "quality_history": [{"label": "Session start", "score": initial_quality}],
     }
@@ -7030,7 +8293,13 @@ async def transform_analyze_dataset(session_id: str):
 
     try:
         if provider == "gemini":
-            raw_response = _call_gemini_text_standalone(system_prompt, user_prompt, temperature=0.3, max_tokens=2048, model_override=model)
+            raw_response = _call_gemini_text_standalone(
+                system_prompt,
+                user_prompt,
+                temperature=0.3,
+                max_tokens=2048,
+                model_override=model,
+            )
         else:
             resp = client.chat.completions.create(
                 model=model,
@@ -7063,23 +8332,46 @@ async def transform_think_before_acting(req: TransformPromptRequest):
     before_nulls = int(current_df.isnull().sum().sum())
 
     # Detect "do everything" style prompts — skip overly cautious thinking
-    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything"]
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+    ]
     is_batch_request = any(kw in req.prompt.lower() for kw in batch_keywords)
 
     if is_batch_request:
         # For batch requests, build a concrete plan from data state
-        null_cols = {col: int(current_df[col].isnull().sum()) for col in current_df.columns if current_df[col].isnull().sum() > 0}
-        cat_cols = [col for col in current_df.columns if current_df[col].dtype == "object"]
-        num_cols = [col for col in current_df.columns if current_df[col].dtype in ["float64", "int64", "float32", "int32"]]
+        null_cols = {
+            col: int(current_df[col].isnull().sum())
+            for col in current_df.columns
+            if current_df[col].isnull().sum() > 0
+        }
+        cat_cols = [
+            col for col in current_df.columns if current_df[col].dtype == "object"
+        ]
+        num_cols = [
+            col
+            for col in current_df.columns
+            if current_df[col].dtype in ["float64", "int64", "float32", "int32"]
+        ]
         dup_count = int(current_df.duplicated().sum())
 
         plan_steps = []
         if null_cols:
-            plan_steps.append(f"Fill {sum(null_cols.values())} null values across {len(null_cols)} column(s) with median/mode")
+            plan_steps.append(
+                f"Fill {sum(null_cols.values())} null values across {len(null_cols)} column(s) with median/mode"
+            )
         if dup_count > 0:
             plan_steps.append(f"Remove {dup_count} duplicate rows")
         if cat_cols:
-            plan_steps.append(f"Encode {len(cat_cols)} categorical column(s): {', '.join(cat_cols[:5])}")
+            plan_steps.append(
+                f"Encode {len(cat_cols)} categorical column(s): {', '.join(cat_cols[:5])}"
+            )
         if num_cols:
             plan_steps.append(f"Normalize {len(num_cols)} numeric column(s)")
         if not plan_steps:
@@ -7090,14 +8382,25 @@ async def transform_think_before_acting(req: TransformPromptRequest):
             "is_valid": True,
             "validation_issues": [],
             "plan": plan_steps,
-            "estimated_impact": {"rows_affected": before_shape[0], "cols_affected": before_shape[1]},
+            "estimated_impact": {
+                "rows_affected": before_shape[0],
+                "cols_affected": before_shape[1],
+            },
             "confidence": "high",
-            "warnings": ["This will modify the entire dataset. You can undo each step individually."],
+            "warnings": [
+                "This will modify the entire dataset. You can undo each step individually."
+            ],
         }
 
     # Build context
-    col_info = ", ".join(f"{col} ({current_df[col].dtype})" for col in current_df.columns)
-    null_cols = {col: int(current_df[col].isnull().sum()) for col in current_df.columns if current_df[col].isnull().sum() > 0}
+    col_info = ", ".join(
+        f"{col} ({current_df[col].dtype})" for col in current_df.columns
+    )
+    null_cols = {
+        col: int(current_df[col].isnull().sum())
+        for col in current_df.columns
+        if current_df[col].isnull().sum() > 0
+    }
 
     system_prompt = (
         "You are a senior data engineer planning a data transformation. "
@@ -7128,21 +8431,43 @@ async def transform_think_before_acting(req: TransformPromptRequest):
         f"- Null values: {json.dumps(null_cols) if null_cols else 'None'}\n"
         f"- Total nulls: {before_nulls}\n"
         f"- Sample values per column: {json.dumps({col: current_df[col].dropna().head(3).tolist() for col in current_df.columns[:10]}, default=str)}\n\n"
-        f"User request: \"{req.prompt}\"\n\n"
+        f'User request: "{req.prompt}"\n\n'
         f"Think about this request and plan the execution. Be action-oriented — if the request makes sense, approve it."
     )
 
     try:
         client, model, provider = _resolve_llm_client_standalone()
     except Exception:
-        return {"thinking": "Ready to execute", "is_valid": True, "plan": ["Execute directly"], "confidence": "high", "validation_issues": [], "estimated_impact": {}, "warnings": []}
+        return {
+            "thinking": "Ready to execute",
+            "is_valid": True,
+            "plan": ["Execute directly"],
+            "confidence": "high",
+            "validation_issues": [],
+            "estimated_impact": {},
+            "warnings": [],
+        }
 
     if not provider:
-        return {"thinking": "No LLM configured", "is_valid": True, "plan": ["Execute directly"], "confidence": "high", "validation_issues": [], "estimated_impact": {}, "warnings": []}
+        return {
+            "thinking": "No LLM configured",
+            "is_valid": True,
+            "plan": ["Execute directly"],
+            "confidence": "high",
+            "validation_issues": [],
+            "estimated_impact": {},
+            "warnings": [],
+        }
 
     try:
         if provider == "gemini":
-            raw = _call_gemini_text_standalone(system_prompt, user_prompt, temperature=0.2, max_tokens=1024, model_override=model)
+            raw = _call_gemini_text_standalone(
+                system_prompt,
+                user_prompt,
+                temperature=0.2,
+                max_tokens=1024,
+                model_override=model,
+            )
         else:
             resp = client.chat.completions.create(
                 model=model,
@@ -7155,12 +8480,32 @@ async def transform_think_before_acting(req: TransformPromptRequest):
             )
             raw = resp.choices[0].message.content.strip()
     except Exception:
-        return {"thinking": "Could not reach LLM for planning", "is_valid": True, "plan": ["Execute directly"], "confidence": "medium", "validation_issues": [], "estimated_impact": {}, "warnings": []}
+        return {
+            "thinking": "Could not reach LLM for planning",
+            "is_valid": True,
+            "plan": ["Execute directly"],
+            "confidence": "medium",
+            "validation_issues": [],
+            "estimated_impact": {},
+            "warnings": [],
+        }
 
     result = _parse_thinking_response(raw)
 
     # Safety net: never block execution for common transform operations
-    common_ops = ["remove", "drop", "fill", "impute", "normalize", "scale", "encode", "clean", "convert", "rename", "replace"]
+    common_ops = [
+        "remove",
+        "drop",
+        "fill",
+        "impute",
+        "normalize",
+        "scale",
+        "encode",
+        "clean",
+        "convert",
+        "rename",
+        "replace",
+    ]
     if not result["is_valid"] and any(op in req.prompt.lower() for op in common_ops):
         result["is_valid"] = True
         result["validation_issues"] = []
@@ -7183,15 +8528,28 @@ async def transform_execute_with_tools(req: TransformPromptRequest):
     before_nulls = int(current_df.isnull().sum().sum())
 
     # Handle batch requests
-    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything"]
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+    ]
     expanded_prompt = req.prompt
     if any(kw in req.prompt.lower() for kw in batch_keywords):
         actions = []
-        null_cols = [col for col in current_df.columns if current_df[col].isnull().sum() > 0]
+        null_cols = [
+            col for col in current_df.columns if current_df[col].isnull().sum() > 0
+        ]
         if null_cols:
             for col in null_cols:
                 if current_df[col].dtype in ["float64", "int64", "float32", "int32"]:
-                    actions.append(f"fill null values in column '{col}' with the median")
+                    actions.append(
+                        f"fill null values in column '{col}' with the median"
+                    )
                 else:
                     actions.append(f"fill null values in column '{col}' with the mode")
         if int(current_df.duplicated().sum()) > 0:
@@ -7201,8 +8559,14 @@ async def transform_execute_with_tools(req: TransformPromptRequest):
         expanded_prompt = ". ".join(actions)
 
     # Build context for tool selection
-    col_info = ", ".join(f"{col} ({current_df[col].dtype})" for col in current_df.columns)
-    null_info = {col: int(current_df[col].isnull().sum()) for col in current_df.columns if current_df[col].isnull().sum() > 0}
+    col_info = ", ".join(
+        f"{col} ({current_df[col].dtype})" for col in current_df.columns
+    )
+    null_info = {
+        col: int(current_df[col].isnull().sum())
+        for col in current_df.columns
+        if current_df[col].isnull().sum() > 0
+    }
 
     system_prompt = (
         "You are a data transformation agent. You have access to tools to transform a pandas DataFrame.\n"
@@ -7226,7 +8590,9 @@ async def transform_execute_with_tools(req: TransformPromptRequest):
 
     if not provider or provider == "gemini":
         # Gemini doesn't support tool calling well — fall back to standard prompt
-        raise HTTPException(status_code=501, detail="Tool calling requires Groq or OpenAI provider")
+        raise HTTPException(
+            status_code=501, detail="Tool calling requires Groq or OpenAI provider"
+        )
 
     tools_schema = get_mcp_tools_schema()
 
@@ -7253,7 +8619,10 @@ async def transform_execute_with_tools(req: TransformPromptRequest):
 
     if not tool_calls:
         # No tool calls — LLM gave a text response, fall back to code gen
-        raise HTTPException(status_code=422, detail="LLM did not select any tools. Try being more specific.")
+        raise HTTPException(
+            status_code=422,
+            detail="LLM did not select any tools. Try being more specific.",
+        )
 
     for tc in tool_calls:
         tool_name = tc.function.name
@@ -7264,9 +8633,13 @@ async def transform_execute_with_tools(req: TransformPromptRequest):
 
         try:
             result_df = execute_mcp_tool(tool_name, result_df, args)
-            tools_executed.append({"tool": tool_name, "args": args, "status": "success"})
+            tools_executed.append(
+                {"tool": tool_name, "args": args, "status": "success"}
+            )
         except Exception as exc:
-            tools_executed.append({"tool": tool_name, "args": args, "status": "error", "error": str(exc)})
+            tools_executed.append(
+                {"tool": tool_name, "args": args, "status": "error", "error": str(exc)}
+            )
 
     # Compute diff
     after_shape = result_df.shape
@@ -7324,7 +8697,9 @@ async def transform_execute_with_tools(req: TransformPromptRequest):
         "columns": diff["cols_after"],
         "column_names": list(result_df.columns),
         "dtypes": {col: str(result_df[col].dtype) for col in result_df.columns},
-        "null_counts": {col: int(result_df[col].isnull().sum()) for col in result_df.columns},
+        "null_counts": {
+            col: int(result_df[col].isnull().sum()) for col in result_df.columns
+        },
         "tools_executed": tools_executed,
     }
 
@@ -7334,11 +8709,13 @@ async def list_transform_tools():
     """List all available MCP transform tools and their schemas."""
     tools = []
     for name, tool_def in TRANSFORM_TOOLS.items():
-        tools.append({
-            "name": tool_def["name"],
-            "description": tool_def["description"],
-            "parameters": tool_def["parameters"],
-        })
+        tools.append(
+            {
+                "name": tool_def["name"],
+                "description": tool_def["description"],
+                "parameters": tool_def["parameters"],
+            }
+        )
     return {"tools": tools, "count": len(tools)}
 
 
@@ -7380,21 +8757,38 @@ async def transform_prompt(req: TransformPromptRequest):
             "columns": before_shape[1],
             "column_names": list(current_df.columns),
             "dtypes": {col: str(current_df[col].dtype) for col in current_df.columns},
-            "null_counts": {col: int(current_df[col].isnull().sum()) for col in current_df.columns},
+            "null_counts": {
+                col: int(current_df[col].isnull().sum()) for col in current_df.columns
+            },
         }
 
     # Handle "do it all" batch requests by expanding to a concrete prompt
-    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything"]
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+    ]
     expanded_prompt = req.prompt
     if any(kw in req.prompt.lower() for kw in batch_keywords):
         actions = []
-        null_cols = [col for col in current_df.columns if current_df[col].isnull().sum() > 0]
+        null_cols = [
+            col for col in current_df.columns if current_df[col].isnull().sum() > 0
+        ]
         if null_cols:
             for col in null_cols:
                 if current_df[col].dtype in ["float64", "int64", "float32", "int32"]:
-                    actions.append(f"fill null values in column '{col}' with the median")
+                    actions.append(
+                        f"fill null values in column '{col}' with the median"
+                    )
                 else:
-                    actions.append(f"fill null values in column '{col}' with the mode (most frequent value)")
+                    actions.append(
+                        f"fill null values in column '{col}' with the mode (most frequent value)"
+                    )
         if int(current_df.duplicated().sum()) > 0:
             actions.append("drop duplicate rows")
         if not actions:
@@ -7434,7 +8828,10 @@ async def transform_prompt(req: TransformPromptRequest):
         raise HTTPException(status_code=500, detail=f"LLM unavailable: {exc}")
 
     if not provider:
-        raise HTTPException(status_code=500, detail="No LLM provider configured. Set GROQ_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.")
+        raise HTTPException(
+            status_code=500,
+            detail="No LLM provider configured. Set GROQ_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.",
+        )
 
     # Generate code, execute, and auto-retry up to 2 times on failure
     MAX_RETRIES = 2
@@ -7446,7 +8843,13 @@ async def transform_prompt(req: TransformPromptRequest):
     for attempt in range(1 + MAX_RETRIES):
         try:
             if provider == "gemini":
-                generated_code = _call_gemini_text_standalone(system_prompt, retry_prompt, temperature=0.2, max_tokens=1024, model_override=model)
+                generated_code = _call_gemini_text_standalone(
+                    system_prompt,
+                    retry_prompt,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    model_override=model,
+                )
             else:
                 resp = client.chat.completions.create(
                     model=model,
@@ -7519,7 +8922,9 @@ async def transform_prompt(req: TransformPromptRequest):
                 "nulls_removed": max(0, before_nulls - candidate_nulls),
             }
 
-            constraint_violations = _validate_transform_constraints(constraints, candidate_diff)
+            constraint_violations = _validate_transform_constraints(
+                constraints, candidate_diff
+            )
             if constraint_violations:
                 last_error = "; ".join(constraint_violations)
                 if attempt < MAX_RETRIES:
@@ -7530,7 +8935,10 @@ async def transform_prompt(req: TransformPromptRequest):
                         "Regenerate code that satisfies ALL explicit constraints from the user prompt."
                     )
                     continue
-                raise HTTPException(status_code=422, detail=f"Generated code violated prompt constraints: {last_error}")
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Generated code violated prompt constraints: {last_error}",
+                )
 
             result_df = candidate_df
             diff = candidate_diff
@@ -7550,10 +8958,14 @@ async def transform_prompt(req: TransformPromptRequest):
                 )
 
     if last_error:
-        raise HTTPException(status_code=422, detail=f"Generated code failed: {last_error}")
+        raise HTTPException(
+            status_code=422, detail=f"Generated code failed: {last_error}"
+        )
 
     if result_df is None or diff is None:
-        raise HTTPException(status_code=422, detail="No valid transform result produced")
+        raise HTTPException(
+            status_code=422, detail="No valid transform result produced"
+        )
 
     summary = _build_transform_summary(req.prompt, diff, result_df, current_df, session)
 
@@ -7580,7 +8992,9 @@ async def transform_prompt(req: TransformPromptRequest):
         "columns": diff["cols_after"],
         "column_names": list(result_df.columns),
         "dtypes": {col: str(result_df[col].dtype) for col in result_df.columns},
-        "null_counts": {col: int(result_df[col].isnull().sum()) for col in result_df.columns},
+        "null_counts": {
+            col: int(result_df[col].isnull().sum()) for col in result_df.columns
+        },
     }
 
 
@@ -7614,7 +9028,7 @@ async def transform_undo(req: TransformUndoRequest):
         raise HTTPException(status_code=400, detail="Invalid step index")
 
     # Remove this step and all after it
-    session["steps"] = session["steps"][:req.step_index]
+    session["steps"] = session["steps"][: req.step_index]
 
     # Replay accepted steps to rebuild current_df
     df = session["original_df"].copy()
@@ -7654,7 +9068,9 @@ async def transform_revert(req: TransformRevertRequest):
 
 
 @app.post("/transform/save/{file_id}")
-async def transform_save(file_id: str, session_id: str = Form(...), db: Session = Depends(get_db)):
+async def transform_save(
+    file_id: str, session_id: str = Form(...), db: Session = Depends(get_db)
+):
     """Save the transformed dataset — overwrites the original CSV so training
     uses the cleaned version."""
     session = TRANSFORM_SESSIONS.get(session_id)
@@ -7727,34 +9143,118 @@ def _is_non_actionable_transform_prompt(prompt: str) -> bool:
         return True
 
     # Batch/execute-all commands are always actionable
-    batch_keywords = ["do it all", "do all", "apply all", "run all", "execute all", "fix everything", "clean everything", "do everything", "fix all", "clean all"]
+    batch_keywords = [
+        "do it all",
+        "do all",
+        "apply all",
+        "run all",
+        "execute all",
+        "fix everything",
+        "clean everything",
+        "do everything",
+        "fix all",
+        "clean all",
+    ]
     if any(kw in text for kw in batch_keywords):
         return False
 
     transform_verbs = [
-        "remove", "drop", "delete", "filter", "keep", "retain", "fill", "impute",
-        "replace", "rename", "convert", "cast", "normalize", "standardize", "scale",
-        "encode", "clean", "strip", "trim", "split", "merge", "aggregate", "group",
-        "sort", "deduplicate", "duplicate", "round", "clip", "bin", "outlier",
-        "all", "everything", "fix",
+        "remove",
+        "drop",
+        "delete",
+        "filter",
+        "keep",
+        "retain",
+        "fill",
+        "impute",
+        "replace",
+        "rename",
+        "convert",
+        "cast",
+        "normalize",
+        "standardize",
+        "scale",
+        "encode",
+        "clean",
+        "strip",
+        "trim",
+        "split",
+        "merge",
+        "aggregate",
+        "group",
+        "sort",
+        "deduplicate",
+        "duplicate",
+        "round",
+        "clip",
+        "bin",
+        "outlier",
+        "all",
+        "everything",
+        "fix",
     ]
     if any(verb in text for verb in transform_verbs):
         return False
 
     # Analysis requests — let them through as chat, not transforms
-    analysis_keywords = ["analyze", "analyse", "examine", "inspect", "show", "describe", "statistics", "summary", "profile", "overview", "again", "correct", "quality", "tell me", "how much", "find null", "show null", "check null", "missing values", "find missing", "show missing", "scan null", "null values"]
+    analysis_keywords = [
+        "analyze",
+        "analyse",
+        "examine",
+        "inspect",
+        "show",
+        "describe",
+        "statistics",
+        "summary",
+        "profile",
+        "overview",
+        "again",
+        "correct",
+        "quality",
+        "tell me",
+        "how much",
+        "find null",
+        "show null",
+        "check null",
+        "missing values",
+        "find missing",
+        "show missing",
+        "scan null",
+        "null values",
+    ]
     if any(kw in text for kw in analysis_keywords):
         return True
 
     small_talk = [
-        "hi", "hello", "hey", "thanks", "thank you", "test", "testing", "ok", "okay",
-        "cool", "nice", "yo", "sup", "hola", "bonjour", "what", "how", "why", "who",
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "test",
+        "testing",
+        "ok",
+        "okay",
+        "cool",
+        "nice",
+        "yo",
+        "sup",
+        "hola",
+        "bonjour",
+        "what",
+        "how",
+        "why",
+        "who",
     ]
-    if text.rstrip("!?.") in small_talk or (len(text.split()) >= 1 and text.split()[0] in small_talk):
+    if text.rstrip("!?.") in small_talk or (
+        len(text.split()) >= 1 and text.split()[0] in small_talk
+    ):
         return True
 
     # Questions are chat, not transforms
-    if text.startswith(("what", "how", "why", "which", "can", "is", "are", "do", "does", "tell")):
+    if text.startswith(
+        ("what", "how", "why", "which", "can", "is", "are", "do", "does", "tell")
+    ):
         return True
 
     if len(text.split()) <= 2 and not any(verb in text for verb in transform_verbs):
@@ -7768,12 +9268,36 @@ def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
     text = (prompt or "").strip().lower()
 
     # Null value scan
-    null_keywords = ["find null", "null values", "show null", "check null", "missing values", "find missing", "show missing", "scan null"]
+    null_keywords = [
+        "find null",
+        "null values",
+        "show null",
+        "check null",
+        "missing values",
+        "find missing",
+        "show missing",
+        "scan null",
+    ]
     if any(kw in text for kw in null_keywords):
         return _build_null_scan_response(df)
 
     # Analysis/quality check
-    analysis_keywords = ["analyze", "analyse", "examine", "inspect", "describe", "statistics", "summary", "profile", "overview", "again", "correct", "quality", "good", "tell me"]
+    analysis_keywords = [
+        "analyze",
+        "analyse",
+        "examine",
+        "inspect",
+        "describe",
+        "statistics",
+        "summary",
+        "profile",
+        "overview",
+        "again",
+        "correct",
+        "quality",
+        "good",
+        "tell me",
+    ]
     if any(kw in text for kw in analysis_keywords):
         nulls = int(df.isnull().sum().sum())
         dups = int(df.duplicated().sum())
@@ -7781,7 +9305,9 @@ def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
         cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
         total_cells = df.shape[0] * df.shape[1]
         completeness = round((1 - nulls / max(total_cells, 1)) * 100, 1)
-        quality_score = min(100, max(0, int(completeness - (dups / max(df.shape[0], 1)) * 10)))
+        quality_score = min(
+            100, max(0, int(completeness - (dups / max(df.shape[0], 1)) * 10))
+        )
 
         response = f"🔍 DATASET ANALYSIS\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         response += f"📊 Overview\n"
@@ -7801,11 +9327,17 @@ def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
             pct = round(col_nulls / df.shape[0] * 100, 0)
             if pct >= 30:
                 if df[col].dtype in ["float64", "int64", "float32", "int32"]:
-                    critical_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill with median")
+                    critical_issues.append(
+                        f"{col}: {col_nulls} nulls ({pct}%) → fill with median"
+                    )
                 else:
-                    critical_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill with mode")
+                    critical_issues.append(
+                        f"{col}: {col_nulls} nulls ({pct}%) → fill with mode"
+                    )
             elif pct >= 10:
-                medium_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill missing values")
+                medium_issues.append(
+                    f"{col}: {col_nulls} nulls ({pct}%) → fill missing values"
+                )
             else:
                 low_issues.append(f"{col}: {col_nulls} nulls ({pct}%) → fill or ignore")
 
@@ -7814,14 +9346,20 @@ def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
             if df[col].dtype == "object":
                 numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
                 if numeric_count > len(df) * 0.5:
-                    critical_issues.append(f"{col}: stored as text but looks numeric → convert to number")
+                    critical_issues.append(
+                        f"{col}: stored as text but looks numeric → convert to number"
+                    )
 
         # Duplicates
         if dups > 0:
             if dups > df.shape[0] * 0.1:
-                critical_issues.append(f"Dataset: {dups} duplicate rows ({round(dups/df.shape[0]*100,0)}%) → drop duplicates")
+                critical_issues.append(
+                    f"Dataset: {dups} duplicate rows ({round(dups/df.shape[0]*100,0)}%) → drop duplicates"
+                )
             else:
-                medium_issues.append(f"Dataset: {dups} duplicate rows → drop duplicates")
+                medium_issues.append(
+                    f"Dataset: {dups} duplicate rows → drop duplicates"
+                )
 
         if critical_issues:
             response += f"\n🚨 Critical Issues (fix first)\n"
@@ -7835,7 +9373,9 @@ def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
 
         if low_issues:
             response += f"\nℹ️ Low Priority\n"
-            for i, issue in enumerate(low_issues[:3], len(critical_issues) + len(medium_issues) + 1):
+            for i, issue in enumerate(
+                low_issues[:3], len(critical_issues) + len(medium_issues) + 1
+            ):
                 response += f"{i}. {issue}\n"
 
         if not critical_issues and not medium_issues and not low_issues:
@@ -7864,7 +9404,9 @@ def _generate_chat_response(prompt: str, df: pd.DataFrame) -> str:
         return response
 
     # Questions
-    if text.startswith(("what", "how", "why", "which", "can", "is", "are", "does", "tell")):
+    if text.startswith(
+        ("what", "how", "why", "which", "can", "is", "are", "does", "tell")
+    ):
         return (
             f"I execute, not explain. 📊 {df.shape[0]}×{df.shape[1]}\n\n"
             f"Actions: fill nulls | drop cols | normalize | encode | remove outliers | filter | rename\n\n"
@@ -7880,7 +9422,9 @@ def _extract_transform_constraints(prompt: str) -> Dict[str, bool]:
     text = (prompt or "").lower()
 
     no_row_removal = bool(
-        re.search(r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(row|rows)", text)
+        re.search(
+            r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(row|rows)", text
+        )
         or re.search(r"(keep|retain).{0,30}(all\s+)?rows", text)
         or "without data loss" in text
     )
@@ -7890,7 +9434,10 @@ def _extract_transform_constraints(prompt: str) -> Dict[str, bool]:
         or "don't change rows" in text
     )
     no_col_removal = bool(
-        re.search(r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(column|columns|col|cols)", text)
+        re.search(
+            r"(do not|don't|dont|without)\s+(remove|drop|delete).{0,30}(column|columns|col|cols)",
+            text,
+        )
         or re.search(r"(keep|retain).{0,30}(all\s+)?(columns|cols)", text)
         or "without data loss" in text
     )
@@ -7908,7 +9455,9 @@ def _extract_transform_constraints(prompt: str) -> Dict[str, bool]:
     }
 
 
-def _validate_transform_constraints(constraints: Dict[str, bool], diff: Dict[str, int]) -> List[str]:
+def _validate_transform_constraints(
+    constraints: Dict[str, bool], diff: Dict[str, int]
+) -> List[str]:
     """Return violations when generated transform breaks explicit prompt constraints."""
     violations: List[str] = []
 
@@ -7928,22 +9477,47 @@ def _validate_transform_constraints(constraints: Dict[str, bool], diff: Dict[str
 def _validate_transform_code(code: str) -> None:
     """Block dangerous patterns in generated transform code."""
     forbidden = [
-        "import ", "from ", "__import__", "subprocess", "os.system", "os.popen",
-        "eval(", "exec(", "compile(", "open(", "shutil", "pathlib",
-        "requests.", "urllib", "socket", "http.client",
-        "globals(", "locals(", "getattr(", "setattr(", "delattr(",
-        "__builtins__", "__class__", "__subclasses__",
+        "import ",
+        "from ",
+        "__import__",
+        "subprocess",
+        "os.system",
+        "os.popen",
+        "eval(",
+        "exec(",
+        "compile(",
+        "open(",
+        "shutil",
+        "pathlib",
+        "requests.",
+        "urllib",
+        "socket",
+        "http.client",
+        "globals(",
+        "locals(",
+        "getattr(",
+        "setattr(",
+        "delattr(",
+        "__builtins__",
+        "__class__",
+        "__subclasses__",
     ]
     code_lower = code.lower()
     for pattern in forbidden:
         if pattern.lower() in code_lower:
             raise HTTPException(
                 status_code=422,
-                detail=f"Generated code contains forbidden pattern: {pattern.strip()}"
+                detail=f"Generated code contains forbidden pattern: {pattern.strip()}",
             )
 
 
-def _build_transform_summary(prompt: str, diff: dict, result_df: "pd.DataFrame | None" = None, before_df: "pd.DataFrame | None" = None, session: "dict | None" = None) -> str:
+def _build_transform_summary(
+    prompt: str,
+    diff: dict,
+    result_df: "pd.DataFrame | None" = None,
+    before_df: "pd.DataFrame | None" = None,
+    session: "dict | None" = None,
+) -> str:
     """Build execution result in the copilot format with proactive next-action suggestions."""
     lines = []
     lines.append(f"⚡ Executed: {prompt[:60]}")
@@ -7951,15 +9525,27 @@ def _build_transform_summary(prompt: str, diff: dict, result_df: "pd.DataFrame |
     lines.append("")
 
     # AI Decision block (only for meaningful transforms)
-    if before_df is not None and result_df is not None and (diff["nulls_removed"] > 0 or diff["rows_changed"] > 0 or diff["cols_changed"] > 0):
+    if (
+        before_df is not None
+        and result_df is not None
+        and (
+            diff["nulls_removed"] > 0
+            or diff["rows_changed"] > 0
+            or diff["cols_changed"] > 0
+        )
+    ):
         decision_block = _build_decision_block(prompt, diff, before_df, result_df)
         if decision_block:
             lines.append(decision_block)
             lines.append("")
 
     lines.append("📊 Result:")
-    lines.append(f"  Before: {diff['rows_before']} rows, {diff['cols_before']} cols, {diff['nulls_before']} nulls")
-    lines.append(f"  After:  {diff['rows_after']} rows, {diff['cols_after']} cols, {diff['nulls_after']} nulls")
+    lines.append(
+        f"  Before: {diff['rows_before']} rows, {diff['cols_before']} cols, {diff['nulls_before']} nulls"
+    )
+    lines.append(
+        f"  After:  {diff['rows_after']} rows, {diff['cols_after']} cols, {diff['nulls_after']} nulls"
+    )
     lines.append("")
 
     changes = []
@@ -7982,7 +9568,9 @@ def _build_transform_summary(prompt: str, diff: dict, result_df: "pd.DataFrame |
         quality_history = session.get("quality_history", [])
         # Record this step
         short_label = prompt[:18] + "..." if len(prompt) > 18 else prompt
-        quality_history.append({"label": f"After: {short_label}", "score": current_score})
+        quality_history.append(
+            {"label": f"After: {short_label}", "score": current_score}
+        )
         session["quality_history"] = quality_history
         lines.append("")
         lines.append(_build_quality_progress_bar(quality_history[:-1], current_score))
@@ -7995,22 +9583,33 @@ def _build_transform_summary(prompt: str, diff: dict, result_df: "pd.DataFrame |
     return "\n".join(lines)
 
 
-def _build_decision_block(prompt: str, diff: dict, before_df: "pd.DataFrame", result_df: "pd.DataFrame") -> str:
+def _build_decision_block(
+    prompt: str, diff: dict, before_df: "pd.DataFrame", result_df: "pd.DataFrame"
+) -> str:
     """Build the AI Decision confidence block showing WHY a particular approach was chosen."""
     prompt_lower = (prompt or "").lower()
     lines = []
 
     # Null filling decisions
-    if "fill" in prompt_lower or "null" in prompt_lower or "impute" in prompt_lower or diff["nulls_removed"] > 0:
+    if (
+        "fill" in prompt_lower
+        or "null" in prompt_lower
+        or "impute" in prompt_lower
+        or diff["nulls_removed"] > 0
+    ):
         # Find which columns had nulls filled
         filled_cols = []
         for col in before_df.columns:
             if col not in result_df.columns:
                 continue
             before_nulls = int(before_df[col].isnull().sum())
-            after_nulls = int(result_df[col].isnull().sum()) if col in result_df.columns else 0
+            after_nulls = (
+                int(result_df[col].isnull().sum()) if col in result_df.columns else 0
+            )
             if before_nulls > 0 and after_nulls < before_nulls:
-                filled_cols.append((col, before_nulls - after_nulls, before_df[col].dtype))
+                filled_cols.append(
+                    (col, before_nulls - after_nulls, before_df[col].dtype)
+                )
 
         if filled_cols:
             lines.append("🧠 AI Decision")
@@ -8033,42 +9632,64 @@ def _build_decision_block(prompt: str, diff: dict, before_df: "pd.DataFrame", re
                         confidence = 85
                         strategy = "median"
                         reason = f"Moderate skew ({skew:.1f}). Median preferred for robustness."
-                        alternative = f"Mean ({mean_val:.1f}) — acceptable but less robust"
+                        alternative = (
+                            f"Mean ({mean_val:.1f}) — acceptable but less robust"
+                        )
                     else:
                         confidence = 88
                         strategy = "median"
                         reason = f"Symmetric distribution. Median ≈ Mean, using median for safety."
                         alternative = f"Mean ({mean_val:.1f}) — equally valid here"
 
-                    lines.append(f"Decision: Fill '{top_col}' nulls with {strategy} ({median_val:.1f})")
+                    lines.append(
+                        f"Decision: Fill '{top_col}' nulls with {strategy} ({median_val:.1f})"
+                    )
                     lines.append(f"Confidence: {confidence}%")
                     lines.append(f"Reason: {reason}")
                     lines.append(f"Alternative: {alternative}")
             else:
                 col_data = before_df[top_col].dropna()
                 if len(col_data) > 0:
-                    mode_val = col_data.mode().iloc[0] if not col_data.mode().empty else "Unknown"
+                    mode_val = (
+                        col_data.mode().iloc[0]
+                        if not col_data.mode().empty
+                        else "Unknown"
+                    )
                     mode_freq = int((col_data == mode_val).sum())
                     mode_pct = round(mode_freq / len(col_data) * 100, 0)
                     confidence = min(95, max(60, int(mode_pct)))
-                    lines.append(f"Decision: Fill '{top_col}' nulls with mode ('{mode_val}')")
+                    lines.append(
+                        f"Decision: Fill '{top_col}' nulls with mode ('{mode_val}')"
+                    )
                     lines.append(f"Confidence: {confidence}%")
-                    lines.append(f"Reason: Mode appears in {mode_pct}% of non-null values — strong majority.")
-                    lines.append(f"Alternative: 'Unknown' — use if mode dominance < 50%")
+                    lines.append(
+                        f"Reason: Mode appears in {mode_pct}% of non-null values — strong majority."
+                    )
+                    lines.append(
+                        f"Alternative: 'Unknown' — use if mode dominance < 50%"
+                    )
 
             if len(filled_cols) > 1:
                 others = ", ".join(f"'{c}'" for c, _, _ in filled_cols[1:4])
-                lines.append(f"Also fixed: {others} ({len(filled_cols)-1} more columns)")
+                lines.append(
+                    f"Also fixed: {others} ({len(filled_cols)-1} more columns)"
+                )
 
     # Outlier removal decisions
     elif "outlier" in prompt_lower:
         if diff["rows_changed"] > 0:
             lines.append("🧠 AI Decision")
             lines.append("━━━━━━━━━━━━")
-            lines.append(f"Decision: Remove {diff['rows_changed']} outlier rows using IQR method (1.5×)")
+            lines.append(
+                f"Decision: Remove {diff['rows_changed']} outlier rows using IQR method (1.5×)"
+            )
             lines.append("Confidence: 87%")
-            lines.append("Reason: IQR is standard for unknown distributions. Removes extreme values only.")
-            lines.append("Alternative: Z-score (3σ) — more lenient, keeps borderline cases")
+            lines.append(
+                "Reason: IQR is standard for unknown distributions. Removes extreme values only."
+            )
+            lines.append(
+                "Alternative: Z-score (3σ) — more lenient, keeps borderline cases"
+            )
 
     # Encoding decisions
     elif "encode" in prompt_lower:
@@ -8077,8 +9698,12 @@ def _build_decision_block(prompt: str, diff: dict, before_df: "pd.DataFrame", re
             lines.append("━━━━━━━━━━━━")
             lines.append(f"Decision: Label encoding (categories → integers)")
             lines.append("Confidence: 82%")
-            lines.append("Reason: Preserves column count. Tree models handle label encoding well.")
-            lines.append("Alternative: One-hot encoding — better for linear models, adds columns")
+            lines.append(
+                "Reason: Preserves column count. Tree models handle label encoding well."
+            )
+            lines.append(
+                "Alternative: One-hot encoding — better for linear models, adds columns"
+            )
 
     # Normalization decisions
     elif "normalize" in prompt_lower or "scale" in prompt_lower:
@@ -8087,12 +9712,16 @@ def _build_decision_block(prompt: str, diff: dict, before_df: "pd.DataFrame", re
         lines.append(f"Decision: Min-Max normalization (scale to 0-1)")
         lines.append("Confidence: 80%")
         lines.append("Reason: Preserves distribution shape. Works for most ML models.")
-        lines.append("Alternative: Z-score standardization — better if data has outliers")
+        lines.append(
+            "Alternative: Z-score standardization — better if data has outliers"
+        )
 
     return "\n".join(lines) if lines else ""
 
 
-def _get_proactive_suggestion(prompt: str, diff: dict, result_df: "pd.DataFrame | None" = None) -> str:
+def _get_proactive_suggestion(
+    prompt: str, diff: dict, result_df: "pd.DataFrame | None" = None
+) -> str:
     """Generate a smart proactive suggestion based on what was just done."""
     prompt_lower = (prompt or "").lower()
 
@@ -8118,7 +9747,10 @@ def _get_proactive_suggestion(prompt: str, diff: dict, result_df: "pd.DataFrame 
             for col in num_cols[:5]:
                 q1, q3 = result_df[col].quantile(0.25), result_df[col].quantile(0.75)
                 iqr = q3 - q1
-                outliers = ((result_df[col] < q1 - 1.5 * iqr) | (result_df[col] > q3 + 1.5 * iqr)).sum()
+                outliers = (
+                    (result_df[col] < q1 - 1.5 * iqr)
+                    | (result_df[col] > q3 + 1.5 * iqr)
+                ).sum()
                 outlier_count += int(outliers)
             if outlier_count > 0:
                 return f"💡 Numeric columns are clean. I found {outlier_count} potential outliers. Want me to remove them?\n🔜 Type: 'remove outliers'"
@@ -8131,13 +9763,21 @@ def _get_proactive_suggestion(prompt: str, diff: dict, result_df: "pd.DataFrame 
         if nulls_remaining > 0:
             return f"💡 Encoding done. Still {nulls_remaining} nulls to fix first.\n🔜 Type: 'fill all null values'"
         total_cells = result_df.shape[0] * result_df.shape[1]
-        quality = min(100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100)))
+        quality = min(
+            100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
+        )
         return f"💡 Categorical columns encoded. Quality: {quality}/100. Want me to normalize numeric features?\n🔜 Type: 'normalize numeric columns'"
 
     # After normalizing
-    if "normalize" in prompt_lower or "scale" in prompt_lower or "standardize" in prompt_lower:
+    if (
+        "normalize" in prompt_lower
+        or "scale" in prompt_lower
+        or "standardize" in prompt_lower
+    ):
         total_cells = result_df.shape[0] * result_df.shape[1]
-        quality = min(100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100)))
+        quality = min(
+            100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
+        )
         if cat_cols:
             return f"💡 Normalized! Quality: {quality}/100. {len(cat_cols)} text column(s) remain. Want me to encode them?\n🔜 Type: 'encode categorical columns'"
         return f"✅ Dataset quality: {quality}/100. Data is ML-ready! Go Back to Training to start."
@@ -8161,7 +9801,11 @@ def _get_proactive_suggestion(prompt: str, diff: dict, result_df: "pd.DataFrame 
         return "💡 No duplicates. Data is cleaner now!\n🔜 Type: 'analyse' to see quality score."
 
     # After converting types
-    if "convert" in prompt_lower or "dtype" in prompt_lower or "numeric" in prompt_lower:
+    if (
+        "convert" in prompt_lower
+        or "dtype" in prompt_lower
+        or "numeric" in prompt_lower
+    ):
         if nulls_remaining > 0:
             return f"💡 Types converted. Conversion may have created {nulls_remaining} new nulls (invalid values → NaN). Want me to fill them?\n🔜 Type: 'fill all null values'"
         return "💡 Types fixed! Data is in better shape now.\n🔜 Type: 'analyse' to check progress."
@@ -8175,42 +9819,10 @@ def _get_proactive_suggestion(prompt: str, diff: dict, result_df: "pd.DataFrame 
         return f"💡 Data is clean! {len(cat_cols)} categorical column(s) could be encoded for ML.\n🔜 Type: 'encode categorical columns'"
     else:
         total_cells = result_df.shape[0] * result_df.shape[1]
-        quality = min(100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100)))
+        quality = min(
+            100, max(0, int((1 - nulls_remaining / max(total_cells, 1)) * 100))
+        )
         return f"✅ Dataset quality: {quality}/100. ML-ready! Go Back to Training."
-
-
-def _compute_quality_score(df: pd.DataFrame) -> int:
-    """Compute a 0-100 quality score for a DataFrame."""
-    if df.shape[0] == 0:
-        return 0
-    total_cells = df.shape[0] * df.shape[1]
-    nulls = int(df.isnull().sum().sum())
-    dups = int(df.duplicated().sum())
-
-    # Completeness (0-50 points)
-    completeness_ratio = 1 - (nulls / max(total_cells, 1))
-    completeness_score = int(completeness_ratio * 50)
-
-    # No duplicates (0-15 points)
-    dup_ratio = dups / max(df.shape[0], 1)
-    dup_score = int((1 - min(dup_ratio * 5, 1)) * 15)
-
-    # Type correctness (0-20 points) — object columns that look numeric lose points
-    type_penalty = 0
-    for col in df.select_dtypes(include=["object"]).columns:
-        numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
-        if numeric_count > df.shape[0] * 0.5:
-            type_penalty += 5
-    type_score = max(0, 20 - type_penalty)
-
-    # Column utility (0-15 points) — constant or near-constant columns lose points
-    constant_penalty = 0
-    for col in df.columns:
-        if df[col].nunique() <= 1:
-            constant_penalty += 5
-    utility_score = max(0, 15 - constant_penalty)
-
-    return min(100, max(0, completeness_score + dup_score + type_score + utility_score))
 
 
 def _build_quality_progress_bar(quality_history: list, current_score: int) -> str:
@@ -8259,7 +9871,11 @@ def _build_null_scan_response(df: pd.DataFrame) -> str:
             # Determine suggested fix
             if df[col].dtype in ["float64", "int64", "float32", "int32"]:
                 median_val = df[col].median()
-                fix = f"Fill with median ({median_val:.0f})" if not pd.isna(median_val) else "Fill with 0"
+                fix = (
+                    f"Fill with median ({median_val:.0f})"
+                    if not pd.isna(median_val)
+                    else "Fill with 0"
+                )
             elif df[col].dtype == "object":
                 mode_val = df[col].mode()
                 if not mode_val.empty:
@@ -8312,7 +9928,9 @@ def _build_dataset_profile_for_analysis(df: pd.DataFrame) -> str:
 
         line = f"  - {col} ({dtype}): {unique} unique, {nulls} nulls ({null_pct})"
         if df[col].dtype in ["float64", "int64", "float32", "int32"]:
-            line += f", range=[{df[col].min()}, {df[col].max()}], mean={df[col].mean():.2f}"
+            line += (
+                f", range=[{df[col].min()}, {df[col].max()}], mean={df[col].mean():.2f}"
+            )
         else:
             line += f", sample={sample[:3]}"
         lines.append(line)
@@ -8323,11 +9941,17 @@ def _build_dataset_profile_for_analysis(df: pd.DataFrame) -> str:
     issues_found = False
 
     # High null columns
-    high_null_cols = [(col, int(df[col].isnull().sum())) for col in df.columns if df[col].isnull().sum() > len(df) * 0.1]
+    high_null_cols = [
+        (col, int(df[col].isnull().sum()))
+        for col in df.columns
+        if df[col].isnull().sum() > len(df) * 0.1
+    ]
     if high_null_cols:
         issues_found = True
         for col, count in high_null_cols:
-            lines.append(f"  ⚠ Column '{col}' has {count} nulls ({count/len(df)*100:.0f}%)")
+            lines.append(
+                f"  ⚠ Column '{col}' has {count} nulls ({count/len(df)*100:.0f}%)"
+            )
 
     # Duplicate rows
     dup_count = int(df.duplicated().sum())
@@ -8347,7 +9971,9 @@ def _build_dataset_profile_for_analysis(df: pd.DataFrame) -> str:
             numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
             if numeric_count > len(df) * 0.8:
                 issues_found = True
-                lines.append(f"  ⚠ Column '{col}' is stored as text but appears numeric ({numeric_count}/{len(df)} values)")
+                lines.append(
+                    f"  ⚠ Column '{col}' is stored as text but appears numeric ({numeric_count}/{len(df)} values)"
+                )
 
     if not issues_found:
         lines.append("  ✓ No major issues detected")
@@ -8386,7 +10012,7 @@ def _parse_analysis_response(raw: Optional[str]) -> dict:
         }
 
     try:
-        parsed = json.loads(text[start:end + 1])
+        parsed = json.loads(text[start : end + 1])
         if not isinstance(parsed, dict):
             return fallback
 
@@ -8432,7 +10058,7 @@ def _parse_thinking_response(raw: Optional[str]) -> dict:
         return fallback
 
     try:
-        parsed = json.loads(text[start:end + 1])
+        parsed = json.loads(text[start : end + 1])
         if not isinstance(parsed, dict):
             return fallback
         return {

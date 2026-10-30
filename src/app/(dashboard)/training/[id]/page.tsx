@@ -33,12 +33,13 @@ const statusConfig: Record<StepStatus, { label: string; bg: string; text: string
   failed: { label: "Failed", bg: "bg-rose-500/12 border border-rose-400/35", text: "text-rose-300", dot: "bg-rose-300" },
 };
 
-const llmModelOptions: Record<"auto" | "groq" | "openai" | "gemini", string[]> = {
-  auto: ["auto"],
-  groq: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
-  openai: ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
-  gemini: ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-pro-latest"],
-};
+const llmModelOptions: Record<"auto" | "groq" | "openai" | "gemini", string[]> =
+  {
+    auto: ["auto"],
+    groq: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    openai: ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
+    gemini: ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-pro-latest"],
+  };
 
 function mapBackendStageToSteps(stage: string, status: string, error?: string | null): PipelineStep[] {
   const nextSteps: PipelineStep[] = initialSteps.map((step): PipelineStep => ({

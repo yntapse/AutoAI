@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from sqlalchemy import Column, DateTime, Float, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 
 from database import Base
 
@@ -21,3 +22,19 @@ class Project(Base):
     missing_value_count = Column(Integer, nullable=False, default=0)
     target_variance = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    pipeline_definitions = relationship(
+        "PipelineDefinition",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+    pipeline_runs = relationship(
+        "PipelineRun",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+    agent_decisions = relationship(
+        "AgentDecision",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )

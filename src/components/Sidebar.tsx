@@ -46,6 +46,50 @@ const navGroups = [
         badge: undefined as string | undefined,
       },
       {
+        label: "Data Catalog",
+        href: "/catalog",
+        icon: (
+          <svg className="w-[17px] h-[17px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M4 7v10c0 1.657 3.582 3 8 3s8-1.343 8-3V7M4 7c0 1.657 3.582 3 8 3s8-1.343 8-3M4 7c0-1.657 3.582-3 8-3s8 1.343 8 3m0 5c0 1.657-3.582 3-8 3s-8-1.343-8-3" />
+          </svg>
+        ),
+        color: "cyan",
+        badge: "New" as string | undefined,
+      },
+      {
+        label: "AI Pipeline Builder",
+        href: "/pipeline-builder",
+        icon: (
+          <svg className="w-[17px] h-[17px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        ),
+        color: "cyan",
+        badge: "New" as string | undefined,
+      },
+      {
+        label: "Visual ETL Builder",
+        href: "/etl-studio",
+        icon: (
+          <svg className="w-[17px] h-[17px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M4 5h6v4H4zM14 15h6v4h-6zM4 15h6v4H4zM14 5h6v4h-6zM10 7h4M10 17h4M7 9v6M17 9v6" />
+          </svg>
+        ),
+        color: "cyan",
+        badge: "New" as string | undefined,
+      },
+      {
+        label: "Pipelines",
+        href: "/pipelines",
+        icon: (
+          <svg className="w-[17px] h-[17px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M4 6h6m0 0a2 2 0 104 0m-4 0a2 2 0 114 0m0 0h6M4 18h6m0 0a2 2 0 104 0m-4 0a2 2 0 114 0m0 0h6M4 12h16" />
+          </svg>
+        ),
+        color: "emerald",
+        badge: "New" as string | undefined,
+      },
+      {
         label: "Experiments",
         href: "/experiments",
         icon: (
